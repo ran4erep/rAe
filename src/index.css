@@ -1,0 +1,198 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Manrope", -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-display: "Chakra Petch", "Manrope", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    overscroll-behavior: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    touch-action: manipulation;
+  }
+}
+
+/* Tactile Commodore Amiga 500 sculpted keycap shading (compositor-only press) */
+.amiga-key-ivory {
+  background: linear-gradient(180deg, #E8E3D9 0%, #D9D2C5 100%);
+  color: #191817;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.72),
+    inset 0 -2px 0 rgba(88, 82, 72, 0.35),
+    0 2px 0 #7E786D,
+    0 3px 3px rgba(0, 0, 0, 0.32);
+}
+
+.amiga-key-ivory[data-pressed="true"],
+.amiga-key-ivory:active {
+  background: linear-gradient(180deg, #CFC8BA 0%, #C6BEB0 100%);
+  transform: translateY(1.5px);
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.25),
+    0 0.5px 0 #6B665C;
+}
+
+.amiga-key-grey {
+  background: linear-gradient(180deg, #746F67 0%, #5F5B54 100%);
+  color: #F7F4EE;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    inset 0 -2px 0 rgba(0, 0, 0, 0.38),
+    0 2px 0 #3C3934,
+    0 3px 3px rgba(0, 0, 0, 0.36);
+}
+
+.amiga-key-grey[data-pressed="true"],
+.amiga-key-grey:active {
+  background: linear-gradient(180deg, #57534C 0%, #4E4A44 100%);
+  transform: translateY(1.5px);
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.38),
+    0 0.5px 0 #302E2A;
+}
+
+.amiga-key-accent {
+  background: linear-gradient(180deg, #D94035 0%, #B82B22 100%);
+  color: #FFF9F8;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.28),
+    inset 0 -2px 0 rgba(70, 12, 8, 0.45),
+    0 2px 0 #701812,
+    0 3px 3px rgba(0, 0, 0, 0.36);
+}
+
+.amiga-key-accent[data-pressed="true"],
+.amiga-key-accent:active {
+  background: linear-gradient(180deg, #B2281F 0%, #9E2119 100%);
+  transform: translateY(1.5px);
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.4),
+    0 0.5px 0 #5C130E;
+}
+
+.emulator-touch-surface,
+.emulator-touch-surface * {
+  -webkit-touch-callout: none !important;
+  -webkit-user-select: none !important;
+  user-select: none !important;
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Crisp pixel scaling for OCS/ECS CRT framebuffer */
+.crt-canvas {
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+
+/* Optional lightweight CRT scanline overlay (GPU composited, zero JS cost) */
+.crt-scanlines {
+  background-image: repeating-linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0) 0px,
+    rgba(0, 0, 0, 0) 2px,
+    rgba(0, 0, 0, 0.24) 2px,
+    rgba(0, 0, 0, 0.24) 3px
+  );
+}
+
+.pb-safe {
+  padding-bottom: max(env(safe-area-inset-bottom, 0px), 6px);
+}
+
+/* Semi-transparent tactile keys when overlaid over fullscreen Amiga screen */
+.amiga-keyboard-translucent .amiga-key-ivory {
+  background: rgba(232, 227, 217, 0.38);
+  color: #ffffff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.35);
+}
+
+.amiga-keyboard-translucent .amiga-key-ivory[data-pressed="true"],
+.amiga-keyboard-translucent .amiga-key-ivory:active {
+  background: rgba(232, 227, 217, 0.68);
+  transform: translateY(1px);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.35);
+}
+
+.amiga-keyboard-translucent .amiga-key-grey {
+  background: rgba(34, 33, 32, 0.62);
+  color: #ffffff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.26);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.35);
+}
+
+.amiga-keyboard-translucent .amiga-key-grey[data-pressed="true"],
+.amiga-keyboard-translucent .amiga-key-grey:active {
+  background: rgba(64, 61, 58, 0.82);
+  transform: translateY(1px);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+
+.amiga-keyboard-translucent .amiga-key-accent {
+  background: rgba(200, 52, 42, 0.52);
+  color: #ffffff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.92);
+  border: 1px solid rgba(255, 175, 170, 0.34);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.35);
+}
+
+.amiga-keyboard-translucent .amiga-key-accent[data-pressed="true"],
+.amiga-keyboard-translucent .amiga-key-accent:active {
+  background: rgba(217, 64, 53, 0.8);
+  transform: translateY(1px);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.45);
+}
+
+/* Range slider with transparent track for GPU-composited fill bar */
+.amiga-range-input {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+}
+
+.amiga-range-input::-webkit-slider-runnable-track {
+  height: 10px;
+  background: transparent;
+  border-radius: 9999px;
+}
+
+.amiga-range-input::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  margin-top: -5px;
+  border-radius: 9999px;
+  background: #F2EFE9;
+  border: 2.5px solid #C8342A;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.55);
+  cursor: pointer;
+}
+
+.amiga-range-input::-moz-range-track {
+  height: 10px;
+  background: transparent;
+  border-radius: 9999px;
+}
+
+.amiga-range-input::-moz-range-thumb {
+  width: 20px;
+  height: 20px;
+  border-radius: 9999px;
+  background: #F2EFE9;
+  border: 2.5px solid #C8342A;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.55);
+  cursor: pointer;
+}

@@ -1,0 +1,8 @@
+{
+  "name": "Amiga 500 OCS/ECS — Мобильный эмулятор",
+  "description": "Быстрый мобильный эмулятор Commodore Amiga (OCS/ECS, Motorola 68000) с полной QWERTY-клавиатурой Amiga, поддержкой ADF-дискет и Kickstart ROM.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
