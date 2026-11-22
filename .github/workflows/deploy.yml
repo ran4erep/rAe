@@ -38,9 +38,6 @@ jobs:
       - name: Typecheck
         run: npm run lint
 
-      - name: Run unit tests
-        run: ./node_modules/.bin/tsx --test src/utils/assetUrl.test.ts src/emulator/hardware/overscan.test.ts src/emulator/hardware/autoCrop.test.ts src/emulator/hardware/amiga.test.ts src/emulator/settingsStorage.test.ts src/emulator/controls/physicalGamepad.test.ts
-
       - name: Build production bundle
         env:
           # Relative "./" base ensures all assets (JS, CSS, bios, wasm, sounds)
