@@ -32,7 +32,16 @@ export interface ArchiveMediaCandidate {
   path: string;
   size: number;
   kind: ArchiveImageKind;
+  diskNumber?: number | null;
+  diskTotal?: number | null;
+  isBadDump?: boolean;
+  isVerified?: boolean;
+  isClean?: boolean;
+  crackTag?: string | null;
+  prereleaseKind?: 'alpha' | 'beta' | 'proto' | 'demo' | null;
+  variantTags?: string[];
   extractBytes: () => Uint8Array;
+  extractBytesAsync?: () => Promise<Uint8Array>;
 }
 
 export interface ArchiveFileEntry {
@@ -41,6 +50,12 @@ export interface ArchiveFileEntry {
   path: string;
   size: number;
   kind: ArchiveImageKind | 'file';
+  diskNumber?: number | null;
+  diskTotal?: number | null;
+  isClean?: boolean;
+  crackTag?: string | null;
+  prereleaseKind?: 'alpha' | 'beta' | 'proto' | 'demo' | null;
+  variantTags?: string[];
   protection?: number;
   extractBytes: () => Uint8Array;
 }

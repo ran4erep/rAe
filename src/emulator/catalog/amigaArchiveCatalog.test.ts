@@ -2,14 +2,35 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildCatalogApiUrl,
+  CATALOG_SOURCES,
   CatalogMemoryCache,
   CatalogPageResponse,
   decodeHeaderFilename,
+  DEFAULT_CATALOG_PROXY_URL,
+  getDefaultCatalogProxyBase,
+  makeCatalogCacheKey,
   resolveCatalogCoverUrl,
   resolveCatalogDownloadUrl,
 } from './amigaArchiveCatalog';
 
-test('buildCatalogApiUrl constructs category and search URLs accurately', () => {
+test('CATALOG_SOURCES uses clean Planetemu label without (ADF)', () => {
+  const pe = CATALOG_SOURCES.find((s) => s.id === 'planetemu');
+  assert.ok(pe);
+  assert.equal(pe.label, 'Planetemu');
+});
+
+test('getDefaultCatalogProxyBase uses Vercel proxy even in DEV unless explicitly overridden', () => {
+  assert.equal(getDefaultCatalogProxyBase({ DEV: true }), DEFAULT_CATALOG_PROXY_URL);
+  assert.equal(getDefaultCatalogProxyBase({ DEV: false }), DEFAULT_CATALOG_PROXY_URL);
+  assert.equal(getDefaultCatalogProxyBase({ DEV: true, VITE_CATALOG_PROXY_URL: 'local' }), '');
+  assert.equal(getDefaultCatalogProxyBase({ DEV: true, VITE_CATALOG_PROXY_URL: '/' }), '');
+  assert.equal(
+    getDefaultCatalogProxyBase({ DEV: true, VITE_CATALOG_PROXY_URL: 'https://custom.example.com/' }),
+    'https://custom.example.com'
+  );
+});
+
+test('buildCatalogApiUrl constructs category, planetemu letter, and search URLs accurately', () => {
   assert.equal(
     buildCatalogApiUrl('https://amiga-proxy.vercel.app/', {
       category: 'games',
@@ -26,6 +47,33 @@ test('buildCatalogApiUrl constructs category and search URLs accurately', () => 
       page: 1,
     }),
     'https://amiga-proxy.vercel.app/api/catalog?q=turrican&page=1'
+  );
+
+  assert.equal(
+    buildCatalogApiUrl('https://amiga-proxy.vercel.app/', {
+      source: 'planetemu',
+      category: 'games',
+      letter: 'T',
+      query: '',
+      page: 3,
+    }),
+    'https://amiga-proxy.vercel.app/api/catalog?source=planetemu&letter=T&page=3'
+  );
+
+  assert.equal(
+    buildCatalogApiUrl('', {
+      source: 'planetemu',
+      category: 'games',
+      letter: '0',
+      query: 'aladdin',
+      page: 1,
+    }),
+    '/api/catalog?source=planetemu&q=aladdin&page=1'
+  );
+
+  assert.notEqual(
+    makeCatalogCacheKey('', 'amiga500archive', 'games', '', 1),
+    makeCatalogCacheKey('', 'planetemu', '0', '', 1)
   );
 });
 

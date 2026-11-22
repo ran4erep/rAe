@@ -10,13 +10,14 @@ import {
   ADF_TOTAL_SIZE,
   decodeMfmSector,
   encodeAdfTrackToMfm,
+  FLOPPY_HOTSWAP_EJECT_FRAMES,
   MFM_TRACK_BYTES,
   verifyAmigaBootblockChecksum,
   writeAmigaBootblockChecksum,
 } from './floppy';
 import { createBlankFormattedHdf } from '../archives/amigaDosFs';
 import { buildBuiltinAdf } from '../roms/openKickKernel';
-import { AmigaMachine } from './amigaMachine';
+import { AmigaMachine, detectVideoStandardFromName } from './amigaMachine';
 import { DEFAULT_AMIGA_CONFIG } from '../types';
 
 test('Amiga keyboard CIA-A serial wire encoding round-trips all raw keycodes', () => {
@@ -1255,6 +1256,1444 @@ test('Copper mid-scanline COLOR00 splits render horizontal RGB gradients with cy
   assert.equal(fb[rowOff + 264], 0xff00ff00); // ABGR green after $82
   assert.equal(fb[rowOff + 520], 0xffff0000); // ABGR blue after $C2
 });
+
+test('Copper end-of-line splits (H >= $D0) defer whole-scanline registers and 32-bit BPLxPT pairs until after renderScanline', () => {
+  const amiga = new AmigaMachine(
+    { chipset: 'ECS', videoStandard: 'PAL', overscan: 'none', audioEnabled: false },
+    { skipDefaultDisk: true }
+  );
+  amiga.memory.ovl = false;
+  const c = amiga.chipset;
+  const wr16 = (addr: number, val: number) => amiga.memory.write16(addr, val);
+
+  // Fill test bitplane regions:
+  // $021000..$0210FF: $FFFF (stale garbage -> solid COLOR01 green if BPLCON0 enables too early)
+  // $022000..$0220FF: $0000 (clean zeros for next line)
+  // $02FFE0..$02FFFF: $AAAA (active pattern on wrap line 60)
+  // $030000..$0300FF: $FFFF (clean target after wrap at $DA)
+  // $03FFE0..$03FFFF: $5555 (torn pointer trap if BPL1PTH writes before renderScanline without BPL1PTL)
+  for (let i = 0; i < 64; i++) {
+    wr16(0x021000 + i * 2, 0xffff);
+    wr16(0x022000 + i * 2, 0x0000);
+    wr16(0x030000 + i * 2, 0xffff);
+  }
+  for (let i = 0; i < 16; i++) {
+    wr16(0x02ffe0 + i * 2, 0xaaaa);
+    wr16(0x03ffe0 + i * 2, 0x5555);
+  }
+
+  // Copperlist at $014000:
+  // Line 50: BPLCON0=$0000, BPL1PT=$021000, COLOR00=$000, COLOR01=$0F0.
+  // At WAIT (50, $D0): BPLCON0=$1200, BPL1PT=$022000 (must NOT enable $021000 garbage on line 50!).
+  // Line 59: BPL1MOD=0, BPLCON0=$1200, BPL1PT=$02FFE0 (active $AAAA).
+  // At WAIT (60, $DA): BPL1PTH=$0003, BPL1PTL=$0000 (must NOT tear BPL1PT to $03FFE0 on line 60; line 61 must see $030000).
+  const base = 0x014000;
+  const cl = [
+    0x008e, 0x2c81, // DIWSTRT
+    0x0090, 0x2cc1, // DIWSTOP
+    0x0092, 0x0038, // DDFSTRT
+    0x0094, 0x00d0, // DDFSTOP
+    0x0108, 0x0000, // BPL1MOD=0
+    0x0180, 0x0000, // COLOR00=black
+    0x0182, 0x00f0, // COLOR01=green
+    0x0100, 0x0000, // BPLCON0=off
+    0x00e0, 0x0002, 0x00e2, 0x1000, // BPL1PT=$021000 (garbage)
+    // Line 50 H=$D0 split: turn on bitplanes & switch pointer to clean $022000 for line 51
+    0x32d1, 0xfffe,
+    0x0100, 0x1200,
+    0x00e0, 0x0002, 0x00e2, 0x2000,
+    // Line 59 setup for line 60 circular wrap test
+    0x3b01, 0xfffe,
+    0x0108, 0xffd8, // BPL1MOD=-40 so line 59 & line 60 both start at $02FFE0 before wrap
+    0x00e0, 0x0002, 0x00e2, 0xffe0,
+    // Line 60 H=$DA split: wrap BPL1PT to $030000 for line 61
+    0x3cdb, 0xfffe,
+    0x0108, 0x0000,
+    0x00e0, 0x0003,
+    0x00e2, 0x0000,
+    0xffff, 0xfffe,
+  ];
+  for (let i = 0; i < cl.length; i++) wr16(base + i * 2, cl[i]);
+
+  c.writeReg16(0x080, (base >>> 16) & 0x1f);
+  c.writeReg16(0x082, base & 0xffff);
+  c.writeReg16(0x096, 0x8380); // DMA_MASTER | DMA_BITPLANE | DMA_COPPER
+  c.startFrame();
+
+  for (let line = 0; line <= 61; line++) {
+    c.runCopperLine(line, 0xdb);
+    c.renderScanline(line, line >= 50 && line <= 61);
+    c.runCopperLine(line, 0xfe);
+  }
+
+  const fb = amiga.getFramebuffer();
+  const row50 = (50 - 44) * 640;
+  const row51 = (51 - 44) * 640;
+  const row60 = (60 - 44) * 640;
+  const row61 = (61 - 44) * 640;
+
+  // Line 50 must remain completely black (deferred BPLCON0=$1200 must not leak into line 50)
+  for (let x = 0; x < 640; x += 4) {
+    assert.equal(fb[row50 + x], 0xff000000, `Line 50 pixel ${x} must be black, got 0x${fb[row50 + x].toString(16)}`);
+  }
+  // Line 51 uses $022000 (all zeros -> black)
+  assert.equal(fb[row51 + 16], 0xff000000, 'Line 51 must render clean $022000 buffer');
+
+  // Line 60 must read intact $02FFE0 ($AAAA: bit 15=1 green, bit 14=0 black), NOT torn $03FFE0 ($5555)
+  assert.equal(fb[row60 + 0], 0xff00ff00, 'Line 60 px 0 must match $AAAA MSB=1 (green)');
+  assert.equal(fb[row60 + 2], 0xff000000, 'Line 60 px 2 must match $AAAA bit 14=0 (black)');
+
+  // Line 61 must use wrapped $030000 ($FFFF -> solid green)
+  assert.equal(fb[row61 + 0], 0xff00ff00, 'Line 61 px 0 must match wrapped $030000 (green)');
+  assert.equal(fb[row61 + 2], 0xff00ff00, 'Line 61 px 2 must match wrapped $030000 (green)');
+});
+
+test('VHPOSR ($DFF006/$DFF007) horizontal beam advances per CPU cycle and unblocks Black Crypt $DFF007 wait loop', () => {
+  for (const ecoCpuMode of [false, true]) {
+    const amiga = new AmigaMachine(
+      { chipset: 'ECS', videoStandard: 'PAL', ecoCpuMode, audioEnabled: false },
+      { skipDefaultDisk: true }
+    );
+    amiga.memory.ovl = false;
+
+    // Exact wait routine seen in Black Crypt ($C0F3D6..$C0F3EC):
+    //   MOVEQ #$79, D0
+    //   MOVE.B $00DFF007, D1
+    //   CMP.B  $00DFF007, D1
+    //   BEQ.S  -8
+    //   DBF    D0, -16
+    //   STOP   #$2700
+    const code = [
+      0x7079,
+      0x1239, 0x00df, 0xf007,
+      0xb239, 0x00df, 0xf007,
+      0x67f8,
+      0x51c8, 0xfff0,
+      0x4e72, 0x2700,
+    ];
+    for (let i = 0; i < code.length; i++) {
+      amiga.memory.write16(0x010000 + i * 2, code[i]);
+    }
+    amiga.cpu.sr = 0x2700; // Supervisor, mask IRQs so OpenKick/VBlank vectors don't preempt
+    amiga.cpu.pc = 0x010000;
+    amiga.cpu.stopped = false;
+
+    amiga.stepFrame(false, false);
+
+    assert.equal(amiga.cpu.stopped, true, `ecoCpuMode=${ecoCpuMode}: CPU must exit $DFF007 wait loop and reach STOP`);
+    assert.equal(amiga.cpu.pc, 0x010018);
+    assert.equal(amiga.cpu.d[0] & 0xffff, 0xffff);
+  }
+
+  // Verify intra-scanline getHpos() range 0..226 ($00..$E2) and standalone fallback after finishFrame()
+  const amiga = new AmigaMachine({ audioEnabled: false }, { skipDefaultDisk: true });
+  amiga.chipset.beginScanline(100, amiga.cpu.cycles, 454);
+  assert.equal(amiga.chipset.readReg16(0x006), (100 << 8) | 0);
+  amiga.cpu.cycles += 200;
+  const midHpos = amiga.chipset.readReg16(0x006) & 0xff;
+  assert.equal(midHpos, 100);
+  amiga.cpu.cycles += 300;
+  assert.equal(amiga.chipset.readReg16(0x006) & 0xff, 226);
+
+  amiga.chipset.finishFrame();
+  amiga.chipset.hpos = 0x42;
+  assert.equal(amiga.chipset.readReg16(0x006) & 0xff, 0x42);
+});
+
+test('AmigaMachine.insertBlankAdf encodes custom AmigaDOS volume label into OFS root block', () => {
+  const amiga = new AmigaMachine({ audioEnabled: false }, { skipDefaultDisk: true });
+  const diskName = amiga.insertBlankAdf(0, undefined, 'MySaves:1/2');
+  assert.equal(diskName, 'MySaves12.adf');
+  assert.equal(amiga.getStatusSnapshot().df0.name, 'MySaves12.adf');
+
+  const exported = amiga.exportDriveAdf(0);
+  assert.ok(exported);
+  const rootOff = 880 * 512;
+  const labelLen = exported.bytes[rootOff + 432];
+  assert.equal(labelLen, 9);
+  const decodedLabel = Array.from(exported.bytes.slice(rootOff + 433, rootOff + 433 + labelLen))
+    .map((b) => String.fromCharCode(b))
+    .join('');
+  assert.equal(decodedLabel, 'MySaves12');
+});
+
+test('Hot-swapping ADF over an occupied drive holds /CHNG low & gates DMA for FLOPPY_HOTSWAP_EJECT_FRAMES so Kickstart unmounts the old volume cleanly', () => {
+  const amiga = new AmigaMachine({ turboFloppy: true, audioEnabled: false }, { skipDefaultDisk: true });
+  amiga.memory.ovl = false;
+
+  const disk1 = new Uint8Array(ADF_TOTAL_SIZE);
+  disk1[0] = 0x11;
+  const disk2 = new Uint8Array(ADF_TOTAL_SIZE);
+  disk2[0] = 0x22;
+
+  // Inserting into an empty DF1: is immediate (ejectHoldFrames = 0)
+  amiga.insertAdf(1, disk1, 'Disk1.adf', false);
+  const d1 = amiga.floppy.drives[1];
+  assert.equal(d1.ejectHoldFrames, 0);
+  assert.equal(d1.diskChanged, true);
+
+  // Select DF1 with motor on and step once to acknowledge disk1 (/CHNG clears)
+  amiga.floppy.handleCiaBPrb(0x6f, 0xff); // /SEL1=0, /MTR=0, STEP=1
+  d1.step(false);
+  assert.equal(d1.diskChanged, false);
+  assert.notEqual(amiga.floppy.getCiaAStatusBits() & 0x04, 0); // /CHNG high (inactive)
+  assert.equal(amiga.floppy.getCiaAStatusBits() & 0x20, 0); // /RDY low (ready)
+
+  // Hot-swap disk2 directly over occupied DF1: metadata updates immediately, but /CHNG holds low across steps
+  amiga.insertAdf(1, disk2, 'Disk2.adf', false);
+  assert.equal(d1.name, 'Disk2.adf');
+  assert.equal(d1.data?.[0], 0x22);
+  assert.equal(d1.ejectHoldFrames, FLOPPY_HOTSWAP_EJECT_FRAMES);
+  assert.equal(d1.diskChanged, true);
+  assert.equal(amiga.floppy.getCiaAStatusBits() & 0x04, 0); // /CHNG low
+  assert.notEqual(amiga.floppy.getCiaAStatusBits() & 0x20, 0); // /RDY high (unseated)
+
+  // Stepping during the eject-hold window must NOT clear /CHNG and DMA must stay blocked
+  d1.step(true);
+  assert.equal(d1.diskChanged, true);
+  assert.equal(amiga.floppy.alignToWordSync(0x4489), false);
+  assert.equal(amiga.floppy.streamDiskDmaWords(0x010000, 16, () => {}), 0);
+
+  // After FLOPPY_HOTSWAP_EJECT_FRAMES frames, disk2 is seated; next step clears /CHNG and allows DMA
+  for (let i = 0; i < FLOPPY_HOTSWAP_EJECT_FRAMES; i++) {
+    amiga.stepFrame(false, false);
+  }
+  assert.equal(d1.ejectHoldFrames, 0);
+  assert.equal(d1.diskChanged, true); // Still asserted until next head step
+
+  amiga.floppy.handleCiaBPrb(0x6f, 0xff);
+  d1.step(false);
+  assert.equal(d1.diskChanged, false);
+  assert.notEqual(amiga.floppy.getCiaAStatusBits() & 0x04, 0);
+  assert.equal(amiga.floppy.getCiaAStatusBits() & 0x20, 0);
+  assert.equal(amiga.floppy.alignToWordSync(0x4489), true);
+
+  // Rapid eject -> immediate insert still enforces the removal hold window, while hardReset clears it
+  amiga.ejectDisk(1);
+  assert.equal(d1.ejectHoldFrames, FLOPPY_HOTSWAP_EJECT_FRAMES);
+  amiga.stepFrame(false, false);
+  amiga.insertAdf(1, disk1, 'Disk1.adf', false);
+  assert.ok(d1.ejectHoldFrames >= FLOPPY_HOTSWAP_EJECT_FRAMES - 1);
+  amiga.hardReset();
+  assert.equal(d1.ejectHoldFrames, 0);
+});
+
+test('NTSC PAL-raster-wait deadlock detector rescues Humans-style VPOSR > $0110 loop without resetting CPU and ignores normal NTSC input loops', () => {
+  // 1. Reproduce exact Humans 1 deadlock from humans.json ($C089D6..$C089EA) in NTSC ECS mode
+  const amiga = new AmigaMachine(
+    { chipset: 'ECS', videoStandard: 'NTSC', overscan: 'auto', audioEnabled: false },
+    { skipDefaultDisk: true }
+  );
+  // Boot OpenKick briefly so VBlank vector is installed, then inject the exact loop into Chip RAM
+  amiga.stepFrame(false, false);
+  amiga.stepFrame(false, false);
+
+  const loopBase = 0x010000;
+  const humansLoop = [
+    0x302e, 0x0004, // MOVE.W 4(A6), D0  (VPOSR)
+    0x4840,         // SWAP   D0
+    0x302e, 0x0006, // MOVE.W 6(A6), D0  (VHPOSR)
+    0xe088,         // LSR.L  #8, D0
+    0x0240, 0x01ff, // ANDI.W #$01FF, D0
+    0x0c40, 0x0110, // CMPI.W #$0110, D0 (line 272 > NTSC 262!)
+    0x6fea,         // BLE.S  -22 ($010000)
+    0x4e72, 0x2700, // STOP   #$2700 (reached once unblocked!)
+  ];
+  for (let i = 0; i < humansLoop.length; i++) {
+    amiga.memory.write16(loopBase + i * 2, humansLoop[i]);
+  }
+  amiga.memory.write32(0x012000, 0xcafebabe); // Canary RAM value that must survive switch
+
+  amiga.cpu.a[6] = 0x00dff000;
+  amiga.cpu.sr = 0x2000; // Supervisor, IPL=0 (real VBlank IPL=3 still fires each frame)
+  amiga.cpu.pc = loopBase;
+  amiga.cpu.stopped = false;
+
+  const autoSwitches: string[] = [];
+  amiga.onAutoVideoStandardChange = (std) => autoSwitches.push(std);
+
+  // Run up to 25 frames in NTSC: loop must trigger automatic switch to PAL without resetting CPU/RAM
+  for (let f = 0; f < 25; f++) {
+    amiga.stepFrame(false, false);
+    if (amiga.config.videoStandard === 'PAL') break;
+  }
+  assert.equal(amiga.config.videoStandard, 'PAL');
+  assert.deepEqual(autoSwitches, ['PAL']);
+  assert.equal(amiga.chipset.isPalTiming(), true);
+  assert.equal(amiga.memory.read32(0x012000) >>> 0, 0xcafebabe);
+
+  // Next PAL frame reaches line 273 ($0111 > $0110), exits BLE.S cleanly, and hits STOP!
+  amiga.stepFrame(false, false);
+  assert.equal(amiga.cpu.stopped, true);
+  assert.equal(amiga.cpu.pc, loopBase + 26);
+
+  // 2. Negative check: a menu/loop that polls CIA-A Fire1 ($BFE001) or JOY1DAT alongside VPOSR must NOT trigger false PAL switch
+  const menuAmiga = new AmigaMachine(
+    { chipset: 'ECS', videoStandard: 'NTSC', audioEnabled: false },
+    { skipDefaultDisk: true }
+  );
+  menuAmiga.stepFrame(false, false);
+  menuAmiga.stepFrame(false, false);
+
+  const menuLoop = [
+    0x1239, 0x00bf, 0xe001, // MOVE.B $00BFE001, D1 (polls Fire button)
+    0x302e, 0x0004,         // MOVE.W 4(A6), D0
+    0x4840,                 // SWAP   D0
+    0x302e, 0x0006,         // MOVE.W 6(A6), D0
+    0xe088,                 // LSR.L  #8, D0
+    0x0240, 0x01ff,         // ANDI.W #$01FF, D0
+    0x0c40, 0x0110,         // CMPI.W #$0110, D0
+    0x6fe4,                 // BLE.S  -28 ($010000)
+  ];
+  for (let i = 0; i < menuLoop.length; i++) {
+    menuAmiga.memory.write16(loopBase + i * 2, menuLoop[i]);
+  }
+  menuAmiga.cpu.a[6] = 0x00dff000;
+  menuAmiga.cpu.sr = 0x2000;
+  menuAmiga.cpu.pc = loopBase;
+  menuAmiga.cpu.stopped = false;
+
+  for (let f = 0; f < 30; f++) {
+    menuAmiga.stepFrame(false, false);
+  }
+  assert.equal(menuAmiga.config.videoStandard, 'NTSC');
+  assert.equal(menuAmiga.chipset.isPalTiming(), false);
+});
+
+test('Auto video standard detects region tags, ECS BEAMCON0, and PAL DIW/Copper requirements without mutating auto config', () => {
+  assert.equal(DEFAULT_AMIGA_CONFIG.videoStandard, 'auto');
+  assert.equal(detectVideoStandardFromName('Marble Madness (USA).adf'), 'NTSC');
+  assert.equal(detectVideoStandardFromName('Defender of the Crown [NTSC].adf'), 'NTSC');
+  assert.equal(detectVideoStandardFromName('Chaos Engine (Europe).adf'), 'PAL');
+  assert.equal(detectVideoStandardFromName('Humans (1992)(Gametek).adf'), null);
+  assert.equal(detectVideoStandardFromName('Status_Demo.adf'), null);
+
+  // 1. Auto defaults to PAL, switches to NTSC when booting a (USA) disk, then self-heals to PAL if game opens PAL DIW > 262
+  const amiga = new AmigaMachine(
+    { chipset: 'ECS', videoStandard: 'auto', audioEnabled: false },
+    { skipDefaultDisk: true }
+  );
+  assert.equal(amiga.config.videoStandard, 'auto');
+  assert.equal(amiga.getActiveVideoStandard(), 'PAL');
+
+  const events: Array<{ std: string; reason: string }> = [];
+  amiga.onAutoVideoStandardChange = (std, reason) => events.push({ std, reason });
+
+  const usaDisk = new Uint8Array(ADF_TOTAL_SIZE);
+  amiga.insertAdf(0, usaDisk, 'TestGame (USA).adf', true);
+  assert.equal(amiga.config.videoStandard, 'auto');
+  assert.equal(amiga.getActiveVideoStandard(), 'NTSC');
+  assert.equal(amiga.chipset.isPalTiming(), false);
+  assert.equal(amiga.getStatusSnapshot().videoStandard, 'NTSC');
+
+  // Emulate real Kickstart + game opening a PAL Display Window (DIWSTOP=$2CC1 -> line 300 > 262)
+  amiga.isOpenKick = false;
+  amiga.memory.ovl = false;
+  amiga.cpu.stopped = true;
+  amiga.chipset.writeReg16(0x096, 0x8300); // DMA_MASTER | DMA_BITPLANE
+  amiga.chipset.writeReg16(0x100, 0x1200); // 1 bitplane
+  amiga.chipset.writeReg16(0x08e, 0x2c81); // DIWSTRT
+  amiga.chipset.writeReg16(0x090, 0x2cc1); // DIWSTOP -> diwVStop = 300 (> 262!)
+
+  for (let f = 0; f < 8; f++) {
+    amiga.stepFrame(false, false);
+  }
+  assert.equal(amiga.config.videoStandard, 'auto', 'Auto mode preference must stay "auto"');
+  assert.equal(amiga.getActiveVideoStandard(), 'PAL');
+  assert.equal(amiga.chipset.isPalTiming(), true);
+  assert.equal(events.at(-1)?.reason, 'diw');
+
+  // 2. ECS BEAMCON0 write dynamically toggles Auto activeVideoStandard between NTSC and PAL
+  events.length = 0;
+  amiga.chipset.writeReg16(0x090, 0xf4c1); // Standard NTSC DIWSTOP (line 244)
+  amiga.chipset.writeReg16(0x1dc, 0x0000); // ECS BEAMCON0 = NTSC
+  amiga.stepFrame(false, false);
+  assert.equal(amiga.getActiveVideoStandard(), 'NTSC');
+  assert.equal(events.at(-1)?.reason, 'beamcon0');
+
+  // 3. Copper PAL line-255 wrap ($FFE1 $FFFE) while in NTSC automatically switches back to PAL
+  const clBase = 0x014000;
+  const cl = [
+    0x0180, 0x0111,
+    0xffe1, 0xfffe, // PAL line-255 wrap
+    0x0901, 0xfffe,
+    0x0180, 0x0f00,
+    0xffff, 0xfffe,
+  ];
+  for (let i = 0; i < cl.length; i++) amiga.memory.write16(clBase + i * 2, cl[i]);
+  amiga.chipset.writeReg16(0x080, (clBase >>> 16) & 0x1f);
+  amiga.chipset.writeReg16(0x082, clBase & 0xffff);
+  amiga.chipset.writeReg16(0x096, 0x8280); // DMA_MASTER | DMA_COPPER
+
+  for (let f = 0; f < 6; f++) {
+    amiga.stepFrame(false, false);
+  }
+  assert.equal(amiga.config.videoStandard, 'auto');
+  assert.equal(amiga.getActiveVideoStandard(), 'PAL');
+  assert.equal(events.at(-1)?.reason, 'copper');
+});
+
+test('Paula Disk DMA separates INT_DSKSYN from INT_DSKBLK across scanlines and delivers DSKBLK after post-DSKLEN setup on track 6', () => {
+  // 1. Small read (4 words) with WORDSYNC in normal mode must raise DSKSYN before DSKBLK (never same scanline)
+  const amiga = new AmigaMachine({ turboFloppy: false, audioEnabled: false }, { skipDefaultDisk: true });
+  amiga.memory.ovl = false;
+  amiga.cpu.stopped = true;
+  amiga.insertBlankAdf(0, 'SyncTest.adf');
+  amiga.floppy.handleCiaBPrb(0x77, 0xff); // Select DF0, motor ON
+
+  // Step head to cylinder 6
+  for (let c = 0; c < 6; c++) {
+    amiga.floppy.handleCiaBPrb(0x74, 0x77); // DIR=0 inward, STEP=0
+    amiga.floppy.handleCiaBPrb(0x75, 0x74); // STEP rising edge -> cylinder++
+  }
+  assert.equal(amiga.floppy.drives[0].cylinder, 6);
+
+  amiga.chipset.writeReg16(0x096, 0x8210); // DMA_MASTER | DMA_DISK
+  amiga.chipset.writeReg16(0x09e, 0x8400); // ADKCON WORDSYNC
+  amiga.chipset.writeReg16(0x07e, 0x4489); // DSKSYNC = $4489
+  amiga.chipset.writeReg16(0x020, 0x0001);
+  amiga.chipset.writeReg16(0x022, 0x8000); // DSKPT = $018000
+  amiga.chipset.writeReg16(0x09c, 0x1002); // Clear DSKSYN | DSKBLK
+  amiga.chipset.writeReg16(0x024, 0x8004);
+  amiga.chipset.writeReg16(0x024, 0x8004);
+
+  // Consume 2-scanline delay
+  amiga.chipset.stepDiskDma(4);
+  amiga.chipset.stepDiskDma(4);
+  assert.equal(amiga.chipset.intreq & 0x1002, 0);
+
+  // Scanline 3: DSKSYN fires, DSKBYTR reports DMAON|WORDEQUAL, DSKBLK must NOT be raised yet
+  amiga.chipset.stepDiskDma(4);
+  assert.notEqual(amiga.chipset.intreq & 0x1000, 0, 'INT_DSKSYN must be raised on sync scanline');
+  assert.equal(amiga.chipset.intreq & 0x0002, 0, 'INT_DSKBLK must NOT fire on the same scanline as INT_DSKSYN');
+  assert.equal(amiga.chipset.dskDmaActive, true);
+  assert.equal(amiga.chipset.readReg16(0x01a) & 0x5000, 0x5000, 'DSKBYTR must report DMAON + WORDEQUAL');
+
+  // Simulate loader clearing DSKSYN | DSKBLK ($1002) right after observing DSKSYN
+  amiga.chipset.writeReg16(0x09c, 0x1002);
+
+  // Scanline 4: 4 words stream into Chip RAM, DMA finishes, and INT_DSKBLK is cleanly raised
+  amiga.chipset.stepDiskDma(4);
+  assert.equal(amiga.chipset.dskDmaActive, false);
+  assert.equal(amiga.chipset.dskDmaWordsLeft, 0);
+  assert.equal(amiga.memory.read16(0x018000), 0x4489);
+  assert.notEqual(amiga.chipset.intreq & 0x0002, 0, 'INT_DSKBLK must be raised after data transfer');
+  assert.equal(amiga.chipset.readReg16(0x01a) & 0x4000, 0, 'DSKBYTR DMAON must clear once DMA ends');
+
+  // 2. Trackloader running 68k code in Turbo Floppy mode on track 6:
+  //    writes DSKLEN twice, stalls ~500 cycles (e.g. setup/ISR), clears $1002 in INTREQ, then polls BTST #1, INTREQR+1
+  const turbo = new AmigaMachine({ turboFloppy: true, audioEnabled: false }, { skipDefaultDisk: true });
+  turbo.memory.ovl = false;
+  turbo.insertBlankAdf(0, 'HumansTrack6.adf');
+  turbo.floppy.handleCiaBPrb(0x77, 0xff);
+  for (let c = 0; c < 6; c++) {
+    turbo.floppy.handleCiaBPrb(0x74, 0x77);
+    turbo.floppy.handleCiaBPrb(0x75, 0x74);
+  }
+  turbo.chipset.writeReg16(0x096, 0x8210);
+  turbo.chipset.writeReg16(0x09e, 0x8400);
+  turbo.chipset.writeReg16(0x07e, 0x4489);
+  turbo.chipset.writeReg16(0x020, 0x0002);
+  turbo.chipset.writeReg16(0x022, 0x0000); // DSKPT = $020000
+
+  // 68000 routine at $010000:
+  // A6=$DFF000; write DSKLEN=$8230 twice; delay ~550 cycles (DBRA loop);
+  // wait DSKSYN, clear INTREQ=$1002, wait DSKBLK, STOP #$2700
+  const prog = [
+    0x3d7c, 0x8230, 0x0024, // MOVE.W #$8230, $24(A6) (DSKLEN)
+    0x3d7c, 0x8230, 0x0024, // MOVE.W #$8230, $24(A6)
+    0x303c, 0x0028,         // MOVE.W #40, D0 (~400+ cycles delay before clearing INTREQ)
+    0x51c8, 0xfffe,         // DBRA D0, -2
+    0x082e, 0x0004, 0x001e, // BTST #4, $1E(A6) (DSKSYN in high byte of INTREQR)
+    0x67f8,                 // BEQ.S -8
+    0x3d7c, 0x1002, 0x009c, // MOVE.W #$1002, $9C(A6) (clear DSKSYN | DSKBLK)
+    0x082e, 0x0001, 0x001f, // BTST #1, $1F(A6) (DSKBLK in low byte of INTREQR)
+    0x67f8,                 // BEQ.S -8
+    0x4e72, 0x2700,         // STOP #$2700
+  ];
+  for (let i = 0; i < prog.length; i++) turbo.memory.write16(0x010000 + i * 2, prog[i]);
+  turbo.cpu.a[6] = 0x00dff000;
+  turbo.cpu.sr = 0x2700;
+  turbo.cpu.pc = 0x010000;
+  turbo.cpu.stopped = false;
+
+  turbo.stepFrame(false, false);
+  assert.equal(turbo.cpu.stopped, true, 'Trackloader must observe DSKBLK and reach STOP instead of hanging');
+  assert.equal(turbo.chipset.dskDmaActive, false);
+  assert.equal(turbo.memory.read16(0x020000), 0x4489);
+  assert.notEqual(turbo.chipset.intreq & 0x0002, 0);
+
+  // 3. DSKLEN armed before DMACON DMA_DISK enable and 0-word DSKLEN ($8000 x2) still raise DSKBLK
+  const edge = new AmigaMachine({ turboFloppy: false, audioEnabled: false }, { skipDefaultDisk: true });
+  edge.memory.ovl = false;
+  edge.insertBlankAdf(0, 'EdgeTest.adf');
+  edge.floppy.handleCiaBPrb(0x77, 0xff);
+  edge.chipset.writeReg16(0x020, 0x0001);
+  edge.chipset.writeReg16(0x022, 0x0000);
+  edge.chipset.writeReg16(0x024, 0x8004);
+  edge.chipset.writeReg16(0x024, 0x8004); // Armed before DMACON!
+  edge.chipset.writeReg16(0x096, 0x8210); // Now enable DMA_MASTER | DMA_DISK
+  edge.chipset.writeReg16(0x09e, 0x8400); // Enable WORDSYNC during delay
+  for (let i = 0; i < 6; i++) edge.chipset.stepDiskDma(4);
+  assert.equal(edge.chipset.dskDmaActive, false);
+  assert.equal(edge.memory.read16(0x010000), 0x4489);
+  assert.notEqual(edge.chipset.intreq & 0x0002, 0);
+
+  // Zero-word DSKLEN=$8000 twice triggers DSKBLK after delay
+  edge.chipset.writeReg16(0x09c, 0x0002);
+  edge.chipset.writeReg16(0x024, 0x8000);
+  edge.chipset.writeReg16(0x024, 0x8000);
+  for (let i = 0; i < 4; i++) edge.chipset.stepDiskDma(4);
+  assert.equal(edge.chipset.dskDmaActive, false);
+  assert.notEqual(edge.chipset.intreq & 0x0002, 0);
+});
+
+test('AGA Alice/Lisa hardware IDs (VPOSR=$22/$32, LISAID=$00F8) and 256-color 24-bit palette rendering', () => {
+  const amiga = new AmigaMachine(
+    { chipset: 'AGA', videoStandard: 'PAL', chipRamKB: 2048, audioEnabled: false },
+    { skipDefaultDisk: true }
+  );
+  const c = amiga.chipset;
+  const chip = amiga.memory.chipRam;
+
+  assert.equal(amiga.cpu.is68020, true);
+  assert.equal((c.readReg16(0x004) >>> 8) & 0x7f, 0x22); // AGA PAL Alice
+  assert.equal(c.readReg16(0x07c), 0x00f8);              // AGA Lisa
+
+  amiga.updateConfig({ chipset: 'AGA', videoStandard: 'NTSC' });
+  assert.equal((c.readReg16(0x004) >>> 8) & 0x7f, 0x32); // AGA NTSC Alice
+  amiga.updateConfig({ chipset: 'AGA', videoStandard: 'PAL' });
+
+  // Program Color 200 (Bank 6 = bits 15..13 = 6 = $C000, sub-index 8 -> $190) to 24-bit RGB ($12, $34, $56)
+  // Upper nibbles ($1, $3, $5 -> $0135) with LOCT=0, then lower nibbles ($2, $4, $6 -> $0246) with LOCT=1 ($0200)
+  c.writeReg16(0x106, 0xc000); // Bank 6, LOCT=0
+  c.writeReg16(0x190, 0x0135); // Color 200 upper
+  c.writeReg16(0x106, 0xc200); // Bank 6, LOCT=1
+  c.writeReg16(0x190, 0x0246); // Color 200 lower
+  assert.equal(c.colorReg24[200], 0x123456);
+  // Restore BPLCON3 bank 0
+  c.writeReg16(0x106, 0x0c00);
+
+  // Set up 8-bitplane Lo-Res display with pixel 0 = color index 200 (0xC8 = bits 7, 6, 3)
+  c.writeReg16(0x096, 0x8300); // DMA_MASTER | DMA_BITPLANE
+  c.writeReg16(0x08e, 0x2c81);
+  c.writeReg16(0x090, 0xf4c1);
+  c.writeReg16(0x092, 0x0038);
+  c.writeReg16(0x094, 0x00d0);
+  c.writeReg16(0x100, 0x0210); // BPLCON0 BPU3=1 ($0010) -> 8 bitplanes, COLOR=1
+  c.writeReg16(0x102, 0x0000);
+  c.writeReg16(0x108, 0x0000);
+  c.writeReg16(0x10a, 0x0000);
+  for (let p = 0; p < 8; p++) {
+    const addr = 0x020000 + p * 0x1000;
+    chip.fill(0, addr, addr + 40);
+    // Color index 200 = 0b11001000 -> planes 3, 6, 7 have bit 7 ($80) set at byte 0
+    chip[addr] = (200 & (1 << p)) !== 0 ? 0x80 : 0x00;
+    c.writeReg16(0x0e0 + p * 4, (addr >>> 16) & 0xff);
+    c.writeReg16(0x0e2 + p * 4, addr & 0xffff);
+  }
+
+  c.renderScanline(44, true);
+  // ABGR32 for RGB $12,$34,$56 is 0xFF563412
+  assert.equal(amiga.getFramebuffer()[0], 0xff563412);
+});
+
+test('AGA HAM8 mode, BPLCON4 BPLAM/sprite offset, and FMODE 64-bit bitplane + 64px sprite fetches render cleanly', () => {
+  const amiga = new AmigaMachine(
+    { chipset: 'AGA', videoStandard: 'PAL', chipRamKB: 2048, audioEnabled: false },
+    { skipDefaultDisk: true }
+  );
+  const c = amiga.chipset;
+  const chip = amiga.memory.chipRam;
+  amiga.memory.ovl = false;
+
+  c.writeReg16(0x096, 0x8320); // DMA_MASTER | DMA_BITPLANE | DMA_SPRITE
+  c.writeReg16(0x08e, 0x2c81);
+  c.writeReg16(0x090, 0xf4c1);
+  c.writeReg16(0x092, 0x0038);
+  c.writeReg16(0x094, 0x00d0);
+  c.writeReg16(0x102, 0x0000);
+  c.writeReg16(0x108, 0x0000);
+  c.writeReg16(0x10a, 0x0000);
+  c.writeReg16(0x106, 0x0c00);
+
+  // 1) HAM8 test: BPU3=1 (8 planes) + HAM ($0800) -> $0810
+  // Pixel 0: ctrl=00, idx=1 -> palette[1] = ($00, $FF, $00) green
+  // Pixel 1: ctrl=10 (modify Red top 6 bits) with val=0x3F (0xFC) -> ($FC, $FF, $00) yellow-green
+  c.writeReg16(0x100, 0x0810);
+  c.writeReg16(0x10c, 0x0011); // BPLAM = 0
+  c.writeReg16(0x182, 0x00f0); // COLOR01 = $00FF00
+  const px0 = 0x01; // ctrl=00, data=1
+  const px1 = (0b10 << 6) | 0x3f; // ctrl=10 (modify R), data=63
+  for (let p = 0; p < 8; p++) {
+    const addr = 0x030000 + p * 0x1000;
+    chip.fill(0, addr, addr + 40);
+    let b = 0;
+    if ((px0 & (1 << p)) !== 0) b |= 0x80;
+    if ((px1 & (1 << p)) !== 0) b |= 0x40;
+    chip[addr] = b;
+    c.writeReg16(0x0e0 + p * 4, (addr >>> 16) & 0xff);
+    c.writeReg16(0x0e2 + p * 4, addr & 0xffff);
+  }
+  c.renderScanline(44, true);
+  const fb = amiga.getFramebuffer();
+  assert.equal(fb[0], 0xff00ff00); // Pixel 0 = green
+  assert.equal(fb[2], 0xff00fffc); // Pixel 1 = R=$FC, G=$FF, B=$00 -> ABGR 0xFF00FFFC
+
+  // 2) BPLCON4 BPLAM=$80 XORs bitplane color index from 0 -> 128; FMODE=3 uses 64-bit fetch chunks
+  c.writeReg16(0x106, 0x8000); // Bank 4 (colors 128..159)
+  c.writeReg16(0x180, 0x0f0f); // Color 128 = magenta ($FF00FF)
+  c.writeReg16(0x106, 0x0c00);
+  c.writeReg16(0x10c, 0x8011); // BPLAM=$80, ESPRM=1, OSPRM=1
+  c.writeReg16(0x1fc, 0x000f); // FMODE = 64-bit BPL + 64px SPR
+  c.writeReg16(0x100, 0x1200); // 1 bitplane Lo-Res
+  c.writeReg16(0x094, 0x00a0); // Standard 320px AGA FMODE=3 stop ($38..$A0 = 5x8 = 40 bytes)
+  chip.fill(0, 0x030000, 0x030080);
+  c.writeReg16(0x0e0, 0x0003);
+  c.writeReg16(0x0e2, 0x0000);
+  c.renderScanline(45, true);
+  assert.equal(fb[1 * 640], 0xffff00ff, 'BPLAM=$80 must remap color 0 to palette[128] magenta');
+  assert.equal(c.bplPt[0], 0x030000 + 40, 'FMODE=3 $38..$A0 fetches 5x8=40 bytes cleanly');
+
+  // 3) 64px AGA sprite (FMODE SPR=3): Sprite 0 at H=$81 (pos low = $40, ctl bit 0 = 1), color offset = 16 -> color 17
+  c.writeReg16(0x180 + 17 * 2, 0x00ff); // Color 17 = cyan ($00FFFF)
+  c.writeReg16(0x10c, 0x0011); // BPLAM=0, ESPRM=1 (base 16)
+  c.writeReg16(0x140, (46 << 8) | 0x40); // V=46, H=$81
+  c.writeReg16(0x142, (47 << 8) | 0x01);
+  c.writeReg16(0x146, 0x0000);
+  c.writeReg16(0x144, 0x8000); // Manual SPR0DATA arm sets bit 15 of first 16px (dx=0)
+  c.writeReg16(0x0e0, 0x0003);
+  c.writeReg16(0x0e2, 0x0000);
+  c.renderScanline(46, true);
+  assert.equal(fb[2 * 640 + 0], 0xffffff00, '64px AGA manual SPR0DATA must render pixel 0 at X=0 in cyan');
+
+  // Also test 64px sprite DMA fetch via SPR0PT from Chip RAM ($040000): 16-byte header + 16-byte line
+  const sprBase = 0x040000;
+  chip.fill(0, sprBase, sprBase + 64);
+  const wr16 = (off: number, v: number) => {
+    amiga.memory.write16(sprBase + off, v);
+  };
+  wr16(0, (47 << 8) | 0x40); // POS: V=47, H=$81
+  wr16(8, (48 << 8) | 0x01); // CTL at offset +8 for 64px FMODE=3: VSTOP=48, H bit 0 = 1
+  // Line 47 data at sprBase+16: daHi=$80000000 (pixel 0), daLo=$00000001 (pixel 63) -> color 17 cyan
+  wr16(16, 0x8000);
+  wr16(22, 0x0001);
+  c.writeReg16(0x120, 0x0004);
+  c.writeReg16(0x122, 0x0000);
+  c.startFrame();
+  c.fetchSpriteHeaders();
+  c.writeReg16(0x0e0, 0x0003);
+  c.writeReg16(0x0e2, 0x0000);
+  c.renderScanline(47, true);
+  assert.equal(fb[3 * 640 + 0], 0xffffff00, '64px AGA DMA sprite pixel 0 must render at X=0');
+  assert.equal(fb[3 * 640 + 63 * 2], 0xffffff00, '64px AGA DMA sprite pixel 63 must render at X=63');
+});
+
+test('AGA 9-bit DDFSTOP ($0100 clamped to $D8), FMODE=1/2/3 ceiling fetch sizes, and BPLCON3 BRDRBLNK', () => {
+  const amiga = new AmigaMachine(
+    { chipset: 'AGA', videoStandard: 'PAL', chipRamKB: 2048, audioEnabled: false },
+    { skipDefaultDisk: true }
+  );
+  const c = amiga.chipset;
+  amiga.memory.ovl = false;
+
+  c.writeReg16(0x096, 0x8320); // DMA_MASTER | DMA_BITPLANE | DMA_SPRITE
+  c.writeReg16(0x08e, 0x3890); // DIWSTRT V=$38, H=$90 (lo-res X = 15)
+  c.writeReg16(0x090, 0x20b1); // DIWSTOP V=$120, H=$1B1 (lo-res X = 304 -> 289px wide)
+  c.writeReg16(0x102, 0x0000);
+  c.writeReg16(0x108, 0x0000);
+  c.writeReg16(0x10a, 0x0000);
+  c.writeReg16(0x100, 0x1201); // 1 bitplane Lo-Res, COLOR=1, ECSENA=1
+
+  const measureBytes = (ddfStrt: number, ddfStop: number, fmode: number, bplcon0 = 0x1201): number => {
+    c.writeReg16(0x100, bplcon0);
+    c.writeReg16(0x1fc, fmode);
+    c.writeReg16(0x092, ddfStrt);
+    c.writeReg16(0x094, ddfStop);
+    c.writeReg16(0x0e0, 0x0002);
+    c.writeReg16(0x0e2, 0x0000);
+    c.renderScanline(0x40, false);
+    return c.bplPt[0] - 0x020000;
+  };
+
+  // DDFSTOP bit 8 ($0100) must be preserved on ECS/AGA and clamped at hardware hard-stop $D8
+  c.writeReg16(0x094, 0x0100);
+  assert.equal(c.ddfStop, 0x0100, 'AGA must preserve 9th bit (0x0100) of DDFSTOP');
+  assert.equal(measureBytes(0x0038, 0x0100, 3), 48, 'FMODE=3 $38..$0100 clamps to $D8 -> 6x8=48 bytes');
+  assert.equal(measureBytes(0x0038, 0x00ca, 3), 48, 'FMODE=3 $38..$00CA ($C8) rounds up -> 6x8=48 bytes');
+  assert.equal(measureBytes(0x0038, 0x00d0, 3), 48, 'FMODE=3 $38..$00D0 rounds up -> 6x8=48 bytes');
+  assert.equal(measureBytes(0x0038, 0x00a0, 3), 40, 'FMODE=3 $38..$00A0 -> 5x8=40 bytes');
+
+  // FMODE=1/2 (32-bit fetch) ceiling rounding across LoRes, HiRes, SHRES
+  assert.equal(measureBytes(0x0038, 0x00ca, 1), 40, 'FMODE=1 LoRes $38..$C8 rounds up -> 10x4=40 bytes');
+  assert.equal(measureBytes(0x003c, 0x00ca, 1, 0x9201), 76, 'FMODE=1 HiRes $3C..$C8 rounds up -> 19x4=76 bytes');
+  assert.equal(measureBytes(0x003c, 0x00cc, 3, 0x9201), 80, 'FMODE=3 HiRes $3C..$CC -> 10x8=80 bytes');
+
+  // BPLCON3 BRDRBLNK ($0020): outside DIW must be pure black (0xFF000000) even with non-black COLOR00 & sprites
+  c.writeReg16(0x100, 0x1201); // 1 bitplane Lo-Res, ECSENA=1
+  c.writeReg16(0x1fc, 0x0003);
+  c.writeReg16(0x092, 0x0038);
+  c.writeReg16(0x094, 0x00ca);
+  c.writeReg16(0x106, 0x0020); // BRDRBLNK = 1
+  c.writeReg16(0x180, 0x0f00); // COLOR00 = bright red ($FF0000 -> ABGR 0xFF0000FF)
+  c.writeReg16(0x180 + 17 * 2, 0x00ff); // Sprite color 17 = cyan
+  c.writeReg16(0x140, (0x40 << 8) | 0x40); // Sprite at H=$81 (X=0, inside left border < $90)
+  c.writeReg16(0x142, (0x41 << 8) | 0x01);
+  c.writeReg16(0x146, 0x0000);
+  c.writeReg16(0x144, 0x8000);
+  amiga.memory.chipRam.fill(0, 0x020000, 0x020100);
+  c.writeReg16(0x0e0, 0x0002);
+  c.writeReg16(0x0e2, 0x0000);
+
+  // Render vertical border line (line 44 < DIWSTRT V=$38=56) and active line (0x40=64)
+  c.renderScanline(44, true);
+  c.renderScanline(0x40, true);
+  const fb = amiga.getFramebuffer();
+  assert.equal(fb[0], 0xff000000, 'BRDRBLNK must blank vertical border outside DIWSTRT/DIWSTOP');
+  const yActive = (0x40 - 44) * 640;
+  // Left border X = 0 (< (0x90 - 0x81) * 2 = 30) must be black even with sprite at X=0 and red COLOR00
+  assert.equal(fb[yActive + 0], 0xff000000, 'BRDRBLNK must blank left border and border sprites');
+  // Inside DIW (X = 32, between 30 and 608) shows COLOR00 bright red
+  assert.equal(fb[yActive + 32], 0xff0000ff, 'Inside DIW must still display COLOR00 when BRDRBLNK is active');
+  // Right border X = 620 (>= (0x1B1 - 0x81) * 2 = 608) must be black
+  assert.equal(fb[yActive + 620], 0xff000000, 'BRDRBLNK must blank right border outside DIWSTOP');
+});
+
+test('Amiga 1200 Gayle stub, Zorro II Fast RAM Autoconfig up to 8MB, and A500 <-> A1200 config switch', () => {
+  const amiga = new AmigaMachine(
+    { chipset: 'AGA', chipRamKB: 2048, fastRamKB: 8192, slowRamKB: 0, audioEnabled: false },
+    { skipDefaultDisk: true }
+  );
+
+  // AGA Gayle IDE Status ($DA201C) returns 0x40 (DRDY=1, BSY=0) so KS 3.1 scsi.device skips 30s wait
+  assert.equal(amiga.memory.read8(0xda201c), 0x40);
+  assert.equal(amiga.memory.read8(0xda3018), 0x40);
+  assert.equal(amiga.memory.read16(0xda0000), 0x0000);
+  assert.equal(amiga.memory.read8(0xde1000), 0x00);
+
+  // Zorro II Fast RAM Autoconfig at $E80000 exposes 8MB board (er_Type & 7 === 0 -> 8MB)
+  const erType =
+    (amiga.memory.read8(0xe80000) & 0xf0) | ((amiga.memory.read8(0xe80002) >>> 4) & 0x0f);
+  assert.equal(erType, 0xe0, '8MB Zorro II Fast RAM must advertise er_Type = $E0');
+
+  // Complete Fast RAM Autoconfig at $200000, then verify Hardfile still autoconfigs next at $EA0000!
+  const hdf = createBlankFormattedHdf(1, 'A1200HD');
+  amiga.mountHdf(hdf, 'dh0.hdf', false, 0);
+  amiga.memory.write8(0xe8004a, 0x00); // latch low nibble
+  amiga.memory.write8(0xe80048, 0x20); // assign Fast RAM base $200000
+  amiga.memory.write32(0x200100, 0x12345678);
+  amiga.memory.write32(0x900100, 0xabcdef01); // inside 8MB ($200000-$9FFFFF)
+  assert.equal(amiga.memory.read32(0x200100) >>> 0, 0x12345678);
+  assert.equal(amiga.memory.read32(0x900100) >>> 0, 0xabcdef01);
+
+  // Now Hardfile Autoconfig board must answer at $E80000
+  const hdType =
+    (amiga.memory.read8(0xe80000) & 0xf0) | ((amiga.memory.read8(0xe80002) >>> 4) & 0x0f);
+  assert.equal(hdType, 0xd1, 'Hardfile Zorro II board must take over $E80000 after Fast RAM');
+
+  // Switching to A500 (ECS) turns off 68EC020 mode
+  amiga.updateConfig({ chipset: 'ECS', chipRamKB: 1024, slowRamKB: 512, fastRamKB: 0 });
+  assert.equal(amiga.cpu.is68020, false);
+  assert.equal(amiga.getStatusSnapshot().chipset, 'ECS');
+
+  // Switching back to A1200 (AGA) re-enables 68EC020 mode and clears Gayle after-reset state
+  amiga.updateConfig({ chipset: 'AGA', chipRamKB: 2048, slowRamKB: 0, fastRamKB: 4096 });
+  assert.equal(amiga.cpu.is68020, true);
+  assert.equal(amiga.getStatusSnapshot().chipset, 'AGA');
+});
+
+test('Amiga 1200 Gayle ID $DE1000 bit sequence, 68EC020 unaligned RAM R/W, BRDRSPRT, and AGA HAM6', () => {
+  const amiga = new AmigaMachine(
+    { chipset: 'AGA', videoStandard: 'PAL', chipRamKB: 2048, audioEnabled: false },
+    { skipDefaultDisk: true }
+  );
+  amiga.memory.ovl = false;
+
+  // 1) Gayle ID sequence: 0x00 before write; after write to $DE1000, shifts 0xD0 MSB-first for 8 reads
+  assert.equal(amiga.memory.read8(0xde1000), 0x00);
+  amiga.memory.write8(0xde1000, 0x00);
+  const gayleBits: number[] = [];
+  for (let i = 0; i < 9; i++) gayleBits.push(amiga.memory.read8(0xde1000));
+  assert.deepEqual(gayleBits, [0x80, 0x80, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00]);
+  amiga.memory.clearRam();
+  assert.equal(amiga.memory.read8(0xde1000), 0x00);
+
+  // 2) 68EC020 unaligned 16/32-bit reads and writes
+  assert.equal(amiga.memory.allowUnaligned, true);
+  amiga.memory.write32(0x010001, 0x11223344);
+  assert.equal(amiga.memory.read32(0x010001) >>> 0, 0x11223344);
+  assert.equal(amiga.memory.read8(0x010001), 0x11);
+  assert.equal(amiga.memory.read8(0x010004), 0x44);
+  amiga.memory.write16(0x010003, 0xaabb);
+  assert.equal(amiga.memory.read16(0x010003), 0xaabb);
+
+  // 3) BRDRSPRT ($0002) with BRDRBLNK ($0020): sprites render in border while border stays black
+  const c = amiga.chipset;
+  c.writeReg16(0x096, 0x8320); // DMA_MASTER | DMA_BITPLANE | DMA_SPRITE
+  c.writeReg16(0x08e, 0x3890); // DIWSTRT
+  c.writeReg16(0x090, 0x20b1); // DIWSTOP
+  c.writeReg16(0x100, 0x1201); // 1 bitplane + ECSENA
+  c.writeReg16(0x106, 0x0022); // BRDRBLNK | BRDRSPRT
+  c.writeReg16(0x180, 0x0f00); // COLOR00 red
+  c.writeReg16(0x180 + 17 * 2, 0x00ff); // Sprite color 17 cyan
+  c.writeReg16(0x140, (0x40 << 8) | 0x40); // H=$81 -> X=0 (in left border)
+  c.writeReg16(0x142, (0x42 << 8) | 0x01);
+  c.writeReg16(0x146, 0x0000);
+  c.writeReg16(0x144, 0x8000);
+  c.writeReg16(0x0e0, 0x0002);
+  c.writeReg16(0x0e2, 0x0000);
+  c.renderScanline(0x40, true);
+  const fb = amiga.getFramebuffer();
+  const yActive = (0x40 - 44) * 640;
+  assert.equal(fb[yActive + 0], 0xffffff00, 'BRDRSPRT must allow sprite pixel at X=0 inside blanked border');
+  assert.equal(fb[yActive + 4], 0xff000000, 'Non-sprite pixel inside blanked border must stay black');
+
+  // 4) AGA HAM6 uses 24-bit base palette (not 12-bit)
+  c.writeReg16(0x106, 0x0000); // LOCT=0 (upper 4 bits)
+  c.writeReg16(0x182, 0x0123);
+  c.writeReg16(0x106, 0x0200); // LOCT=1 (lower 4 bits)
+  c.writeReg16(0x182, 0x0456); // Color 1 = RGB24 #142536
+  assert.equal(c.colorReg24[1], 0x142536);
+  c.writeReg16(0x106, 0x0000);
+  c.writeReg16(0x100, 0x6a01); // 6 bitplanes, HOMOD=1 -> HAM6
+  c.writeReg16(0x092, 0x0038);
+  c.writeReg16(0x094, 0x00d0);
+  for (let p = 0; p < 6; p++) {
+    const addr = 0x030000 + p * 0x100;
+    c.writeReg16(0x0e0 + p * 4, addr >>> 16);
+    c.writeReg16(0x0e2 + p * 4, addr & 0xffff);
+    amiga.memory.chipRam.fill(0, addr, addr + 64);
+  }
+  // startPx = (0x38 - 0x38)*2 + (0 - 0)&15 + (0x81 - 0x81) = 0 -> pixel 0 is at outPx=0
+  // First visible pixel inside DIW ($90): diwHStartLo = $90 - $81 = 15 (X = 30)
+  // byte 2 bit 7 = outPx 16 (X = 32, inside DIW): data4=1, ctrl=0 -> colorReg24[1] = #142536 (ABGR 0xFF362514)
+  amiga.memory.chipRam[0x030000 + 2] = 0x80;
+  c.renderScanline(0x41, true);
+  const yHam = (0x41 - 44) * 640;
+  assert.equal(fb[yHam + 32], 0xff362514, 'AGA HAM6 ctrl=0 must load full 24-bit color from colorReg24');
+});
+
+test('Kickstart 1.3 UserState() 68EC020 compat patch preserves checksum & restores on OCS/ECS, plus DF0 compat check', () => {
+  const checksumRom256 = (rom: Uint8Array): number => {
+    let sum = 0;
+    for (let i = 0; i < rom.length; i += 4) {
+      const w = ((rom[i] << 24) | (rom[i + 1] << 16) | (rom[i + 2] << 8) | rom[i + 3]) >>> 0;
+      const next = sum + w;
+      sum = (next + (next > 0xffffffff ? 1 : 0)) >>> 0;
+    }
+    return sum >>> 0;
+  };
+
+  // Build synthetic 256KB KS 1.3 ROM with exact Exec V34 UserState() sequence and valid checksum
+  const rom = new Uint8Array(262144);
+  rom[12] = 0x00;
+  rom[13] = 34; // Version 34 (KS 1.3)
+  const sig = [
+    0x20, 0x4d, 0x4b, 0xfa, 0x00, 0x06, 0x4e, 0xee, 0xff, 0xe2,
+    0x2a, 0x48, 0x32, 0x1f, 0x4e, 0x67, 0x2e, 0x40, 0x08, 0x81,
+    0x00, 0x0d, 0x46, 0xc1, 0x4e, 0x75,
+  ];
+  rom.set(sig, 0x11b0);
+  // Set checksum footer at rom.length - 0x18 so total end-around sum == 0xFFFFFFFF
+  const footerOff = rom.length - 0x18;
+  const partialSum = checksumRom256(rom);
+  const fixWord = (0xffffffff - partialSum) >>> 0;
+  rom[footerOff] = (fixWord >>> 24) & 0xff;
+  rom[footerOff + 1] = (fixWord >>> 16) & 0xff;
+  rom[footerOff + 2] = (fixWord >>> 8) & 0xff;
+  rom[footerOff + 3] = fixWord & 0xff;
+  assert.equal(checksumRom256(rom), 0xffffffff);
+
+  const amiga = new AmigaMachine(
+    { chipset: 'AGA', chipRamKB: 2048, audioEnabled: false },
+    { skipDefaultDisk: true }
+  );
+  amiga.loadCustomRom(rom, 'Kickstart 1.3 Test.rom');
+
+  // In AGA (68EC020) mode, UserState() at $FC11B0 is patched & ROM checksum remains 0xFFFFFFFF
+  assert.equal(amiga.memory.read16(0xfc11b0), 0x40c1, 'UserState must be patched to MOVE SR, D1');
+  assert.equal(checksumRom256(amiga.memory.rom), 0xffffffff, 'Patched KS 1.3 ROM must keep 0xFFFFFFFF checksum');
+
+  // Switching back to ECS (68000) restores exact original bytes & checksum
+  amiga.updateConfig({ chipset: 'ECS', chipRamKB: 1024, slowRamKB: 512, fastRamKB: 0 });
+  assert.equal(amiga.memory.read16(0xfc11b0), 0x204d, 'Switching back to 68000 must restore original UserState');
+  assert.equal(checksumRom256(amiga.memory.rom), 0xffffffff, 'Restored KS 1.3 ROM must keep 0xFFFFFFFF checksum');
+
+  // Check DF0 compatibility warnings
+  const ffsDisk = new Uint8Array(901120);
+  ffsDisk[0] = 0x44; ffsDisk[1] = 0x4f; ffsDisk[2] = 0x53; ffsDisk[3] = 0x01; // DOS\1 FFS
+  assert.ok(amiga.checkDf0KickstartCompat(ffsDisk, 'UFO_AGA.adf')?.includes('FFS'));
+  const ofsDisk = new Uint8Array(901120);
+  ofsDisk[0] = 0x44; ofsDisk[1] = 0x4f; ofsDisk[2] = 0x53; ofsDisk[3] = 0x00; // DOS\0 OFS
+  assert.equal(amiga.checkDf0KickstartCompat(ofsDisk, 'UFO_OCS.adf'), null);
+  assert.ok(amiga.checkDf0KickstartCompat(ofsDisk, 'UFO (AGA).adf')?.includes('Amiga 1200'));
+});
+
+test('Amiga 1200 boots real Kickstart 3.1 ROM rapidly without 30s Gayle IDE hang', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const ks31Path = path.resolve(
+    process.cwd(),
+    'bios',
+    'Kickstart v3.1 rev 40.68 (1993)(Commodore)(A1200)[!].rom'
+  );
+  if (!fs.existsSync(ks31Path)) return;
+
+  const romBytes = new Uint8Array(fs.readFileSync(ks31Path));
+  const amiga = new AmigaMachine(
+    {
+      chipset: 'AGA',
+      videoStandard: 'PAL',
+      chipRamKB: 2048,
+      slowRamKB: 0,
+      fastRamKB: 4096,
+      audioEnabled: false,
+    },
+    { skipDefaultDisk: true }
+  );
+  const res = amiga.loadCustomRom(romBytes, 'Kickstart v3.1 (A1200).rom');
+  assert.equal(res.ok, true);
+
+  for (let i = 0; i < 150; i++) {
+    amiga.stepFrame(i === 149);
+  }
+  const fb = amiga.getFramebuffer();
+  const colors = new Set<number>();
+  for (let i = 0; i < fb.length; i += 8) {
+    colors.add(fb[i]);
+  }
+  assert.ok(
+    colors.size >= 8,
+    `Kickstart 3.1 A1200 should render animated Kickstart screen within 150 frames, got ${colors.size} unique colors`
+  );
+
+  // Verify left-edge artifact fix (DDFSTRT=$40 + BPLCON1=$44 must clip BPLPT=base-2 cleanly behind DIWSTRT=$95)
+  const bg = fb[0];
+  for (let y = 108; y <= 132; y++) {
+    for (let x = 35; x < 72; x++) {
+      assert.equal(
+        fb[y * 640 + x],
+        bg,
+        `Unexpected left-edge artifact pixel on KS 3.1 boot screen at (${x}, ${y})`
+      );
+    }
+  }
+});
+
+test('ECS/AGA BLTCON0L ($05A) updates low minterm byte without altering channel/shift bits and HIRES DDFSTRT/BPLCON1 clips left guard word', () => {
+  const aga = new AmigaMachine({ chipset: 'AGA', audioEnabled: false }, { skipDefaultDisk: true });
+  aga.memory.ovl = false;
+  const c = aga.chipset;
+  const chip = aga.memory.chipRam;
+
+  // BLTCON0 = $0900 (useA | useD, ash=0, lf=$00), then byte write to $DFF05B (BLTCON0L) sets lf=$F0 (A -> D copy)
+  c.writeReg16(0x040, 0x0900);
+  aga.memory.write8(0xdff05b, 0xf0);
+  assert.equal(c.bltCon0, 0x09f0, 'AGA BLTCON0L must preserve upper BLTCON0 byte and update lf');
+
+  chip[0x010000] = 0xab;
+  chip[0x010001] = 0xcd;
+  chip[0x010200] = 0x00;
+  chip[0x010201] = 0x00;
+  c.writeReg16(0x044, 0xffff);
+  c.writeReg16(0x046, 0xffff);
+  c.writeReg16(0x050, 0x0001);
+  c.writeReg16(0x052, 0x0000);
+  c.writeReg16(0x054, 0x0001);
+  c.writeReg16(0x056, 0x0200);
+  c.writeReg16(0x064, 0x0000);
+  c.writeReg16(0x066, 0x0000);
+  c.writeReg16(0x058, (1 << 6) | 1);
+  assert.equal(chip[0x010200], 0xab);
+  assert.equal(chip[0x010201], 0xcd);
+
+  // OCS ignores BLTCON0L writes
+  const ocs = new AmigaMachine({ chipset: 'OCS', audioEnabled: false }, { skipDefaultDisk: true });
+  ocs.chipset.writeReg16(0x040, 0x090a);
+  ocs.memory.write8(0xdff05b, 0xf0);
+  assert.equal(ocs.chipset.bltCon0, 0x090a, 'OCS must ignore BLTCON0L writes');
+
+  // HIRES FMODE=0 with KS 3.1 geometry: DIWSTRT H=$95 (minX=40), DDFSTRT=$40, BPLCON1=$44, BPLPT=base-2
+  c.writeReg16(0x096, 0x8300);
+  c.writeReg16(0x08e, 0x6395);
+  c.writeReg16(0x090, 0xf4ad);
+  c.writeReg16(0x092, 0x0040);
+  c.writeReg16(0x094, 0x00d0);
+  c.writeReg16(0x100, 0x9200); // HIRES, 1 bitplane
+  c.writeReg16(0x102, 0x0044);
+  c.writeReg16(0x1fc, 0x0000); // FMODE=0
+  c.writeReg16(0x180, 0x0000); // black bg
+  c.writeReg16(0x182, 0x0fff); // white fg
+
+  // Word 0 at base-2 ($020000) is 0xFFFF (left guard word), Word 1 at base ($020002) is 0x0080 (bit 8 -> x=48)
+  chip.fill(0, 0x020000, 0x020060);
+  chip[0x020000] = 0xff;
+  chip[0x020001] = 0xff;
+  chip[0x020002] = 0x00;
+  chip[0x020003] = 0x80;
+  c.writeReg16(0x0e0, 0x0002);
+  c.writeReg16(0x0e2, 0x0000);
+  c.renderScanline(100, true);
+
+  const fbRow = (100 - 44) * 640;
+  const fb = aga.getFramebuffer();
+  for (let x = 32; x < 48; x++) {
+    assert.equal(fb[fbRow + x], 0xff000000, `Guard word must be clipped left of minX=40 at x=${x}`);
+  }
+  assert.equal(fb[fbRow + 48], 0xffffffff, 'First active pixel after guard word must appear at x=48');
+});
+
+test('ECS/AGA Copper CDANG=1 permits register writes down to $000 (while OCS stops below $040) and INTENA tracks real mask changes', () => {
+  // 1) Copper CDANG=1 writing DSKPTL ($022) <- $1234
+  const setupCopperTest = (chipset: 'OCS' | 'AGA') => {
+    const m = new AmigaMachine({ chipset, audioEnabled: false }, { skipDefaultDisk: true });
+    m.memory.ovl = false;
+    m.chipset.writeReg16(0x02e, 0x0002); // COPCON CDANG=1
+    m.chipset.writeReg16(0x096, 0x8280); // DMAEN | COPEN
+    m.memory.write16(0x010000, 0x0022);  // MOVE DSKPTL ($022)
+    m.memory.write16(0x010002, 0x1234);
+    m.memory.write16(0x010004, 0xffff);  // WAIT end of frame
+    m.memory.write16(0x010006, 0xfffe);
+    m.chipset.writeReg16(0x080, 0x0001);
+    m.chipset.writeReg16(0x082, 0x0000);
+    m.chipset.writeReg16(0x088, 0x0000); // COPJMP1
+    m.chipset.runCopperLine(30);
+    return m;
+  };
+
+  const aga = setupCopperTest('AGA');
+  assert.equal(aga.chipset.dskPt & 0xffff, 0x1234, 'AGA Copper with CDANG=1 must execute MOVE to $022');
+
+  const ocs = setupCopperTest('OCS');
+  assert.equal(ocs.chipset.dskPt & 0xffff, 0x0000, 'OCS Copper with CDANG=1 must stop before writing below $040');
+  assert.equal(ocs.chipset.copWaiting, true);
+  assert.equal(ocs.chipset.copWaitV, 0xff);
+
+  // 2) INTENA lastMaskWrite skips master-only Disable/Enable ($4000/$C000) and captures real mask changes
+  aga.cpu.pc = 0x00012340;
+  aga.chipset.writeReg16(0x09a, 0xc020); // Set INTEN | VERTB
+  assert.equal(aga.chipset.lastIntenaMaskWriteVal, 0xc020);
+  assert.equal(aga.chipset.lastIntenaMaskWritePc, 0x00012340);
+
+  aga.cpu.pc = 0x00056780;
+  aga.chipset.writeReg16(0x09a, 0x4000); // Disable() master only — must not overwrite real mask log
+  aga.chipset.writeReg16(0x09a, 0xc000); // Enable() master only
+  assert.equal(aga.chipset.lastIntenaMaskWriteVal, 0xc020);
+  assert.equal(aga.chipset.lastIntenaMaskWritePc, 0x00012340);
+
+  aga.cpu.pc = 0x0009abcd;
+  aga.chipset.writeReg16(0x09a, 0x0020); // Clear VERTB
+  assert.equal(aga.chipset.lastIntenaMaskWriteVal, 0x0020);
+  assert.equal(aga.chipset.lastIntenaMaskWriteResult & 0x0020, 0);
+  assert.equal(aga.chipset.lastIntenaMaskWritePc, 0x0009abcd);
+
+  // 3) Full 64KB custom chip mirror bank ($DF0000-$DFFFFF): e.g. $DFE006 VHPOSR & $DFE09A INTENA
+  aga.chipset.vpos = 0x42;
+  aga.chipset.hpos = 0x28;
+  assert.equal(aga.memory.read16(0x00dfe006), 0x4228);
+  assert.equal(aga.memory.read8(0x00df0006), 0x42);
+  aga.cpu.pc = 0x0009de72;
+  aga.memory.write16(0x00dfe09a, 0x8020);
+  assert.equal(aga.chipset.readReg16(0x01c) & 0x0020, 0x0020);
+  assert.equal(aga.chipset.lastRamIntenaWritePc, 0x0009de72);
+});
+
+test('INTREQR VERTB sticky-poll rescue unblocks RAM busy-waits (BTST #5,$DFF01F) while preserving ROM VERTB IRQ servers', () => {
+  // Build minimal 256KB ROM where Level 3 handler at $FC0100 clears INTREQ bit 5 and increments counter at $012000
+  const rom = new Uint8Array(262144);
+  const wrRom32 = (off: number, v: number) => {
+    rom[off] = (v >>> 24) & 0xff;
+    rom[off + 1] = (v >>> 16) & 0xff;
+    rom[off + 2] = (v >>> 8) & 0xff;
+    rom[off + 3] = v & 0xff;
+  };
+  const wrRom16 = (off: number, v: number) => {
+    rom[off] = (v >>> 8) & 0xff;
+    rom[off + 1] = v & 0xff;
+  };
+  // Reset SSP=$080000, PC=$FC0080 (with OVL=1 at boot) -> jumps to RAM $010000 after clearing OVL
+  wrRom32(0x00, 0x00080000);
+  wrRom32(0x04, 0x00fc0080);
+  // $FC0080: MOVE.B #3, ($BFE201).L ; MOVE.B #0, ($BFE001).L (clear OVL) ; JMP ($010000).L
+  const bootCode = [
+    0x13fc, 0x0003, 0x00bf, 0xe201,
+    0x13fc, 0x0000, 0x00bf, 0xe001,
+    0x4ef9, 0x0001, 0x0000,
+  ];
+  for (let i = 0; i < bootCode.length; i++) wrRom16(0x80 + i * 2, bootCode[i]);
+
+  // $FC0100 (ROM L3 handler): ADDQ.L #1, ($012000).L ; MOVE.W #$0020, ($DFF09C).L ; RTE
+  const l3Code = [
+    0x52b9, 0x0001, 0x2000,
+    0x33fc, 0x0020, 0x00df, 0xf09c,
+    0x4e73,
+  ];
+  for (let i = 0; i < l3Code.length; i++) wrRom16(0x100 + i * 2, l3Code[i]);
+
+  const amiga = new AmigaMachine(
+    { chipset: 'AGA', videoStandard: 'PAL', chipRamKB: 2048, audioEnabled: false },
+    { skipDefaultDisk: true }
+  );
+  amiga.loadCustomRom(rom, 'VERTB Test ROM.rom');
+  amiga.memory.ovl = false;
+
+  // Point Level 3 vector ($6C) to ROM $00FC0100, keep INTENA=$6020 (INTEN | VERTB)
+  amiga.memory.write32(0x00006c, 0x00fc0100);
+  amiga.chipset.writeReg16(0x09a, 0xc020);
+  amiga.cpu.sr = 0x0000; // IPL 0
+  amiga.cpu.ssp = 0x080000;
+  amiga.cpu.usp = 0x070000;
+
+  // RAM loop at $010000 mimicking Alien Breed 3D ($27BCA2..$27BCC4):
+  // loop: BTST #5, ($DFF01F).L ; BEQ.S loop ; MOVE.W #$0020, ($DFF09C).L ; ADDQ.L #1, ($012004).L ; BRA.S loop
+  const ramCode = [
+    0x0839, 0x0005, 0x00df, 0xf01f, // BTST #5, ($DFF01F).L
+    0x67f6,                         // BEQ.S -10 -> $010000
+    0x33fc, 0x0020, 0x00df, 0xf09c, // MOVE.W #$0020, ($DFF09C).L
+    0x52b9, 0x0001, 0x2004,         // ADDQ.L #1, ($012004).L
+    0x60e6,                         // BRA.S $010000
+  ];
+  for (let i = 0; i < ramCode.length; i++) amiga.memory.write16(0x010000 + i * 2, ramCode[i]);
+  amiga.memory.write32(0x012000, 0);
+  amiga.memory.write32(0x012004, 0);
+  amiga.cpu.pc = 0x010000;
+
+  // Step 8 frames: first 2 frames trigger sticky-poll detector, next 6 frames advance RAM loop 1/frame
+  for (let f = 0; f < 8; f++) {
+    amiga.stepFrame(false, false);
+  }
+  const romL3Count = amiga.memory.read32(0x012000) >>> 0;
+  const ramPollTicks = amiga.memory.read32(0x012004) >>> 0;
+  assert.equal(romL3Count, 8, 'ROM Level 3 VERTB handler must still execute every frame');
+  assert.equal(ramPollTicks, 6, 'RAM INTREQR VERTB poll loop must unblock and pace at exactly 1 iteration per frame');
+});
+
+test('Copper SKIP compares against current copHpos (supporting COPJMP2 loops), WAIT maskV=$80 wraps cleanly at end of line, and AGA FMODE=3 DDFSTRT=$30 / midline BPLCON4 render accurately', () => {
+  const amiga = new AmigaMachine(
+    { chipset: 'AGA', videoStandard: 'PAL', chipRamKB: 2048, audioEnabled: false },
+    { skipDefaultDisk: true }
+  );
+  amiga.memory.ovl = false;
+  const c = amiga.chipset;
+  const chip = amiga.memory.chipRam;
+
+  // 1) Copper SKIP + MOVE COPJMP2 loop:
+  // COP1LC ($010000): WAIT V=$40, H=$40 ; COLOR00=$111 ; COP2LC=$011000 ; COPJMP2
+  // COP2LC ($011000): COLOR00 += 1 cycle (write $222) ; SKIP V=$40, H=$4C ; MOVE COPJMP2,0 ; COLOR00=$999 ; WAIT $FFFF $FFFE
+  // WAIT ($40, $40) -> copHpos=$40. Iter 1: MOVE COLOR00 ($44), SKIP $4C ($44 < $4C -> no skip, $48), MOVE COPJMP2 ($4C)
+  // Iter 2: MOVE COLOR00 ($50), SKIP $4C ($50 >= $4C -> SKIP!, $54), MOVE COPJMP2 skipped ($58), MOVE COLOR00=$999!
+  const wr16 = (a: number, v: number) => amiga.memory.write16(a, v);
+  wr16(0x010000, 0x4041); wr16(0x010002, 0xfffe); // WAIT V=$40, H=$40
+  wr16(0x010004, 0x0180); wr16(0x010006, 0x0111);
+  wr16(0x010008, 0x0084); wr16(0x01000a, 0x0001); // COP2PTH
+  wr16(0x01000c, 0x0086); wr16(0x01000e, 0x1000); // COP2PTL
+  wr16(0x010010, 0x008a); wr16(0x010012, 0x0000); // COPJMP2
+
+  wr16(0x011000, 0x0180); wr16(0x011002, 0x0222); // visible COLOR00=$222 on iter 1..2
+  wr16(0x011004, 0x404d); wr16(0x011006, 0xffff); // SKIP V=$40, H=$4C (mask V=$FF, H=$FE)
+  wr16(0x011008, 0x008a); wr16(0x01100a, 0x0000); // MOVE COPJMP2, 0 (loop back if not skipped)
+  wr16(0x01100c, 0x0180); wr16(0x01100e, 0x0999); // Executed ONLY after SKIP breaks the loop!
+  wr16(0x011010, 0xffff); wr16(0x011012, 0xfffe);
+
+  c.writeReg16(0x080, 0x0001);
+  c.writeReg16(0x082, 0x0000);
+  c.writeReg16(0x096, 0x8280); // DMA_MASTER | DMA_COPPER
+  c.startFrame();
+  c.runCopperLine(0x40, 0xdb);
+  assert.equal(c.colorReg[0], 0x0999, 'Copper SKIP must loop via COPJMP2 until copHpos >= waitH ($4C), then execute COLOR00=$999');
+
+  // 2) Copper-chunky WAIT with maskV=$80 across line boundary: WAIT ($00, $DF) ($80FE) + WAIT ($00, $3F) ($80FE)
+  wr16(0x012000, 0x5001); wr16(0x012002, 0xfffe); // WAIT line $50 H=$00
+  wr16(0x012004, 0x0180); wr16(0x012006, 0x0123);
+  wr16(0x012008, 0x00df); wr16(0x01200a, 0x80fe); // WAIT any line H=$DE
+  wr16(0x01200c, 0x003f); wr16(0x01200e, 0x80fe); // WAIT next line H=$3E
+  wr16(0x012010, 0x0180); wr16(0x012012, 0x0abc);
+  wr16(0x012014, 0xffff); wr16(0x012016, 0xfffe);
+
+  c.writeReg16(0x080, 0x0001);
+  c.writeReg16(0x082, 0x2000);
+  c.startFrame();
+  c.runCopperLine(0x50, 0xdb);
+  assert.equal(c.colorReg[0], 0x0123);
+  c.runCopperLine(0x50, 0xfe);
+  assert.equal(c.colorReg[0], 0x0123, 'Masked WAIT H=$3E after H=$DE on line $50 must wait for line $51 instead of firing immediately');
+  c.runCopperLine(0x51, 0xdb);
+  assert.equal(c.colorReg[0], 0x0abc, 'Masked WAIT H=$3E must fire cleanly on line $51');
+
+  // 3) AGA FMODE=3 with DDFSTRT=$0030..$00B8 (48 bytes fetched, BPL1MOD=-8) + BPLCON1=0 must phase-align to X=0 (no left-clip/right-wrap) + midline BPLCON4 BPLAM switch
+  c.writeReg16(0x096, 0x8380); // DMA_MASTER | DMA_BITPLANE | DMA_COPPER
+  c.writeReg16(0x1fc, 0x0003); // FMODE = 64-bit bitplane fetch
+  c.writeReg16(0x100, 0x1201); // 1 bitplane Lo-Res, ECSENA=1
+  c.writeReg16(0x102, 0x0000); // BPLCON1 = 0
+  c.writeReg16(0x108, 0xfff8); // BPL1MOD = -8 (40-byte bitmap stride across 48-byte fetch)
+  c.writeReg16(0x08e, 0x2c81);
+  c.writeReg16(0x090, 0x2cc1);
+  c.writeReg16(0x092, 0x0030); // DDFSTRT=$30 (fetchPx=-16) aligns to X=0 under FMODE=3 (64px phase)
+  c.writeReg16(0x094, 0x00b8);
+  c.writeReg16(0x106, 0x0000);
+  c.writeReg16(0x180, 0x0000); // Color 0 = black
+  c.writeReg16(0x182, 0x0f00); // Color 1 = red
+  c.writeReg16(0x106, 0x8000); // Bank 4 (colors 128..159)
+  c.writeReg16(0x180, 0x00f0); // Color 128 = green
+  c.writeReg16(0x182, 0x000f); // Color 129 = blue
+  c.writeReg16(0x106, 0x0000);
+  c.writeReg16(0x10c, 0x0011); // Initial BPLAM = $00
+
+  // Line 0 ($030000..$030027): first 2 bytes = $FF (red at X=0..31), rest = $00
+  // Line 1 ($030028..$03004F): first 2 bytes = $FF (would wrap into right edge if startPx < 0)
+  chip.fill(0, 0x030000, 0x030060);
+  chip[0x030000] = 0xff;
+  chip[0x030001] = 0xff;
+  chip[0x030028] = 0xff;
+  chip[0x030029] = 0xff;
+  c.writeReg16(0x0e0, 0x0003);
+  c.writeReg16(0x0e2, 0x0000);
+
+  // Copper changes BPLCON4 BPLAM from $00 to $80 mid-line at H=$80 (pxX = (((0x84-2)*2)-0x81)*2 = 270)
+  wr16(0x013000, 0x4581); wr16(0x013002, 0xfffe); // WAIT line $45, H=$80
+  wr16(0x013004, 0x010c); wr16(0x013006, 0x8011); // BPLCON4 BPLAM=$80
+  wr16(0x013008, 0xffff); wr16(0x01300a, 0xfffe);
+  c.writeReg16(0x080, 0x0001);
+  c.writeReg16(0x082, 0x3000);
+  c.startFrame();
+  c.runCopperLine(0x45, 0xdb);
+  c.renderScanline(0x45, true);
+
+  const fb = amiga.getFramebuffer();
+  const row = (0x45 - 44) * 640;
+  assert.equal(fb[row + 0], 0xff0000ff, 'AGA FMODE=3 DDFSTRT=$30 + BPLCON1=0 must start at X=0 (not -16) showing Color 1 red');
+  assert.equal(fb[row + 638], 0xff00ff00, 'Right edge must show Color 0->128 green background instead of wrapped line-1 pixels');
+
+  // Also verify 7-bitplane AGA Lo-Res branch (e.g. Alien Breed 3D $7201) with DDFSTRT=$30..$B8
+  c.writeReg16(0x100, 0x7201); // 7 bitplanes Lo-Res
+  c.writeReg16(0x10a, 0xfff8); // BPL2MOD = -8
+  c.writeReg16(0x10c, 0x0011); // BPLAM = $00
+  for (let p = 0; p < 7; p++) {
+    c.writeReg16(0x0e0 + p * 4, p === 0 ? 0x0003 : 0x0004);
+    c.writeReg16(0x0e2 + p * 4, 0x0000);
+  }
+  chip.fill(0, 0x040000, 0x040060);
+  c.writeReg16(0x082, 0x3800); // empty copperlist at $013800
+  wr16(0x013800, 0xffff); wr16(0x013802, 0xfffe);
+  c.startFrame();
+  c.runCopperLine(0x46, 0xdb);
+  c.renderScanline(0x46, true);
+  const row7 = (0x46 - 44) * 640;
+  assert.equal(fb[row7 + 0], 0xff0000ff, '7-bitplane AGA FMODE=3 DDFSTRT=$30 must start at X=0');
+  assert.equal(fb[row7 + 638], 0xff000000, '7-bitplane AGA right edge must remain background instead of wrapped line-1 pixels');
+});
+
+test('Sprite DMA latches only when line === vStart (ignoring stale vStart < header fetch line) and disables at vStop', () => {
+  const amiga = new AmigaMachine({ chipset: 'AGA', chipRamKB: 2048, videoStandard: 'PAL' });
+  const c = amiga.chipset;
+  const chip = amiga.memory.chipRam;
+
+  const wr16 = (addr: number, val: number) => {
+    chip[addr] = (val >>> 8) & 0xff;
+    chip[addr + 1] = val & 0xff;
+  };
+  const wr32 = (addr: number, val: number) => {
+    wr16(addr, (val >>> 16) & 0xffff);
+    wr16(addr + 2, val & 0xffff);
+  };
+
+  c.reset();
+  c.writeReg16(0x096, 0x8220); // DMA_MASTER | DMA_SPRITE
+  c.writeReg16(0x1fc, 0x000c); // FMODE sprite 64-bit (16-byte header + 16-byte data/line)
+  c.writeReg16(0x08e, 0x2c81);
+  c.writeReg16(0x090, 0x2cc1);
+  c.writeReg16(0x100, 0x0200);
+  c.writeReg16(0x180, 0x0000);
+  c.writeReg16(0x1a2, 0x0f00); // Sprite 0/4 color 17 = red
+
+  // Stale/disabled sprite 4 list at $020000: POS=$0000, CTL=$3440 (vStart=0, vStop=52), followed by non-zero garbage data
+  chip.fill(0, 0x020000, 0x020200);
+  wr16(0x020000, 0x0000);
+  wr16(0x020008, 0x3440);
+  wr32(0x020010, 0xffffffff);
+  wr32(0x020018, 0x00000000);
+  // Active sprite 0 at $020100: vStart=50 ($32), vStop=52 ($34), H=$80 ($40 shifted)
+  wr16(0x020100, 0x3280);
+  wr16(0x020108, 0x3400);
+  wr32(0x020110, 0xffff0000);
+  wr32(0x020118, 0x00000000);
+
+  c.writeReg16(0x120, 0x0002); c.writeReg16(0x122, 0x0100); // SPR0PT = $020100
+  c.writeReg16(0x130, 0x0002); c.writeReg16(0x132, 0x0000); // SPR4PT = $020000
+  for (let s = 1; s < 8; s++) {
+    if (s === 4) continue;
+    c.writeReg16(0x120 + s * 4, 0x0000);
+    c.writeReg16(0x122 + s * 4, 0x0000);
+  }
+
+  c.startFrame();
+  c.fetchSpriteHeaders();
+  assert.equal(c.sprPt[4], 0x020010, 'Header fetch advances SPR4PT past 16-byte FMODE=3 header');
+
+  // Step through lines 25..53: SPR4 (vStart=0) must never activate streaming or advance past $020010,
+  // while SPR0 (vStart=50, vStop=52) must arm on lines 50..51 and stop at line 52.
+  for (let line = 25; line <= 53; line++) {
+    c.stepSpritesOnLine(line);
+    assert.equal(c.sprArmed[4], 0, `SPR4 with vStart=0 must stay unarmed on line ${line}`);
+    assert.equal(c.sprPt[4], 0x020010, `SPR4PT must not advance into garbage on line ${line}`);
+    if (line === 50 || line === 51) {
+      assert.equal(c.sprArmed[0], 1, `SPR0 must arm on line ${line}`);
+    } else {
+      assert.equal(c.sprArmed[0], 0, `SPR0 must be unarmed on line ${line}`);
+    }
+  }
+});
+
+test('AGA 7-bitplane FMODE=3 Copper even-slot contention + scanline remainder keeps 104 MOVEs aligned to 2.00 lines', () => {
+  const amiga = new AmigaMachine({ chipset: 'AGA', chipRamKB: 2048, videoStandard: 'PAL' });
+  const c = amiga.chipset;
+  const chip = amiga.memory.chipRam;
+
+  const wr16 = (addr: number, val: number) => {
+    chip[addr] = (val >>> 8) & 0xff;
+    chip[addr + 1] = val & 0xff;
+  };
+
+  c.reset();
+  c.writeReg16(0x096, 0x8380); // DMA_MASTER | DMA_BITPLANE | DMA_COPPER
+  c.writeReg16(0x1fc, 0x000f); // FMODE = $F (64-bit bitplane + sprite)
+  c.writeReg16(0x100, 0x7201); // 7 bitplanes LoRes (steals 3 of 4 even slots per 8-CCK burst)
+  c.writeReg16(0x08e, 0x2cb1); // DIWSTRT V=44
+  c.writeReg16(0x090, 0x2c91); // DIWSTOP V=300
+  c.writeReg16(0x092, 0x0048); // DDFSTRT=$48
+  c.writeReg16(0x094, 0x0088); // DDFSTOP=$88 -> 3 FMODE=3 fetch units -> 18 CCK stolen/line -> 52 MOVEs/line
+  for (let p = 0; p < 7; p++) {
+    c.writeReg16(0x0e0 + p * 4, 0x0004);
+    c.writeReg16(0x0e2 + p * 4, 0x0000);
+  }
+
+  // Build 6 blocks of 104 NOOP MOVEs starting with BPLCON4 toggle on every 104th instruction, matching AB3D COP2
+  let pc = 0x014000;
+  wr16(pc, 0x2c0f); wr16(pc + 2, 0xfffe); pc += 4; // WAIT line 44, H=$0E (start of line 44 active timing)
+  const blockStart = pc;
+  for (let blk = 0; blk < 6; blk++) {
+    wr16(pc, 0x010c); wr16(pc + 2, (blk & 1) !== 0 ? 0x8000 : 0x0000); pc += 4;
+    for (let i = 1; i < 104; i++) {
+      wr16(pc, 0x01fe); wr16(pc + 2, 0x0000); pc += 4; // NOOP
+    }
+  }
+  wr16(pc, 0xffff); wr16(pc + 2, 0xfffe);
+
+  c.writeReg16(0x080, 0x0001);
+  c.writeReg16(0x082, 0x4000);
+  c.startFrame();
+  c.runCopperLine(44, 0xfe);
+
+  // After line 44 (from H=$0E to $E2), run 2 full lines per block and verify BPLCON4 switches strictly outside active display (copHpos around $0E -> 52 MOVEs/line)
+  const expectedStartH = c.copHpos;
+  const pcAfterLine44 = c.copPc;
+  assert.ok(pcAfterLine44 > blockStart, 'Line 44 must execute part of block 0');
+  for (let blk = 1; blk < 6; blk++) {
+    const l0 = 44 + blk * 2 - 1;
+    const l1 = l0 + 1;
+    c.runCopperLine(l0, 0xfe);
+    c.runCopperLine(l1, 0xfe);
+    const expectedPc = pcAfterLine44 + blk * 104 * 4;
+    if (expectedPc <= blockStart + 6 * 104 * 4) {
+      assert.equal(
+        c.copPc,
+        expectedPc,
+        `Block ${blk} (lines ${l0}..${l1}) must execute exactly 104 MOVEs (416 bytes) across 2 lines`
+      );
+      assert.equal(
+        c.copHpos,
+        expectedStartH,
+        `Block ${blk} must preserve exact 2-line phase lock (copHpos=${expectedStartH}) without mid-line drift`
+      );
+    }
+  }
+});
+
+test('CPU overclocking scales 68000 execution throughput 2x/4x while keeping frame timing, CIA E-clocks, and HPOS at 1x without reboot', () => {
+  const measureOneFrame = (cpuOverclock: 1 | 2 | 4) => {
+    const amiga = new AmigaMachine({
+      chipset: 'ECS',
+      videoStandard: 'PAL',
+      audioEnabled: false,
+      cpuOverclock,
+    });
+    amiga.memory.ovl = false;
+    amiga.cpu.sr = 0x2700; // mask IRQs so loop stays strictly inside Chip RAM
+    amiga.cpu.stopped = false;
+    amiga.cpu.d[0] = 0;
+    amiga.cpu.pc = 0x010000;
+    // ADDQ.L #1, D0 ($5280); BRA.S -4 ($60FC)
+    amiga.memory.write16(0x010000, 0x5280);
+    amiga.memory.write16(0x010002, 0x60fc);
+
+    // Start CIA-A Timer A from $FFFF to verify E-clock rate stays 1x per frame
+    amiga.cia.writeA(0x04, 0xff);
+    amiga.cia.writeA(0x05, 0xff);
+    amiga.cia.writeA(0x0e, 0x11); // LOAD + START continuous
+
+    const startCycles = amiga.cpu.cycles;
+    amiga.stepFrame(false, false);
+    const elapsedCycles = amiga.cpu.cycles - startCycles;
+    const taAfter = (amiga.cia.readA(0x05) << 8) | amiga.cia.readA(0x04);
+    const eClocksElapsed = 0xffff - taAfter;
+
+    return {
+      amiga,
+      iterations: amiga.cpu.d[0] >>> 0,
+      elapsedCycles,
+      eClocksElapsed,
+      frameCount: amiga.frameCount,
+    };
+  };
+
+  const r1 = measureOneFrame(1);
+  const r2 = measureOneFrame(2);
+  const r4 = measureOneFrame(4);
+
+  assert.equal(r1.frameCount, 1);
+  assert.equal(r2.frameCount, 1);
+  assert.equal(r4.frameCount, 1);
+
+  // CIA E-clocks must remain strictly locked to 1x native scanline rate
+  assert.equal(r2.eClocksElapsed, r1.eClocksElapsed);
+  assert.equal(r4.eClocksElapsed, r1.eClocksElapsed);
+
+  // Executed M68k cycles and loop iterations scale proportionally with multiplier
+  // (scanline boundary overshoot of ~8 cycles is constant across 1x/2x/4x, yielding ~1.98x and ~3.95x ratios)
+  assert.ok(r1.iterations > 7000, `Baseline 1x iterations should be >7000, got ${r1.iterations}`);
+  const ratio2 = r2.iterations / r1.iterations;
+  const ratio4 = r4.iterations / r1.iterations;
+  assert.ok(ratio2 >= 1.95 && ratio2 <= 2.05, `Expected ~2x iterations ratio, got ${ratio2}`);
+  assert.ok(ratio4 >= 3.93 && ratio4 <= 4.05, `Expected ~4x iterations ratio, got ${ratio4}`);
+
+  const cycRatio2 = r2.elapsedCycles / r1.elapsedCycles;
+  const cycRatio4 = r4.elapsedCycles / r1.elapsedCycles;
+  assert.ok(cycRatio2 >= 1.95 && cycRatio2 <= 2.05, `Expected ~2x cycle ratio, got ${cycRatio2}`);
+  assert.ok(cycRatio4 >= 3.93 && cycRatio4 <= 4.05, `Expected ~4x cycle ratio, got ${cycRatio4}`);
+
+  // Raster HPOS ($DFF006 horizontal tracking) stays calibrated to 4x scanline budget
+  const m4 = r4.amiga;
+  const budget4 = 454 * 4;
+  m4.chipset.beginScanline(40, m4.cpu.cycles, budget4);
+  m4.cpu.runCycles(budget4 >> 1);
+  const midHpos = m4.chipset.getHpos();
+  assert.ok(midHpos >= 108 && midHpos <= 122, `Expected mid-scanline HPOS ~113 at 4x, got ${midHpos}`);
+
+  // Live updateConfig(cpuOverclock) with fractional slider value must not trigger hardReset or wipe CPU state
+  const live = r1.amiga;
+  const beforeLiveD0 = live.cpu.d[0] >>> 0;
+  live.updateConfig({ cpuOverclock: 1.5 });
+  assert.equal(live.cpu.d[0] >>> 0, beforeLiveD0, 'Live overclock change must not reset CPU registers');
+  assert.ok(
+    live.cpu.pc >= 0x010000 && live.cpu.pc <= 0x010004,
+    `Live overclock change must preserve PC (${live.cpu.pc.toString(16)})`
+  );
+  live.stepFrame(false, false);
+  const deltaNextFrame = (live.cpu.d[0] >>> 0) - beforeLiveD0;
+  const liveRatio = deltaNextFrame / r1.iterations;
+  assert.ok(liveRatio >= 1.45 && liveRatio <= 1.55, `Expected ~1.5x throughput after live slider switch, got ${liveRatio}`);
+});
+
 
 
 

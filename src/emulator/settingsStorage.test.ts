@@ -43,10 +43,12 @@ test('saveAmigaConfig and loadSavedAmigaConfig round-trip every setting cleanly'
     autoCrop: true,
     frameSkip: 2,
     ecoCpuMode: true,
+    cpuOverclock: 2.4,
     hapticsEnabled: false,
     floppyAudioEnabled: false,
     turboFloppy: true,
     joystickConnected: false,
+    showEmuPerf: true,
   };
 
   saveAmigaConfig(custom, store);
@@ -68,11 +70,11 @@ test('loadSavedAmigaConfig migrates legacy overscan and turboFloppy keys when un
 
 test('sanitizeAmigaConfig rejects invalid values and clamps volume safely', () => {
   const dirty = {
-    chipset: 'AGA',
+    chipset: 'CD32',
     videoStandard: 'SECAM',
     chipRamKB: 999,
     slowRamKB: 256,
-    fastRamKB: 4096,
+    fastRamKB: 16384,
     audioEnabled: 'yes',
     audioVolume: 3.5,
     audioLedFilter: 0,
@@ -81,10 +83,12 @@ test('sanitizeAmigaConfig rejects invalid values and clamps volume safely', () =
     autoCrop: 'true',
     frameSkip: 9,
     ecoCpuMode: true,
+    cpuOverclock: 99,
     hapticsEnabled: false,
     floppyAudioEnabled: null,
     turboFloppy: true,
     joystickConnected: false,
+    showEmuPerf: 'always',
   };
 
   const sanitized = sanitizeAmigaConfig(dirty);
@@ -101,10 +105,15 @@ test('sanitizeAmigaConfig rejects invalid values and clamps volume safely', () =
   assert.equal(sanitized.autoCrop, DEFAULT_AMIGA_CONFIG.autoCrop);
   assert.equal(sanitized.frameSkip, DEFAULT_AMIGA_CONFIG.frameSkip);
   assert.equal(sanitized.ecoCpuMode, true);
+  assert.equal(sanitized.cpuOverclock, 14.2);
   assert.equal(sanitized.hapticsEnabled, false);
   assert.equal(sanitized.floppyAudioEnabled, DEFAULT_AMIGA_CONFIG.floppyAudioEnabled);
   assert.equal(sanitized.turboFloppy, true);
   assert.equal(sanitized.joystickConnected, false);
+  assert.equal(sanitized.showEmuPerf, DEFAULT_AMIGA_CONFIG.showEmuPerf);
+  assert.equal(sanitizeAmigaConfig({ cpuOverclock: 'turbo' }).cpuOverclock, 1);
+  assert.equal(sanitizeAmigaConfig({ cpuOverclock: 2.3649 }).cpuOverclock, 2.365);
+  assert.equal(sanitizeAmigaConfig({ cpuOverclock: 0.4 }).cpuOverclock, 1);
 });
 
 test('loadSavedAmigaConfig handles corrupt JSON without throwing', () => {
@@ -119,4 +128,40 @@ test('hasConfigChanged avoids redundant state and storage writes on identical pa
   assert.equal(hasConfigChanged(DEFAULT_AMIGA_CONFIG, { audioVolume: 1.0 }), false);
   assert.equal(hasConfigChanged(DEFAULT_AMIGA_CONFIG, { chipset: 'OCS' }), true);
   assert.equal(hasConfigChanged(DEFAULT_AMIGA_CONFIG, { crtScanlines: true }), true);
+  assert.equal(hasConfigChanged(DEFAULT_AMIGA_CONFIG, { videoStandard: 'auto' }), false);
+  assert.equal(hasConfigChanged(DEFAULT_AMIGA_CONFIG, { videoStandard: 'NTSC' }), true);
+  assert.equal(hasConfigChanged(DEFAULT_AMIGA_CONFIG, { overscan: 42 }), true);
 });
+
+test('numeric and WxH pixel overscan slider values persist cleanly and reject invalid values', () => {
+  const store = createMemoryStorage();
+  const cfg: AmigaConfig = { ...DEFAULT_AMIGA_CONFIG, overscan: '704x272' };
+  saveAmigaConfig(cfg, store);
+  assert.equal(loadSavedAmigaConfig(store).overscan, '704x272');
+
+  assert.equal(sanitizeAmigaConfig({ overscan: '703x271' }).overscan, '704x270');
+  assert.equal(sanitizeAmigaConfig({ overscan: '500x200' }).overscan, DEFAULT_AMIGA_CONFIG.overscan);
+  assert.equal(sanitizeAmigaConfig({ overscan: 37.6 }).overscan, 38);
+  assert.equal(sanitizeAmigaConfig({ overscan: -5 }).overscan, DEFAULT_AMIGA_CONFIG.overscan);
+  assert.equal(sanitizeAmigaConfig({ overscan: 105 }).overscan, DEFAULT_AMIGA_CONFIG.overscan);
+  assert.equal(sanitizeAmigaConfig({ overscan: Number.NaN }).overscan, DEFAULT_AMIGA_CONFIG.overscan);
+});
+
+test('AGA chipset (Amiga 1200) and 4MB/8MB Fast RAM persist cleanly', () => {
+  const store = createMemoryStorage();
+  const a1200: AmigaConfig = {
+    ...DEFAULT_AMIGA_CONFIG,
+    chipset: 'AGA',
+    chipRamKB: 2048,
+    slowRamKB: 0,
+    fastRamKB: 8192,
+  };
+  saveAmigaConfig(a1200, store);
+  const loaded = loadSavedAmigaConfig(store);
+  assert.equal(loaded.chipset, 'AGA');
+  assert.equal(loaded.chipRamKB, 2048);
+  assert.equal(loaded.slowRamKB, 0);
+  assert.equal(loaded.fastRamKB, 8192);
+  assert.equal(sanitizeAmigaConfig({ chipset: 'AGA', fastRamKB: 4096 }).fastRamKB, 4096);
+});
+

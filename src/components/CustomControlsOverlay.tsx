@@ -1,13 +1,16 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   clampPct,
-  computeStickTransition,
   ControlButtonSize,
-  ControlTarget,
   CustomControlProfile,
   dispatchTargetActions,
+  expandControlTarget,
   getTargetAriaLabel,
   getTargetDisplayLabel,
+  SingleControlTarget,
+  singleTargetKey,
+  StickDirection,
+  TargetHoldManager,
 } from '../emulator/controls/customProfiles';
 import { triggerHaptic } from '../emulator/haptics';
 import { JoystickState } from '../emulator/types';
@@ -62,8 +65,7 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
     useSuppressBrowserTouchHold(touchSurfaceRef);
 
     // Active play state refs (kept outside React render loop for minimal CPU load)
-    const activeStickTargetsRef = useRef<Map<string, ControlTarget>>(new Map());
-    const activeButtonTargetsRef = useRef<Map<string, ControlTarget>>(new Map());
+    const holdManagerRef = useRef<TargetHoldManager>(new TargetHoldManager());
     const [pressedButtons, setPressedButtons] = useState<Record<string, boolean>>({});
     const [stickActiveDirs, setStickActiveDirs] = useState({
       up: false,
@@ -114,21 +116,12 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
     stickRef.current = profile.stick;
 
     const releaseAllHeldControls = useCallback(() => {
-      const actions = [];
-      for (const target of activeStickTargetsRef.current.values()) {
-        actions.push({ target, down: false });
-      }
-      activeStickTargetsRef.current.clear();
       prevStickDirKey.current = '0000';
       if (stickKnobRef.current) {
         stickKnobRef.current.style.transform = 'translate3d(0px, 0px, 0)';
       }
 
-      for (const target of activeButtonTargetsRef.current.values()) {
-        actions.push({ target, down: false });
-      }
-      activeButtonTargetsRef.current.clear();
-
+      const actions = holdManagerRef.current.releaseAll();
       if (actions.length > 0) {
         dispatchTargetActions(actions, { onKeyEvent, onJoystickChange, onMouseButton });
       }
@@ -295,12 +288,20 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
       if (dirKey !== prevStickDirKey.current) {
         prevStickDirKey.current = dirKey;
         if (dirKey !== '0000') triggerHaptic(8);
-        const { nextActiveMap, actions } = computeStickTransition(
-          activeStickTargetsRef.current,
-          next,
-          stickCfg
-        );
-        activeStickTargetsRef.current = nextActiveMap;
+        const dirs: StickDirection[] = ['up', 'down', 'left', 'right'];
+        const nextTargets: SingleControlTarget[] = [];
+        const seenKeys = new Set<string>();
+        for (const d of dirs) {
+          if (!next[d]) continue;
+          for (const single of expandControlTarget(stickCfg[d])) {
+            const k = singleTargetKey(single);
+            if (!seenKeys.has(k)) {
+              seenKeys.add(k);
+              nextTargets.push(single);
+            }
+          }
+        }
+        const actions = holdManagerRef.current.setSource('stick', nextTargets);
         dispatchTargetActions(actions, { onKeyEvent, onJoystickChange, onMouseButton });
         setStickActiveDirs(next);
       }
@@ -335,15 +336,8 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
         stickKnobRef.current.style.transform = 'translate3d(0px, 0px, 0)';
       }
       const cleared = { up: false, down: false, left: false, right: false };
-      if (stickRef.current) {
-        const { nextActiveMap, actions } = computeStickTransition(
-          activeStickTargetsRef.current,
-          cleared,
-          stickRef.current
-        );
-        activeStickTargetsRef.current = nextActiveMap;
-        dispatchTargetActions(actions, { onKeyEvent, onJoystickChange, onMouseButton });
-      }
+      const actions = holdManagerRef.current.setSource('stick', []);
+      dispatchTargetActions(actions, { onKeyEvent, onJoystickChange, onMouseButton });
       setStickActiveDirs(cleared);
     };
 
@@ -484,7 +478,7 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
               onContextMenu={(e) => e.preventDefault()}
               className={`relative rounded-full flex items-center justify-center ${stickDims.pad} ${
                 fullscreenOverlay
-                  ? 'bg-[#191A1D]/45 border-2 border-white/25 backdrop-blur-[2px] shadow-[0_4px_14px_rgba(0,0,0,0.45)]'
+                  ? 'bg-[#191A1D]/80 border-2 border-[#3C3B38] shadow-[inset_0_4px_12px_rgba(0,0,0,0.85)]'
                   : 'bg-[#191A1D] border-2 border-[#3C3B38] shadow-[inset_0_4px_12px_rgba(0,0,0,0.85)]'
               }`}
             >
@@ -517,6 +511,12 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
           const isPressed = Boolean(pressedButtons[btn.id]);
           const label = getTargetDisplayLabel(btn.target, btn.label);
           const isAccent = btn.target.kind === 'joy' && btn.target.dir === 'fire1';
+          const isMouseBtn = btn.target.kind === 'mouse';
+          const variantCls = isAccent
+            ? 'amiga-key-accent'
+            : isMouseBtn
+              ? 'amiga-key-ivory'
+              : 'amiga-key-grey';
 
           return (
             <button
@@ -531,7 +531,7 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
                 top: `${btn.yPct}%`,
                 transform: 'translate(-50%, -50%)',
               }}
-              onPointerDown={(e) => {
+                onPointerDown={(e) => {
                 if (editMode) {
                   startEditDrag('button', btn.id, btn.xPct, btn.yPct, e);
                   return;
@@ -545,9 +545,12 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
                 } catch {
                   // Ignore
                 }
-                activeButtonTargetsRef.current.set(btn.id, btn.target);
+                const actions = holdManagerRef.current.setSource(
+                  `btn:${btn.id}`,
+                  expandControlTarget(btn.target)
+                );
                 setPressedButtons((p) => ({ ...p, [btn.id]: true }));
-                dispatchTargetActions([{ target: btn.target, down: true }], {
+                dispatchTargetActions(actions, {
                   onKeyEvent,
                   onJoystickChange,
                   onMouseButton,
@@ -562,10 +565,9 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
                   return;
                 }
                 e.stopPropagation();
-                const held = activeButtonTargetsRef.current.get(btn.id);
-                if (held) {
-                  activeButtonTargetsRef.current.delete(btn.id);
-                  dispatchTargetActions([{ target: held, down: false }], {
+                const actions = holdManagerRef.current.setSource(`btn:${btn.id}`, []);
+                if (actions.length > 0) {
+                  dispatchTargetActions(actions, {
                     onKeyEvent,
                     onJoystickChange,
                     onMouseButton,
@@ -578,10 +580,9 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
                   endEditDrag(e);
                   return;
                 }
-                const held = activeButtonTargetsRef.current.get(btn.id);
-                if (held) {
-                  activeButtonTargetsRef.current.delete(btn.id);
-                  dispatchTargetActions([{ target: held, down: false }], {
+                const actions = holdManagerRef.current.setSource(`btn:${btn.id}`, []);
+                if (actions.length > 0) {
+                  dispatchTargetActions(actions, {
                     onKeyEvent,
                     onJoystickChange,
                     onMouseButton,
@@ -592,7 +593,7 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
               onContextMenu={(e) => e.preventDefault()}
               className={`absolute z-20 rounded-md font-semibold flex items-center justify-center whitespace-nowrap select-none ${
                 BUTTON_SIZE_CLASSES[btn.size]
-              } ${isAccent ? 'amiga-key-accent' : 'amiga-key-grey'} ${
+              } ${variantCls} ${
                 isSelected
                   ? 'ring-2 ring-[#E07A22] ring-offset-1 ring-offset-black cursor-grab active:cursor-grabbing'
                   : editMode

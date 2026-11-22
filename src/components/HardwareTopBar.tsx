@@ -37,6 +37,7 @@ interface HardwareTopBarProps {
   onWarmReset: () => void;
   onOpenDisks: () => void;
   onOpenSettings: () => void;
+  onModelTitleTap?: () => void;
 }
 
 export const HardwareTopBar: React.FC<HardwareTopBarProps> = React.memo(
@@ -55,6 +56,7 @@ export const HardwareTopBar: React.FC<HardwareTopBarProps> = React.memo(
     onWarmReset,
     onOpenDisks,
     onOpenSettings,
+    onModelTitleTap,
   }) => {
     const [overlayMenuOpen, setOverlayMenuOpen] = useState(false);
 
@@ -276,23 +278,31 @@ export const HardwareTopBar: React.FC<HardwareTopBarProps> = React.memo(
       );
     }
 
+    const modelTitle = status.chipset === 'AGA' ? 'AMIGA 1200' : 'AMIGA 500';
+
     return (
-      <header className="h-11 shrink-0 bg-[#1C1E22] border-b border-white/10 px-2.5 lg:px-5 flex items-center justify-between gap-2 select-none">
-        {/* Zone 1: Commodore Amiga 500 wordmark + real hardware LEDs */}
-        <div className="flex items-center gap-3 min-w-0">
-          <div className="flex items-center gap-2 shrink-0">
+      <header className="h-11 shrink-0 bg-[#1C1E22] border-b border-white/10 px-2 sm:px-3 lg:px-5 flex items-center justify-between gap-1.5 sm:gap-2 select-none">
+        {/* Zone 1: Commodore Amiga 500/1200 wordmark + real hardware LEDs */}
+        <div className="flex items-center gap-1.5 sm:gap-3 min-w-0 flex-1 overflow-hidden">
+          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
             <span
-              className="w-1.5 h-5 bg-[#D63329] rounded-[1px]"
+              className="w-1 sm:w-1.5 h-5 bg-[#D63329] rounded-[1px]"
               aria-hidden="true"
             />
-            <span className="font-display font-bold tracking-wider text-sm lg:text-base text-[#F2EFE9] whitespace-nowrap">
-              AMIGA 500
-            </span>
+            <button
+              type="button"
+              data-testid="hardware-model-title"
+              onClick={onModelTitleTap}
+              aria-label={modelTitle}
+              className="font-display font-bold tracking-normal sm:tracking-wider text-[13px] sm:text-sm lg:text-base text-[#F2EFE9] whitespace-nowrap bg-transparent border-0 p-0 m-0 cursor-default focus:outline-none focus-visible:ring-1 focus-visible:ring-[#E07A22] rounded-sm"
+            >
+              {modelTitle}
+            </button>
           </div>
 
           {/* Authentic hardware LEDs wired directly to CIA-A LED & DF0/DF1 motors */}
           <div
-            className="flex items-center gap-2 sm:gap-3 text-[10px] sm:text-[11px] font-mono tabular-nums text-[#A7A39A]"
+            className="flex items-center gap-1.5 sm:gap-3 text-[10px] sm:text-[11px] font-mono tabular-nums text-[#A7A39A] shrink-0"
             aria-label="Индикаторы оборудования"
           >
             <span className="flex items-center gap-1 whitespace-nowrap" title="Power / Audio Filter LED">
@@ -303,7 +313,7 @@ export const HardwareTopBar: React.FC<HardwareTopBarProps> = React.memo(
                     : 'bg-[#5A2420]'
                 }`}
               />
-              <span className="hidden xs:inline sm:inline">PWR</span>
+              <span className="hidden sm:inline">PWR</span>
             </span>
             <div
               className="flex items-center gap-1 sm:gap-1.5"
@@ -370,15 +380,15 @@ export const HardwareTopBar: React.FC<HardwareTopBarProps> = React.memo(
         </div>
 
         {/* Zone 2 & 3: Icon-only hardware action buttons */}
-        <div className="flex items-center gap-1.5 shrink-0">
+        <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
           <button
             type="button"
             onClick={onToggleAudio}
             aria-label={audioEnabled ? 'Выключить звук Paula' : 'Включить звук Paula'}
             title={audioEnabled ? 'Звук включён' : 'Звук выключен'}
-            className="h-8 w-8 flex items-center justify-center rounded-md bg-[#2A2D33] hover:bg-[#353941] active:scale-[0.97] text-[#E6E2D9] transition-colors"
+            className="h-7 w-7 sm:h-8 sm:w-8 flex items-center justify-center rounded-md bg-[#2A2D33] hover:bg-[#353941] active:scale-[0.97] text-[#E6E2D9] transition-colors"
           >
-            {audioEnabled ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4 text-[#9B968D]" />}
+            {audioEnabled ? <Volume2 className="w-3.5 h-3.5 sm:w-4 sm:h-4" /> : <VolumeX className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-[#9B968D]" />}
           </button>
 
           <button
@@ -386,9 +396,9 @@ export const HardwareTopBar: React.FC<HardwareTopBarProps> = React.memo(
             onClick={onTogglePause}
             aria-label={status.paused ? 'Продолжить эмуляцию' : 'Пауза эмуляции'}
             title={status.paused ? 'Продолжить' : 'Пауза'}
-            className="h-8 w-8 flex items-center justify-center rounded-md bg-[#2A2D33] hover:bg-[#353941] active:scale-[0.97] text-[#E6E2D9] transition-colors"
+            className="h-7 w-7 sm:h-8 sm:w-8 flex items-center justify-center rounded-md bg-[#2A2D33] hover:bg-[#353941] active:scale-[0.97] text-[#E6E2D9] transition-colors"
           >
-            {status.paused ? <Play className="w-4 h-4 text-[#E07A22]" /> : <Pause className="w-4 h-4" />}
+            {status.paused ? <Play className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-[#E07A22]" /> : <Pause className="w-3.5 h-3.5 sm:w-4 sm:h-4" />}
           </button>
 
           <button
@@ -396,9 +406,9 @@ export const HardwareTopBar: React.FC<HardwareTopBarProps> = React.memo(
             onClick={onWarmReset}
             aria-label="Сброс Amiga (Ctrl+A+A)"
             title="Сброс Amiga"
-            className="h-8 w-8 flex items-center justify-center rounded-md bg-[#2A2D33] hover:bg-[#353941] active:scale-[0.97] text-[#E6E2D9] transition-colors"
+            className="h-7 w-7 sm:h-8 sm:w-8 flex items-center justify-center rounded-md bg-[#2A2D33] hover:bg-[#353941] active:scale-[0.97] text-[#E6E2D9] transition-colors"
           >
-            <RotateCcw className="w-4 h-4" />
+            <RotateCcw className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
           </button>
 
           <button
@@ -406,9 +416,9 @@ export const HardwareTopBar: React.FC<HardwareTopBarProps> = React.memo(
             onClick={onOpenSettings}
             aria-label="Настройки чипсета и экрана"
             title="Настройки чипсета и экрана"
-            className="h-8 w-8 flex items-center justify-center rounded-md bg-[#2A2D33] hover:bg-[#353941] active:scale-[0.97] text-[#E6E2D9] transition-colors"
+            className="h-7 w-7 sm:h-8 sm:w-8 flex items-center justify-center rounded-md bg-[#2A2D33] hover:bg-[#353941] active:scale-[0.97] text-[#E6E2D9] transition-colors"
           >
-            <SlidersHorizontal className="w-4 h-4" />
+            <SlidersHorizontal className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
           </button>
 
           <button
@@ -416,9 +426,9 @@ export const HardwareTopBar: React.FC<HardwareTopBarProps> = React.memo(
             onClick={onOpenDisks}
             aria-label="Дискеты, HDF, архивы и Kickstart ROM"
             title="Диски ADF/ADZ/LHA/HDF и ROM"
-            className="h-8 w-8 flex items-center justify-center rounded-md bg-[#C8342A] hover:bg-[#D94035] active:scale-[0.97] text-white transition-colors"
+            className="h-7 w-7 sm:h-8 sm:w-8 flex items-center justify-center rounded-md bg-[#C8342A] hover:bg-[#D94035] active:scale-[0.97] text-white transition-colors"
           >
-            <FloppyDiskIcon className="w-4 h-4" />
+            <FloppyDiskIcon className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
           </button>
 
           <button
@@ -426,9 +436,9 @@ export const HardwareTopBar: React.FC<HardwareTopBarProps> = React.memo(
             onClick={onToggleFullscreen}
             aria-label="Полноэкранный режим"
             title="Полноэкранный режим"
-            className="h-8 w-8 flex items-center justify-center rounded-md bg-[#2A2D33] hover:bg-[#353941] active:scale-[0.97] text-[#E6E2D9] transition-colors"
+            className="h-7 w-7 sm:h-8 sm:w-8 flex items-center justify-center rounded-md bg-[#2A2D33] hover:bg-[#353941] active:scale-[0.97] text-[#E6E2D9] transition-colors"
           >
-            <Maximize2 className="w-4 h-4" />
+            <Maximize2 className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
           </button>
         </div>
       </header>

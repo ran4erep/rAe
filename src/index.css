@@ -109,50 +109,20 @@
   padding-bottom: max(env(safe-area-inset-bottom, 0px), 6px);
 }
 
-/* Semi-transparent tactile keys when overlaid over fullscreen Amiga screen */
-.amiga-keyboard-translucent .amiga-key-ivory {
-  background: rgba(232, 227, 217, 0.38);
-  color: #ffffff;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.92);
-  border: 1px solid rgba(255, 255, 255, 0.25);
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.35);
+/* Semi-transparent tactile keys when overlaid over fullscreen Amiga screen (identical sculpted style, GPU-only opacity) */
+.amiga-keyboard-translucent .amiga-key-ivory,
+.amiga-keyboard-translucent .amiga-key-grey,
+.amiga-keyboard-translucent .amiga-key-accent {
+  opacity: 0.82;
 }
 
 .amiga-keyboard-translucent .amiga-key-ivory[data-pressed="true"],
-.amiga-keyboard-translucent .amiga-key-ivory:active {
-  background: rgba(232, 227, 217, 0.68);
-  transform: translateY(1px);
-  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.35);
-}
-
-.amiga-keyboard-translucent .amiga-key-grey {
-  background: rgba(34, 33, 32, 0.62);
-  color: #ffffff;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.95);
-  border: 1px solid rgba(255, 255, 255, 0.26);
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.35);
-}
-
+.amiga-keyboard-translucent .amiga-key-ivory:active,
 .amiga-keyboard-translucent .amiga-key-grey[data-pressed="true"],
-.amiga-keyboard-translucent .amiga-key-grey:active {
-  background: rgba(64, 61, 58, 0.82);
-  transform: translateY(1px);
-  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.4);
-}
-
-.amiga-keyboard-translucent .amiga-key-accent {
-  background: rgba(200, 52, 42, 0.52);
-  color: #ffffff;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.92);
-  border: 1px solid rgba(255, 175, 170, 0.34);
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.35);
-}
-
+.amiga-keyboard-translucent .amiga-key-grey:active,
 .amiga-keyboard-translucent .amiga-key-accent[data-pressed="true"],
 .amiga-keyboard-translucent .amiga-key-accent:active {
-  background: rgba(217, 64, 53, 0.8);
-  transform: translateY(1px);
-  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.45);
+  opacity: 0.98;
 }
 
 /* Range slider with transparent track for GPU-composited fill bar */

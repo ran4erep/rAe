@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Check, Gamepad2, Keyboard, Pencil, Plus, Trash2, X } from 'lucide-react';
+import { Check, Gamepad2, Keyboard, MousePointer, Pencil, Plus, Trash2, X } from 'lucide-react';
 import {
   ControlButtonSize,
   CustomControlProfile,
@@ -23,6 +23,7 @@ interface CustomEditToolbarProps {
   onRenameProfile: (name: string) => void;
   onDeleteProfile: () => void;
   onAddButton: () => void;
+  onAddMouseButton: (button: 'left' | 'right') => void;
   onAddStick: () => void;
   onDeleteSelected: () => void;
   onOpenButtonPicker: (buttonId: string) => void;
@@ -40,6 +41,7 @@ export const CustomEditToolbar: React.FC<CustomEditToolbarProps> = ({
   onRenameProfile,
   onDeleteProfile,
   onAddButton,
+  onAddMouseButton,
   onAddStick,
   onDeleteSelected,
   onOpenButtonPicker,
@@ -48,6 +50,7 @@ export const CustomEditToolbar: React.FC<CustomEditToolbarProps> = ({
   onDone,
 }) => {
   const [formMode, setFormMode] = useState<'new' | 'rename' | null>(null);
+  const [mouseMenuOpen, setMouseMenuOpen] = useState(false);
   const [nameDraft, setNameDraft] = useState('');
 
   const selectedButton =
@@ -134,17 +137,37 @@ export const CustomEditToolbar: React.FC<CustomEditToolbarProps> = ({
         <div className="flex items-center gap-1 flex-wrap">
           <button
             type="button"
-            onClick={onAddButton}
+            onClick={() => {
+              setMouseMenuOpen(false);
+              onAddButton();
+            }}
             className="h-8 px-2.5 rounded-md bg-[#2A2D33] hover:bg-[#353941] text-[11px] font-semibold text-[#F2EFE9] flex items-center gap-1"
           >
             <Plus className="w-3.5 h-3.5 text-[#E07A22]" />
             <span>Кнопка</span>
           </button>
 
+          <button
+            type="button"
+            aria-expanded={mouseMenuOpen}
+            onClick={() => setMouseMenuOpen((v) => !v)}
+            className={`h-8 px-2.5 rounded-md text-[11px] font-semibold flex items-center gap-1 ${
+              mouseMenuOpen
+                ? 'bg-[#E07A22] text-[#141518]'
+                : 'bg-[#2A2D33] hover:bg-[#353941] text-[#F2EFE9]'
+            }`}
+          >
+            <MousePointer className={`w-3.5 h-3.5 ${mouseMenuOpen ? 'text-[#141518]' : 'text-[#E07A22]'}`} />
+            <span>+ Мышь</span>
+          </button>
+
           {activeProfile.stick === null && (
             <button
               type="button"
-              onClick={onAddStick}
+              onClick={() => {
+                setMouseMenuOpen(false);
+                onAddStick();
+              }}
               className="h-8 px-2.5 rounded-md bg-[#2A2D33] hover:bg-[#353941] text-[11px] font-semibold text-[#F2EFE9] flex items-center gap-1"
             >
               <Gamepad2 className="w-3.5 h-3.5 text-[#E07A22]" />
@@ -163,6 +186,43 @@ export const CustomEditToolbar: React.FC<CustomEditToolbarProps> = ({
         </div>
       </div>
 
+      {/* Quick Mouse Button Creator Row */}
+      {mouseMenuOpen && (
+        <div className="pt-1 border-t border-white/10 flex flex-wrap items-center justify-between gap-1.5">
+          <span className="text-[11px] font-semibold text-[#BDB9B0]">
+            Добавить кнопку мыши:
+          </span>
+          <div className="flex items-center gap-1.5 flex-wrap">
+            {(
+              [
+                { button: 'left', label: 'ЛКМ (левая)' },
+                { button: 'right', label: 'ПКМ (правая)' },
+              ] as const
+            ).map((item) => (
+              <button
+                key={item.button}
+                type="button"
+                onClick={() => {
+                  onAddMouseButton(item.button);
+                  setMouseMenuOpen(false);
+                }}
+                className="h-7 px-2.5 rounded-[4px] amiga-key-ivory text-[11px] font-semibold"
+              >
+                {item.label}
+              </button>
+            ))}
+            <button
+              type="button"
+              onClick={() => setMouseMenuOpen(false)}
+              aria-label="Скрыть меню кнопок мыши"
+              className="h-7 w-7 rounded-md bg-[#2A2D33] hover:bg-[#353941] text-[#D8D4CC] flex items-center justify-center"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Contextual row for selected Button or Stick (still completely outside the control zone!) */}
       {(selectedButton || stickSelected) && (
         <div className="pt-1 border-t border-white/10 flex flex-wrap items-center justify-between gap-1.5">
@@ -173,8 +233,23 @@ export const CustomEditToolbar: React.FC<CustomEditToolbarProps> = ({
                 onClick={() => onOpenButtonPicker(selectedButton.id)}
                 className="h-7 px-2.5 rounded-md bg-[#353941] hover:bg-[#424752] text-[11px] font-semibold text-[#F2EFE9] flex items-center gap-1.5"
               >
-                <Keyboard className="w-3.5 h-3.5 text-[#E07A22]" />
-                <span>Клавиша: {getTargetDisplayLabel(selectedButton.target, selectedButton.label)}</span>
+                {selectedButton.target.kind === 'mouse' ? (
+                  <MousePointer className="w-3.5 h-3.5 text-[#E07A22]" />
+                ) : selectedButton.target.kind === 'joy' ? (
+                  <Gamepad2 className="w-3.5 h-3.5 text-[#E07A22]" />
+                ) : (
+                  <Keyboard className="w-3.5 h-3.5 text-[#E07A22]" />
+                )}
+                <span>
+                  {selectedButton.target.kind === 'mouse'
+                    ? 'Мышь'
+                    : selectedButton.target.kind === 'joy'
+                      ? 'Джойстик'
+                      : selectedButton.target.kind === 'combo'
+                        ? 'Сочетание'
+                        : 'Клавиша'}
+                  : {getTargetDisplayLabel(selectedButton.target, selectedButton.label)}
+                </span>
               </button>
             </div>
           )}

@@ -1,0 +1,13 @@
+{
+  "name": "amiga500archive-vercel-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "CORS-enabled Vercel serverless proxy for amiga500archive.com catalog, covers, and ADF/ZIP downloads",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "test": "node --test lib/amiga500archive.test.mjs lib/planetemu.test.mjs lib/archiveTosec.test.mjs"
+  }
+}

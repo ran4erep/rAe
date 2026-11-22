@@ -1,3 +1,15 @@
+export type CatalogSource = 'amiga500archive' | 'planetemu';
+
+export interface CatalogSourceOption {
+  id: CatalogSource;
+  label: string;
+}
+
+export const CATALOG_SOURCES: readonly CatalogSourceOption[] = [
+  { id: 'amiga500archive', label: 'Amiga 500 Archive' },
+  { id: 'planetemu', label: 'Planetemu' },
+] as const;
+
 export type CatalogCategory = 'games' | 'top' | 'demos' | 'originals' | 'tools' | 'recent';
 
 export interface CatalogCategoryOption {
@@ -14,10 +26,40 @@ export const CATALOG_CATEGORIES: readonly CatalogCategoryOption[] = [
   { id: 'recent', label: 'Новые' },
 ] as const;
 
+export const PLANETEMU_LETTERS = [
+  '0',
+  'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
+  'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
+] as const;
+
+export type PlanetemuLetter = (typeof PLANETEMU_LETTERS)[number];
+
+export interface CatalogDiskFile {
+  id: string;
+  name: string;
+  sizeLabel: string;
+  sizeBytes: number;
+  diskNumber: number | null;
+  diskTotal: number | null;
+  isBadDump?: boolean;
+  isVerified?: boolean;
+  isClean?: boolean;
+  crackTag?: string | null;
+  prereleaseKind?: 'alpha' | 'beta' | 'proto' | 'demo' | null;
+  variantTags?: string[];
+  proxyDownloadUrl: string;
+}
+
 export interface CatalogGameItem {
   id: string;
   title: string;
   firms: string[];
+  year?: string | null;
+  tags?: string[];
+  platform?: 'CD32' | 'CDTV' | 'AGA' | 'OCS-AGA' | 'OCS/ECS';
+  isPrereleaseOnly?: boolean;
+  diskCount?: number;
+  files?: CatalogDiskFile[];
   coverPath: string | null;
   coverUrl: string | null;
   proxyCoverUrl: string | null;
@@ -27,10 +69,12 @@ export interface CatalogGameItem {
 export interface CatalogPageResponse {
   ok: boolean;
   source: string;
+  fallbackFrom?: string;
   category: string;
   query: string;
   page: number;
   totalPages: number;
+  totalItems?: number;
   hasPrev: boolean;
   hasNext: boolean;
   items: CatalogGameItem[];
@@ -38,6 +82,15 @@ export interface CatalogPageResponse {
 }
 
 export const DEFAULT_CATALOG_PROXY_URL = 'https://amiga-proxy.vercel.app';
+
+export function getDefaultCatalogProxyBase(
+  env: Record<string, unknown> | undefined = (import.meta as ImportMeta & { env?: Record<string, unknown> }).env
+): string {
+  const configured = typeof env?.VITE_CATALOG_PROXY_URL === 'string' ? env.VITE_CATALOG_PROXY_URL.trim() : '';
+  if (configured === '/' || configured === 'local') return '';
+  if (configured) return configured.replace(/\/+$/, '');
+  return DEFAULT_CATALOG_PROXY_URL;
+}
 
 const CACHE_TTL_MS = 3 * 60 * 1000;
 const MAX_CACHE_ENTRIES = 30;
@@ -81,25 +134,42 @@ const catalogCache = new CatalogMemoryCache();
 
 export function makeCatalogCacheKey(
   proxyBase: string,
-  category: CatalogCategory,
+  source: CatalogSource,
+  categoryOrLetter: string,
   query: string,
   page: number
 ): string {
-  return `${proxyBase}|${category}|${query.trim().toLowerCase()}|${page}`;
+  return `${proxyBase}|${source}|${categoryOrLetter}|${query.trim().toLowerCase()}|${page}`;
 }
 
 export function buildCatalogApiUrl(
   proxyBase: string,
-  opts: { category: CatalogCategory; query: string; page: number }
+  opts: {
+    source?: CatalogSource;
+    category: CatalogCategory;
+    letter?: PlanetemuLetter;
+    query: string;
+    page: number;
+  }
 ): string {
   const base = proxyBase.replace(/\/+$/, '');
   const params = new URLSearchParams();
+  const source: CatalogSource = opts.source ?? 'amiga500archive';
   const q = opts.query.trim();
-  if (q) {
+
+  if (source === 'planetemu') {
+    params.set('source', 'planetemu');
+    if (q) {
+      params.set('q', q);
+    } else {
+      params.set('letter', opts.letter ?? '0');
+    }
+  } else if (q) {
     params.set('q', q);
   } else {
     params.set('category', opts.category);
   }
+
   params.set('page', String(Math.max(1, Math.floor(opts.page))));
   return `${base}/api/catalog?${params.toString()}`;
 }
@@ -117,13 +187,18 @@ export function resolveCatalogCoverUrl(proxyBase: string, item: CatalogGameItem)
   return item.coverUrl;
 }
 
-export function resolveCatalogDownloadUrl(proxyBase: string, item: CatalogGameItem): string {
+export function resolveProxyUrl(proxyBase: string, relativeOrAbsolute: string): string {
   const base = proxyBase.replace(/\/+$/, '');
+  return relativeOrAbsolute.startsWith('http')
+    ? relativeOrAbsolute
+    : `${base}${relativeOrAbsolute.startsWith('/') ? '' : '/'}${relativeOrAbsolute}`;
+}
+
+export function resolveCatalogDownloadUrl(proxyBase: string, item: CatalogGameItem): string {
   if (item.proxyDownloadUrl) {
-    return item.proxyDownloadUrl.startsWith('http')
-      ? item.proxyDownloadUrl
-      : `${base}${item.proxyDownloadUrl.startsWith('/') ? '' : '/'}${item.proxyDownloadUrl}`;
+    return resolveProxyUrl(proxyBase, item.proxyDownloadUrl);
   }
+  const base = proxyBase.replace(/\/+$/, '');
   return `${base}/api/download?id=${encodeURIComponent(item.id)}`;
 }
 
@@ -159,19 +234,23 @@ export function decodeHeaderFilename(
   }
 
   const safeBase = fallbackTitle.replace(/[\\/:*?"<>|]+/g, '_').trim() || 'amiga_game';
-  return `${safeBase}.zip`;
+  return safeBase.toLowerCase().endsWith('.zip') ? safeBase : `${safeBase}.zip`;
 }
 
 export async function fetchCatalogPage(opts: {
   proxyBase?: string;
+  source?: CatalogSource;
   category: CatalogCategory;
+  letter?: PlanetemuLetter;
   query: string;
   page: number;
   signal?: AbortSignal;
   bypassCache?: boolean;
 }): Promise<CatalogPageResponse> {
-  const proxyBase = (opts.proxyBase || DEFAULT_CATALOG_PROXY_URL).replace(/\/+$/, '');
-  const cacheKey = makeCatalogCacheKey(proxyBase, opts.category, opts.query, opts.page);
+  const proxyBase = (opts.proxyBase ?? getDefaultCatalogProxyBase()).replace(/\/+$/, '');
+  const source: CatalogSource = opts.source ?? 'amiga500archive';
+  const categoryOrLetter = source === 'planetemu' ? (opts.letter ?? '0') : opts.category;
+  const cacheKey = makeCatalogCacheKey(proxyBase, source, categoryOrLetter, opts.query, opts.page);
 
   if (!opts.bypassCache) {
     const cached = catalogCache.get(cacheKey);
@@ -179,7 +258,9 @@ export async function fetchCatalogPage(opts: {
   }
 
   const url = buildCatalogApiUrl(proxyBase, {
+    source,
     category: opts.category,
+    letter: opts.letter,
     query: opts.query,
     page: opts.page,
   });
@@ -190,7 +271,14 @@ export async function fetchCatalogPage(opts: {
   });
 
   if (!resp.ok) {
-    throw new Error(`Ошибка каталога (HTTP ${resp.status})`);
+    let serverErr = '';
+    try {
+      const errJson = (await resp.json()) as { error?: string };
+      if (errJson?.error) serverErr = errJson.error;
+    } catch {
+      // Ignore non-JSON error body
+    }
+    throw new Error(serverErr || `Ошибка каталога (HTTP ${resp.status})`);
   }
 
   const data = (await resp.json()) as CatalogPageResponse;
@@ -202,28 +290,50 @@ export async function fetchCatalogPage(opts: {
   return data;
 }
 
-export async function downloadCatalogArchive(opts: {
+export async function downloadCatalogArchiveByUrl(opts: {
   proxyBase?: string;
-  item: CatalogGameItem;
+  proxyDownloadUrl: string;
+  fallbackTitle: string;
   signal?: AbortSignal;
 }): Promise<{ filename: string; bytes: Uint8Array }> {
-  const proxyBase = (opts.proxyBase || DEFAULT_CATALOG_PROXY_URL).replace(/\/+$/, '');
-  const url = resolveCatalogDownloadUrl(proxyBase, opts.item);
+  const proxyBase = (opts.proxyBase ?? getDefaultCatalogProxyBase()).replace(/\/+$/, '');
+  const url = resolveProxyUrl(proxyBase, opts.proxyDownloadUrl);
 
   const resp = await fetch(url, { signal: opts.signal });
   if (!resp.ok) {
-    throw new Error(`Не удалось скачать «${opts.item.title}» (HTTP ${resp.status})`);
+    let serverErr = '';
+    try {
+      const errJson = (await resp.json()) as { error?: string };
+      if (errJson?.error) serverErr = errJson.error;
+    } catch {
+      // Ignore non-JSON error body
+    }
+    throw new Error(serverErr || `Не удалось скачать «${opts.fallbackTitle}» (HTTP ${resp.status})`);
   }
 
   const filename = decodeHeaderFilename(
     resp.headers.get('X-Archive-Filename'),
     resp.headers.get('Content-Disposition'),
-    opts.item.title
+    opts.fallbackTitle
   );
   const bytes = new Uint8Array(await resp.arrayBuffer());
   if (bytes.length === 0) {
-    throw new Error(`Архив «${opts.item.title}» пуст. Попробуйте обновить каталог.`);
+    throw new Error(`Архив «${opts.fallbackTitle}» пуст. Попробуйте обновить каталог.`);
   }
 
   return { filename, bytes };
+}
+
+export async function downloadCatalogArchive(opts: {
+  proxyBase?: string;
+  item: CatalogGameItem;
+  signal?: AbortSignal;
+}): Promise<{ filename: string; bytes: Uint8Array }> {
+  const proxyBase = (opts.proxyBase ?? getDefaultCatalogProxyBase()).replace(/\/+$/, '');
+  return downloadCatalogArchiveByUrl({
+    proxyBase,
+    proxyDownloadUrl: resolveCatalogDownloadUrl(proxyBase, opts.item),
+    fallbackTitle: opts.item.title,
+    signal: opts.signal,
+  });
 }

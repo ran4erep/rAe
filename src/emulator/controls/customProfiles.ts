@@ -4,10 +4,14 @@ import { JoystickState } from '../types';
 export type StickDirection = 'up' | 'down' | 'left' | 'right';
 export type ControlButtonSize = 'sm' | 'md' | 'lg';
 
-export type ControlTarget =
+export type SingleControlTarget =
   | { kind: 'key'; code: number }
   | { kind: 'joy'; dir: 'up' | 'down' | 'left' | 'right' | 'fire1' | 'fire2' }
   | { kind: 'mouse'; button: 'left' | 'right' };
+
+export type ControlTarget =
+  | SingleControlTarget
+  | { kind: 'combo'; targets: [SingleControlTarget, SingleControlTarget] };
 
 export interface CustomButtonConfig {
   id: string;
@@ -51,8 +55,43 @@ export interface StickDirsState {
 }
 
 export interface EmittedTargetAction {
-  target: ControlTarget;
+  target: SingleControlTarget;
   down: boolean;
+}
+
+const MODIFIER_KEY_CODES = new Set<number>([
+  AMIGA_RAW.LSHIFT,
+  AMIGA_RAW.RSHIFT,
+  AMIGA_RAW.CTRL,
+  AMIGA_RAW.LALT,
+  AMIGA_RAW.RALT,
+  AMIGA_RAW.LAMIGA,
+  AMIGA_RAW.RAMIGA,
+]);
+
+export function isModifierControlTarget(target: SingleControlTarget): boolean {
+  return target.kind === 'key' && MODIFIER_KEY_CODES.has(target.code);
+}
+
+/**
+ * Orders a 2-target combo so any modifier key (Shift/Ctrl/Alt/Amiga) comes first.
+ * This ensures AmigaOS/games see the modifier pressed before the main key and released after.
+ */
+export function normalizeComboTargets(
+  first: SingleControlTarget,
+  second: SingleControlTarget
+): [SingleControlTarget, SingleControlTarget] {
+  if (isModifierControlTarget(second) && !isModifierControlTarget(first)) {
+    return [second, first];
+  }
+  return [first, second];
+}
+
+export function expandControlTarget(target: ControlTarget): SingleControlTarget[] {
+  if (target.kind === 'combo') {
+    return [target.targets[0], target.targets[1]];
+  }
+  return [target];
 }
 
 export function clampPct(value: number, min = 4, max = 96): number {
@@ -60,13 +99,20 @@ export function clampPct(value: number, min = 4, max = 96): number {
   return Math.max(min, Math.min(max, Math.round(value * 10) / 10));
 }
 
-export function targetKey(target: ControlTarget): string {
+export function singleTargetKey(target: SingleControlTarget): string {
   if (target.kind === 'key') return `key:${target.code}`;
   if (target.kind === 'joy') return `joy:${target.dir}`;
   return `mouse:${target.button}`;
 }
 
-export function targetsEqual(a: ControlTarget, b: ControlTarget): boolean {
+export function targetKey(target: ControlTarget): string {
+  if (target.kind === 'combo') {
+    return `combo:${singleTargetKey(target.targets[0])}+${singleTargetKey(target.targets[1])}`;
+  }
+  return singleTargetKey(target);
+}
+
+export function singleTargetsEqual(a: SingleControlTarget, b: SingleControlTarget): boolean {
   if (a.kind !== b.kind) return false;
   if (a.kind === 'key' && b.kind === 'key') return a.code === b.code;
   if (a.kind === 'joy' && b.kind === 'joy') return a.dir === b.dir;
@@ -74,7 +120,21 @@ export function targetsEqual(a: ControlTarget, b: ControlTarget): boolean {
   return false;
 }
 
-const JOY_LABELS: Record<Extract<ControlTarget, { kind: 'joy' }>['dir'], string> = {
+export function targetsEqual(a: ControlTarget, b: ControlTarget): boolean {
+  if (a.kind !== b.kind) return false;
+  if (a.kind === 'combo' && b.kind === 'combo') {
+    return (
+      singleTargetsEqual(a.targets[0], b.targets[0]) &&
+      singleTargetsEqual(a.targets[1], b.targets[1])
+    );
+  }
+  if (a.kind !== 'combo' && b.kind !== 'combo') {
+    return singleTargetsEqual(a, b);
+  }
+  return false;
+}
+
+const JOY_LABELS: Record<Extract<SingleControlTarget, { kind: 'joy' }>['dir'], string> = {
   up: 'JOY ↑',
   down: 'JOY ↓',
   left: 'JOY ←',
@@ -102,10 +162,23 @@ const COMPACT_KEY_LABELS: Partial<Record<number, string>> = {
   [AMIGA_RAW.CAPSLOCK]: 'CAPS',
 };
 
-export function getTargetDisplayLabel(target: ControlTarget, customLabel?: string): string {
-  const trimmed = customLabel?.trim();
-  if (trimmed) return trimmed;
+const COMBO_PART_LABELS: Partial<Record<number, string>> = {
+  [AMIGA_RAW.LSHIFT]: 'L⇧',
+  [AMIGA_RAW.RSHIFT]: 'R⇧',
+  [AMIGA_RAW.SPACE]: 'SPC',
+  [AMIGA_RAW.RETURN]: 'RET',
+  [AMIGA_RAW.BACKSPACE]: '⌫',
+  [AMIGA_RAW.LALT]: 'L-ALT',
+  [AMIGA_RAW.RALT]: 'R-ALT',
+  [AMIGA_RAW.LAMIGA]: 'L-AMI',
+  [AMIGA_RAW.RAMIGA]: 'R-AMI',
+};
+
+function getSingleTargetDisplayLabel(target: SingleControlTarget, inCombo = false): string {
   if (target.kind === 'key') {
+    if (inCombo && COMBO_PART_LABELS[target.code]) {
+      return COMBO_PART_LABELS[target.code]!;
+    }
     return COMPACT_KEY_LABELS[target.code] ?? AMIGA_KEY_NAMES[target.code] ?? `KEY $${target.code.toString(16)}`;
   }
   if (target.kind === 'joy') {
@@ -114,10 +187,18 @@ export function getTargetDisplayLabel(target: ControlTarget, customLabel?: strin
   return target.button === 'left' ? 'ЛКМ' : 'ПКМ';
 }
 
-export function getTargetAriaLabel(target: ControlTarget, customLabel?: string): string {
+export function getTargetDisplayLabel(target: ControlTarget, customLabel?: string): string {
+  const trimmed = customLabel?.trim();
+  if (trimmed) return trimmed;
+  if (target.kind === 'combo') {
+    return `${getSingleTargetDisplayLabel(target.targets[0], true)}+${getSingleTargetDisplayLabel(target.targets[1], true)}`;
+  }
+  return getSingleTargetDisplayLabel(target, false);
+}
+
+function getSingleTargetAriaLabel(target: SingleControlTarget): string {
   if (target.kind === 'key') {
-    const name = AMIGA_KEY_NAMES[target.code] ?? `Key ${target.code}`;
-    return customLabel?.trim() ? `${customLabel.trim()} (${name})` : name;
+    return AMIGA_KEY_NAMES[target.code] ?? `Key ${target.code}`;
   }
   if (target.kind === 'joy') {
     return JOY_LABELS[target.dir];
@@ -125,32 +206,48 @@ export function getTargetAriaLabel(target: ControlTarget, customLabel?: string):
   return target.button === 'left' ? 'Левая кнопка мыши' : 'Правая кнопка мыши';
 }
 
+export function getTargetAriaLabel(target: ControlTarget, customLabel?: string): string {
+  const baseName =
+    target.kind === 'combo'
+      ? `${getSingleTargetAriaLabel(target.targets[0])} + ${getSingleTargetAriaLabel(target.targets[1])}`
+      : getSingleTargetAriaLabel(target);
+  return customLabel?.trim() ? `${customLabel.trim()} (${baseName})` : baseName;
+}
+
 /**
  * Computes exact minimal press/release transitions for an 8-way stick
- * mapped to arbitrary keyboard keys, joystick directions, or mouse buttons.
+ * mapped to arbitrary keyboard keys, joystick directions, mouse buttons, or 2-action combos.
  */
 export function computeStickTransition(
-  prevActiveMap: Map<string, ControlTarget>,
+  prevActiveMap: Map<string, SingleControlTarget>,
   nextDirs: StickDirsState,
   stick: Pick<CustomStickConfig, 'up' | 'down' | 'left' | 'right'>
-): { nextActiveMap: Map<string, ControlTarget>; actions: EmittedTargetAction[] } {
-  const nextActiveMap = new Map<string, ControlTarget>();
+): { nextActiveMap: Map<string, SingleControlTarget>; actions: EmittedTargetAction[] } {
+  const nextActiveMap = new Map<string, SingleControlTarget>();
   const dirs: StickDirection[] = ['up', 'down', 'left', 'right'];
 
   for (const d of dirs) {
     if (nextDirs[d]) {
-      const target = stick[d];
-      nextActiveMap.set(targetKey(target), target);
+      const expanded = expandControlTarget(stick[d]);
+      for (const single of expanded) {
+        nextActiveMap.set(singleTargetKey(single), single);
+      }
     }
   }
 
   const actions: EmittedTargetAction[] = [];
 
+  // Release in reverse order so secondary keys release before modifiers
+  const toRelease: SingleControlTarget[] = [];
   for (const [k, target] of prevActiveMap.entries()) {
     if (!nextActiveMap.has(k)) {
-      actions.push({ target, down: false });
+      toRelease.push(target);
     }
   }
+  for (let i = toRelease.length - 1; i >= 0; i--) {
+    actions.push({ target: toRelease[i], down: false });
+  }
+
   for (const [k, target] of nextActiveMap.entries()) {
     if (!prevActiveMap.has(k)) {
       actions.push({ target, down: true });
@@ -158,6 +255,78 @@ export function computeStickTransition(
   }
 
   return { nextActiveMap, actions };
+}
+
+/**
+ * Reference-counted hold tracker shared across all custom overlay controls (buttons + stick).
+ * Prevents overlapping combos or stick directions from prematurely releasing a shared modifier/key,
+ * and guarantees press order ([0] then [1]) and reverse release order ([1] then [0]).
+ */
+export class TargetHoldManager {
+  private readonly sources = new Map<string, SingleControlTarget[]>();
+  private readonly refCounts = new Map<string, { target: SingleControlTarget; count: number }>();
+
+  public setSource(sourceId: string, nextTargets: SingleControlTarget[]): EmittedTargetAction[] {
+    const prevTargets = this.sources.get(sourceId) ?? [];
+    if (nextTargets.length === 0) {
+      this.sources.delete(sourceId);
+    } else {
+      this.sources.set(sourceId, nextTargets);
+    }
+
+    const actions: EmittedTargetAction[] = [];
+
+    // Increment new targets first (in order) so shared targets stay held during transitions
+    for (let i = 0; i < nextTargets.length; i++) {
+      const t = nextTargets[i];
+      const k = singleTargetKey(t);
+      const entry = this.refCounts.get(k);
+      if (!entry || entry.count === 0) {
+        this.refCounts.set(k, { target: t, count: 1 });
+        actions.push({ target: t, down: true });
+      } else {
+        entry.count++;
+      }
+    }
+
+    // Decrement previous targets in reverse order so secondary keys release before modifiers
+    for (let i = prevTargets.length - 1; i >= 0; i--) {
+      const t = prevTargets[i];
+      const k = singleTargetKey(t);
+      const entry = this.refCounts.get(k);
+      if (!entry) continue;
+      entry.count--;
+      if (entry.count <= 0) {
+        this.refCounts.delete(k);
+        actions.push({ target: entry.target, down: false });
+      }
+    }
+
+    return actions;
+  }
+
+  public releaseAll(): EmittedTargetAction[] {
+    if (this.refCounts.size === 0) {
+      this.sources.clear();
+      return [];
+    }
+    const actions: EmittedTargetAction[] = [];
+    // Release non-modifiers before modifiers
+    const entries = Array.from(this.refCounts.values());
+    for (let i = entries.length - 1; i >= 0; i--) {
+      if (!isModifierControlTarget(entries[i].target)) {
+        actions.push({ target: entries[i].target, down: false });
+      }
+    }
+    for (let i = entries.length - 1; i >= 0; i--) {
+      if (isModifierControlTarget(entries[i].target)) {
+        actions.push({ target: entries[i].target, down: false });
+      }
+    }
+    this.sources.clear();
+    this.refCounts.clear();
+    return actions;
+  }
 }
 
 /**
@@ -226,7 +395,7 @@ export function createDefaultProfilesState(): CustomProfilesState {
   };
 }
 
-function isValidTarget(raw: unknown): raw is ControlTarget {
+function isValidSingleTarget(raw: unknown): raw is SingleControlTarget {
   if (!raw || typeof raw !== 'object') return false;
   const r = raw as Record<string, unknown>;
   if (r.kind === 'key') {
@@ -244,6 +413,17 @@ function isValidTarget(raw: unknown): raw is ControlTarget {
   }
   if (r.kind === 'mouse') {
     return r.button === 'left' || r.button === 'right';
+  }
+  return false;
+}
+
+function isValidTarget(raw: unknown): raw is ControlTarget {
+  if (isValidSingleTarget(raw)) return true;
+  if (!raw || typeof raw !== 'object') return false;
+  const r = raw as Record<string, unknown>;
+  if (r.kind === 'combo' && Array.isArray(r.targets) && r.targets.length === 2) {
+    const [a, b] = r.targets;
+    return isValidSingleTarget(a) && isValidSingleTarget(b) && !singleTargetsEqual(a, b);
   }
   return false;
 }

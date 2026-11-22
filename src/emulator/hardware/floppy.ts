@@ -16,6 +16,8 @@ export const ADF_TOTAL_SIZE = ADF_CYLINDERS * ADF_SIDES * ADF_TRACK_BYTES; // 90
 export const MFM_SECTOR_BYTES = 1088;
 export const MFM_TRACK_BYTES = 12668;
 export const MFM_SYNC_WORD = 0x4489;
+// Frames (~0.9s PAL) to keep /CHNG low & media unseated when hot-swapping over an occupied drive
+export const FLOPPY_HOTSWAP_EJECT_FRAMES = 45;
 
 /**
  * Computes official AmigaDOS 1024-byte Bootblock Checksum (placed at bytes 4..7).
@@ -321,11 +323,13 @@ export class FloppyDrive {
   public ioPulseFrames = 0;
   public stepPhase = false;
   public readyDelayLines = 0;
+  public ejectHoldFrames = 0;
   private idShift = 0;
 
   public onInsertCb?: (inserted: boolean) => void;
 
   public insert(adfData: Uint8Array, name: string, hotSwap = false, writeProtected = false): void {
+    const hadDisk = this.data !== null;
     // Normalize to 880KB ADF if slightly smaller
     if (adfData.length === ADF_TOTAL_SIZE) {
       this.data = new Uint8Array(adfData);
@@ -338,6 +342,12 @@ export class FloppyDrive {
     this.writeProtected = writeProtected;
     // On hot-swap while Amiga is running, /CHNG stays asserted until the drive steps
     this.diskChanged = hotSwap;
+    // Hold media unseated briefly when hot-swapping over a mounted disk (or immediately after eject)
+    // so trackdisk.device sees /CHNG remain low across steps and fires IECLASS_DISKREMOVED.
+    this.ejectHoldFrames =
+      hotSwap && (hadDisk || this.ejectHoldFrames > 0)
+        ? Math.max(this.ejectHoldFrames, FLOPPY_HOTSWAP_EJECT_FRAMES)
+        : 0;
     this.mfmDirty = true;
     this.trackBytePos = 0;
     this.onInsertCb?.(true);
@@ -348,12 +358,16 @@ export class FloppyDrive {
   }
 
   public eject(): void {
+    const hadDisk = this.data !== null;
     this.data = null;
     this.name = '';
     this.writeProtected = false;
     this.diskChanged = true;
     this.mfmDirty = true;
     this.readyDelayLines = 0;
+    if (hadDisk) {
+      this.ejectHoldFrames = FLOPPY_HOTSWAP_EJECT_FRAMES;
+    }
     this.onInsertCb?.(false);
   }
 
@@ -364,7 +378,7 @@ export class FloppyDrive {
     } else {
       if (this.cylinder < ADF_CYLINDERS - 1) this.cylinder++;
     }
-    if (this.data) {
+    if (this.data && this.ejectHoldFrames === 0) {
       this.diskChanged = false;
       this.ioPulseFrames = 6;
       if (this.cylinder !== prev) this.stepPhase = !this.stepPhase;
@@ -466,6 +480,7 @@ export class FloppyDrive {
       this.trackBytePos = meta ? meta.trackBytePos % MFM_TRACK_BYTES : 0;
       this.ioPulseFrames = 0;
       this.readyDelayLines = 0;
+      this.ejectHoldFrames = 0;
       this.mfmDirty = true;
     } else {
       this.data = null;
@@ -478,6 +493,7 @@ export class FloppyDrive {
       this.trackBytePos = 0;
       this.ioPulseFrames = 0;
       this.readyDelayLines = 0;
+      this.ejectHoldFrames = 0;
       this.mfmDirty = true;
     }
   }
@@ -523,6 +539,7 @@ export class FloppyController {
       d.trackBytePos = 0;
       d.ioPulseFrames = 0;
       d.readyDelayLines = 0;
+      d.ejectHoldFrames = 0;
       d.mfmDirty = true;
     }
     this.motorLatch = false;
@@ -566,7 +583,7 @@ export class FloppyController {
           }
           if (prevMotor !== drive.motorOn) {
             this.soundCallbacks.onMotor?.(i, drive.motorOn);
-            if (drive.motorOn && drive.data !== null) {
+            if (drive.motorOn && drive.data !== null && drive.ejectHoldFrames === 0) {
               this.ioSeq = (this.ioSeq + 1) | 0;
             }
           }
@@ -575,7 +592,7 @@ export class FloppyController {
         if (stepRising) {
           drive.step(dirOut);
           this.soundCallbacks.onStep?.(i, drive.cylinder);
-          if (drive.data !== null && drive.motorOn) {
+          if (drive.data !== null && drive.ejectHoldFrames === 0 && drive.motorOn) {
             this.ioSeq = (this.ioSeq + 1) | 0;
           }
         }
@@ -603,16 +620,17 @@ export class FloppyController {
     // Unselected bus floats high via pull-ups (0x3c); non-existent DF2:/DF3: report /RDY=1 and /CHNG=0 (0x38)
     if (!d) return this.anyDriveSelected ? 0x38 : 0x3c;
 
+    const mediaReady = d.data !== null && d.ejectHoldFrames === 0;
     let bits = 0x3c;
     if (d.motorOn) {
-      if (d.data && d.readyDelayLines === 0) bits &= ~0x20; // /RDY active low once motor spun up & disk present
+      if (mediaReady && d.readyDelayLines === 0) bits &= ~0x20; // /RDY active low once motor spun up & disk present
     } else {
       // Drive ID serial protocol (3.5" DD returns 0 -> /RDY low)
       if (!d.readNextIdBit()) bits &= ~0x20;
     }
     if (d.cylinder === 0) bits &= ~0x10; // /TK0 active low
-    if (d.writeProtected) bits &= ~0x08; // /WPRO active low
-    if (!d.data || d.diskChanged) bits &= ~0x04; // /CHNG active low when no disk
+    if (mediaReady && d.writeProtected) bits &= ~0x08; // /WPRO active low
+    if (!mediaReady || d.diskChanged) bits &= ~0x04; // /CHNG active low when no disk or changed
     return bits;
   }
 
@@ -622,7 +640,7 @@ export class FloppyController {
    */
   public alignToWordSync(syncWord: number): boolean {
     const drive = this.getActiveDrive();
-    if (!drive || !drive.data) return false;
+    if (!drive || !drive.data || drive.ejectHoldFrames > 0) return false;
     const mfm = drive.ensureMfmTrack();
     const len = mfm.length;
     const hi = (syncWord >>> 8) & 0xff;
@@ -656,7 +674,7 @@ export class FloppyController {
     fallbackDrive0 = false
   ): number {
     const drive = this.getActiveDrive() ?? (fallbackDrive0 ? this.drives[0] : null);
-    if (!drive || !drive.data || wordCount <= 0) return 0;
+    if (!drive || !drive.data || drive.ejectHoldFrames > 0 || wordCount <= 0) return 0;
 
     const mfm = drive.ensureMfmTrack();
     const len = mfm.length;
@@ -673,6 +691,13 @@ export class FloppyController {
     drive.ioPulseFrames = 6;
     this.ioSeq = (this.ioSeq + 1) | 0;
     return wordCount;
+  }
+
+  public peekCurrentMfmByte(): number {
+    const drive = this.getActiveDrive();
+    if (!drive || !drive.data || drive.ejectHoldFrames > 0) return 0xaa;
+    const mfm = drive.ensureMfmTrack();
+    return mfm[drive.trackBytePos % mfm.length];
   }
 
   public beginDiskDmaWrite(): void {
@@ -713,7 +738,7 @@ export class FloppyController {
     const total = this.writeDmaBytes;
     this.writeDmaBytes = 0;
     const drive = this.getActiveDrive();
-    if (!drive || !drive.data || drive.writeProtected || total < 1084) return 0;
+    if (!drive || !drive.data || drive.ejectHoldFrames > 0 || drive.writeProtected || total < 1084) return 0;
 
     const buf = this.writeDmaBuf;
     let written = 0;
@@ -767,7 +792,7 @@ export class FloppyController {
     writeChip16: (addr: number, val: number) => void
   ): boolean {
     const drive = this.getActiveDrive() ?? this.drives[0];
-    if (!drive.data || wordCount <= 0) return false;
+    if (!drive.data || drive.ejectHoldFrames > 0 || wordCount <= 0) return false;
     if (useWordSync) {
       const prevIdx = this.activeDriveIndex;
       if (this.activeDriveIndex < 0) this.activeDriveIndex = 0;

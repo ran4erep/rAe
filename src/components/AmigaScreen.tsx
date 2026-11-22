@@ -1,4 +1,5 @@
 import React, { useRef } from 'react';
+import { EmuPerfSnapshot } from '../emulator/performanceStats';
 import { triggerHaptic } from '../emulator/haptics';
 import { FB_HEIGHT, FB_WIDTH } from '../emulator/hardware/chipset';
 import { useSuppressBrowserTouchHold } from '../hooks/useSuppressBrowserTouchHold';
@@ -7,6 +8,7 @@ interface AmigaScreenProps {
   canvasRef: React.RefObject<HTMLCanvasElement | null>;
   scanlines: boolean;
   paused: boolean;
+  emuPerf?: EmuPerfSnapshot | null;
   aspectRatio?: number;
   fullscreen?: boolean;
   onMouseMove: (dx: number, dy: number) => void;
@@ -15,7 +17,17 @@ interface AmigaScreenProps {
 }
 
 export const AmigaScreen: React.FC<AmigaScreenProps> = React.memo(
-  ({ canvasRef, scanlines, paused, aspectRatio = 4 / 3, fullscreen = false, onMouseMove, onMouseButton, onUserInteract }) => {
+  ({
+    canvasRef,
+    scanlines,
+    paused,
+    emuPerf = null,
+    aspectRatio = 4 / 3,
+    fullscreen = false,
+    onMouseMove,
+    onMouseButton,
+    onUserInteract,
+  }) => {
     const containerRef = useRef<HTMLDivElement | null>(null);
     useSuppressBrowserTouchHold(containerRef);
     const touchRef = useRef<{
@@ -185,6 +197,67 @@ export const AmigaScreen: React.FC<AmigaScreenProps> = React.memo(
             className="pointer-events-none absolute inset-0 shadow-[inset_0_0_24px_rgba(0,0,0,0.42)]"
             aria-hidden="true"
           />
+
+          {emuPerf && (
+            <div
+              data-testid="emu-perf-hud"
+              className="pointer-events-none absolute bottom-2 right-2 z-10 max-w-[calc(100%-1rem)] rounded-md bg-[#121316]/85 border border-white/15 px-2 py-1 sm:px-2.5 sm:py-1.5 font-mono tabular-nums text-[9.5px] sm:text-[10.5px] leading-tight text-[#E6E2D9] shadow-lg"
+            >
+              <div className="flex items-center gap-1.5 font-semibold whitespace-nowrap">
+                <span
+                  className={`w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full shrink-0 ${
+                    emuPerf.verdict === 'optimal'
+                      ? 'bg-[#58B87C]'
+                      : emuPerf.verdict === 'tight'
+                        ? 'bg-[#E07A22]'
+                        : emuPerf.verdict === 'lagging'
+                          ? 'bg-[#FF6B63]'
+                          : 'bg-[#8D8980]'
+                  }`}
+                />
+                <span>
+                  {emuPerf.verdict === 'paused'
+                    ? 'ЭМУЛЯЦИЯ: ПАУЗА'
+                    : emuPerf.verdict === 'warming'
+                      ? 'ЭМУЛЯЦИЯ: ЗАМЕР...'
+                      : `ЭМУЛЯЦИЯ ${emuPerf.speedPct}%`}
+                </span>
+                <span
+                  className={
+                    emuPerf.verdict === 'optimal'
+                      ? 'text-[#7AD39B]'
+                      : emuPerf.verdict === 'tight'
+                        ? 'text-[#F09A49]'
+                        : emuPerf.verdict === 'lagging'
+                          ? 'text-[#FF8C85]'
+                          : 'text-[#A7A39A]'
+                  }
+                >
+                  {emuPerf.verdict === 'warming'
+                    ? '· анализ нагрузки'
+                    : emuPerf.verdict === 'paused'
+                      ? '· остановлена'
+                      : emuPerf.verdict === 'optimal'
+                        ? '· как на реальной Amiga'
+                        : emuPerf.verdict === 'tight'
+                          ? '· нагрузка на пределе'
+                          : '· тормозит эмулятор'}
+                </span>
+              </div>
+              {emuPerf.verdict !== 'paused' && emuPerf.verdict !== 'warming' && (
+                <>
+                  <div className="mt-0.5 text-[#BDB9B0] whitespace-nowrap">
+                    {emuPerf.emulatedHz.toFixed(1)}/{emuPerf.targetHz} Гц · Кадр{' '}
+                    {emuPerf.frameMs.toFixed(1)}/{emuPerf.budgetMs.toFixed(1)} мс ({emuPerf.loadPct}%)
+                  </div>
+                  <div className="mt-0.5 text-[9px] sm:text-[10px] text-[#9B968D] whitespace-nowrap">
+                    Ядро {emuPerf.coreMs.toFixed(1)} мс · Экран {emuPerf.blitMs.toFixed(1)} мс
+                    {emuPerf.droppedPerSec > 0 ? ` · Пропуск ${emuPerf.droppedPerSec}/с` : ''}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
 
           {paused && (
             <div className="absolute inset-0 bg-black/55 flex items-center justify-center">

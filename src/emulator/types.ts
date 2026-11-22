@@ -1,16 +1,20 @@
-export type ChipsetModel = 'OCS' | 'ECS';
-export type VideoStandard = 'PAL' | 'NTSC';
+export type ChipsetModel = 'OCS' | 'ECS' | 'AGA';
+export type ResolvedVideoStandard = 'PAL' | 'NTSC';
+export type VideoStandard = 'auto' | ResolvedVideoStandard;
 export type ChipRamKB = 512 | 1024 | 2048;
 export type SlowRamKB = 0 | 512;
+export type FastRamKB = 0 | 1024 | 2048 | 4096 | 8192;
 export type FrameSkipMode = 0 | 1 | 2;
-export type OverscanMode = 'auto' | 'none' | 'tv' | 'max';
+export type CpuOverclockMultiplier = number;
+export type OverscanCustomMode = `${number}x${number}`;
+export type OverscanMode = OverscanCustomMode | number | 'auto' | 'none' | 'tv' | 'max';
 
 export interface AmigaConfig {
   chipset: ChipsetModel;
   videoStandard: VideoStandard;
   chipRamKB: ChipRamKB;
   slowRamKB: SlowRamKB;
-  fastRamKB: 0 | 1024 | 2048;
+  fastRamKB: FastRamKB;
   audioEnabled: boolean;
   audioVolume: number;
   audioLedFilter: boolean;
@@ -19,10 +23,12 @@ export interface AmigaConfig {
   autoCrop: boolean;
   frameSkip: FrameSkipMode;
   ecoCpuMode: boolean;
+  cpuOverclock: CpuOverclockMultiplier;
   hapticsEnabled: boolean;
   floppyAudioEnabled: boolean;
   turboFloppy: boolean;
   joystickConnected: boolean;
+  showEmuPerf: boolean;
 }
 
 export interface FloppyDriveStatus {
@@ -57,7 +63,7 @@ export interface AmigaStatusSnapshot {
   fps: number;
   cpuUsageHint: number; // Estimated frame budget %
   chipset: ChipsetModel;
-  videoStandard: VideoStandard;
+  videoStandard: ResolvedVideoStandard;
   romName: string;
   isOpenKick: boolean;
   powerLed: boolean;
@@ -121,6 +127,11 @@ export interface SerializedAmigaState {
   df1Name: string;
   df0State?: SerializedFloppyDriveState;
   df1State?: SerializedFloppyDriveState;
+  isOpenKick?: boolean;
+  activeVideoStandard?: ResolvedVideoStandard;
+  frameCount?: number;
+  ovl?: boolean;
+  eClockAccum?: number;
   cpuRegs: number[];
   usp: number;
   ssp: number;
@@ -129,7 +140,23 @@ export interface SerializedAmigaState {
   stopped: boolean;
   chipRamBase64: string;
   slowRamBase64: string;
+  fastRamBase64?: string;
   customRegs: number[];
+  bplPt?: number[];
+  sprPt?: number[];
+  beamCon0?: number;
+  copPc?: number;
+  copWaiting?: boolean;
+  copWaitV?: number;
+  copWaitH?: number;
+  copMaskV?: number;
+  copMaskH?: number;
+  vbr?: number;
+  cacr?: number;
+  bplCon3?: number;
+  bplCon4?: number;
+  fmode?: number;
+  agaColors24?: number[];
   ciaA: number[];
   ciaB: number[];
 }
@@ -158,7 +185,7 @@ export interface SaveSlotData {
 
 export const DEFAULT_AMIGA_CONFIG: AmigaConfig = {
   chipset: 'ECS',
-  videoStandard: 'PAL',
+  videoStandard: 'auto',
   chipRamKB: 1024,
   slowRamKB: 512,
   fastRamKB: 0,
@@ -166,14 +193,16 @@ export const DEFAULT_AMIGA_CONFIG: AmigaConfig = {
   audioVolume: 1.0,
   audioLedFilter: true,
   crtScanlines: false,
-  overscan: 'auto',
+  overscan: 'none',
   autoCrop: false,
   frameSkip: 0,
   ecoCpuMode: false,
+  cpuOverclock: 1,
   hapticsEnabled: true,
   floppyAudioEnabled: true,
   turboFloppy: false,
   joystickConnected: true,
+  showEmuPerf: false,
 };
 
 // PAL 50Hz / NTSC 60Hz native timings

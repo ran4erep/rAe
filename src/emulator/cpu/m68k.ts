@@ -35,10 +35,30 @@ export class M68000 {
   public pendingIpl = 0;
   public cycles = 0;
 
+  // Motorola 68EC020 (Amiga 1200) mode & control registers
+  public is68020 = false;
+  public vbr = 0;
+  public cacr = 0;
+  public caar = 0;
+  public sfc = 0;
+  public dfc = 0;
+  public msp = 0;
+
   // Scratch fields for zero-allocation EA calculation
   private eaAddr = 0;
   private instrPc = 0;
+  private exceptionTaken = false;
   private bus: M68kBus;
+
+  // Zero-allocation fault ring buffer (only written when a CPU fault vector 2..15 fires)
+  private readonly faultVector = new Uint8Array(16);
+  private readonly faultPc = new Uint32Array(16);
+  private readonly faultOpcode = new Uint16Array(16);
+  private readonly faultSr = new Uint16Array(16);
+  private readonly faultSp = new Uint32Array(16);
+  private readonly faultCycles = new Uint32Array(16);
+  private faultWriteIdx = 0;
+  public supervisorTrapCount = 0;
 
   constructor(bus: M68kBus) {
     this.bus = bus;
@@ -48,10 +68,19 @@ export class M68000 {
     this.d.fill(0);
     this.a.fill(0);
     this.usp = 0;
+    this.vbr = 0;
+    this.cacr = 0;
+    this.caar = 0;
+    this.sfc = 0;
+    this.dfc = 0;
+    this.msp = 0;
     this.sr = 0x2700; // Supervisor mode, IPL 7
     this.stopped = false;
     this.pendingIpl = 0;
     this.cycles = 0;
+    this.exceptionTaken = false;
+    this.faultWriteIdx = 0;
+    this.supervisorTrapCount = 0;
     this.ssp = this.bus.read32(0x000000) | 0;
     this.a[7] = this.ssp;
     this.pc = this.bus.read32(0x000004) & 0x00ffffff;
@@ -123,7 +152,28 @@ export class M68000 {
   }
 
   public triggerException(vector: number, newIpl = -1): void {
+    // Aborted instructions (Illegal, Privilege, Line-A, Line-F) do not generate a Trace exception.
+    // Group 2 exceptions (TRAP, TRAPV, CHK, DIV0) still take Trace before the handler's first instruction.
+    if (vector === 4 || vector === 8 || vector === 10 || vector === 11) {
+      this.exceptionTaken = true;
+    }
     const oldSr = this.sr;
+    if (vector >= 2 && vector <= 15 && vector !== 9) {
+      const opcode = this.bus.read16(this.instrPc) & 0xffff;
+      if (vector === 8 && (this.instrPc >>> 0) >= 0xf80000 && opcode === 0x007c) {
+        // Routine Kickstart Exec Supervisor() call (ORI.W #$2000,SR) — keep ring buffer clean for real faults
+        this.supervisorTrapCount++;
+      } else {
+        const idx = this.faultWriteIdx & 15;
+        this.faultVector[idx] = vector;
+        this.faultPc[idx] = this.instrPc >>> 0;
+        this.faultOpcode[idx] = opcode;
+        this.faultSr[idx] = oldSr & 0xffff;
+        this.faultSp[idx] = this.a[7] >>> 0;
+        this.faultCycles[idx] = this.cycles >>> 0;
+        this.faultWriteIdx++;
+      }
+    }
     if ((this.sr & SR_S) === 0) {
       this.usp = this.a[7];
       this.a[7] = this.ssp;
@@ -140,10 +190,47 @@ export class M68000 {
       vector === 4 || vector === 8 || vector === 10 || vector === 11
         ? this.instrPc
         : this.pc;
+    if (this.is68020) {
+      // 68010/68EC020 Format $0 stack frame word (vector offset in bits 11..0)
+      this.push16((vector << 2) & 0x0fff);
+    }
     this.push32(pushedPc);
     this.push16(oldSr);
-    this.pc = this.bus.read32((vector << 2) & 0x00ffffff) & 0x00ffffff;
+    const vecAddr = ((this.is68020 ? this.vbr : 0) + (vector << 2)) & 0x00ffffff;
+    this.pc = this.bus.read32(vecAddr) & 0x00ffffff;
     this.cycles += 34;
+  }
+
+  public getRecentFaults(): Array<{
+    vector: number;
+    pc: number;
+    opcode: number;
+    sr: number;
+    sp: number;
+    cycles: number;
+  }> {
+    const total = Math.min(this.faultWriteIdx, 16);
+    const out: Array<{
+      vector: number;
+      pc: number;
+      opcode: number;
+      sr: number;
+      sp: number;
+      cycles: number;
+    }> = [];
+    const start = this.faultWriteIdx - total;
+    for (let i = 0; i < total; i++) {
+      const idx = (start + i) & 15;
+      out.push({
+        vector: this.faultVector[idx],
+        pc: this.faultPc[idx],
+        opcode: this.faultOpcode[idx],
+        sr: this.faultSr[idx],
+        sp: this.faultSp[idx],
+        cycles: this.faultCycles[idx],
+      });
+    }
+    return out;
   }
 
   private checkInterrupts(): boolean {
@@ -182,6 +269,9 @@ export class M68000 {
 
   private calcIndexExt(base: number): number {
     const ext = this.fetch16();
+    if (this.is68020 && (ext & 0x0100) !== 0) {
+      return this.calcFullIndexExt(base, ext);
+    }
     const regIdx = (ext >>> 12) & 7;
     const isAddr = (ext & 0x8000) !== 0;
     const isLong = (ext & 0x0800) !== 0;
@@ -190,7 +280,50 @@ export class M68000 {
     if (!isLong) {
       idxVal = (idxVal << 16) >> 16;
     }
+    if (this.is68020) {
+      const scale = (ext >>> 9) & 3;
+      if (scale !== 0) idxVal = (idxVal << scale) | 0;
+    }
     return (base + disp + idxVal) | 0;
+  }
+
+  private calcFullIndexExt(base: number, ext: number): number {
+    const bs = (ext & 0x0080) !== 0;
+    const is = (ext & 0x0040) !== 0;
+    const bdSize = (ext >>> 4) & 3;
+    const iis = ext & 7;
+
+    let bd = 0;
+    if (bdSize === 2) bd = this.fetch16s();
+    else if (bdSize === 3) bd = this.fetch32();
+
+    let ea = ((bs ? 0 : base) + bd) | 0;
+    let idxVal = 0;
+    if (!is) {
+      const regIdx = (ext >>> 12) & 7;
+      idxVal = (ext & 0x8000) !== 0 ? this.a[regIdx] : this.d[regIdx];
+      if ((ext & 0x0800) === 0) {
+        idxVal = (idxVal << 16) >> 16;
+      }
+      const scale = (ext >>> 9) & 3;
+      if (scale !== 0) idxVal = (idxVal << scale) | 0;
+    }
+
+    if (iis === 0) {
+      return (ea + idxVal) | 0;
+    }
+
+    const postIndexed = (iis & 4) !== 0;
+    const ptrAddr = postIndexed ? ea : ((ea + idxVal) | 0);
+    let indirect = this.bus.read32(ptrAddr) | 0;
+    const odSize = iis & 3;
+    let od = 0;
+    if (odSize === 2) od = this.fetch16s();
+    else if (odSize === 3) od = this.fetch32();
+    if (postIndexed) {
+      indirect = (indirect + idxVal) | 0;
+    }
+    return (indirect + od) | 0;
   }
 
   /**
@@ -455,6 +588,11 @@ export class M68000 {
       return 4;
     }
 
+    const traceBefore = (this.sr & SR_T) !== 0;
+    if (traceBefore) {
+      this.exceptionTaken = false;
+    }
+
     this.instrPc = this.pc;
     const op = this.fetch16();
     const group = op >>> 12;
@@ -517,6 +655,10 @@ export class M68000 {
       case 0xf:
         this.triggerException(11);
         break;
+    }
+
+    if (traceBefore && !this.exceptionTaken) {
+      this.triggerException(9);
     }
 
     return this.cycles - startC;
@@ -590,10 +732,42 @@ export class M68000 {
       return;
     }
 
-    // Immediate ALU: ORI(0), ANDI(2), SUBI(4), ADDI(6), EORI(A), CMPI(C)
+    // Immediate ALU / 68020 CMP2, CHK2, CAS, CAS2, MOVES
     const subOp = (op >>> 9) & 7;
     const sizeBits = (op >>> 6) & 3;
-    if (sizeBits === 3 || subOp === 4 || subOp === 7) {
+    if (sizeBits === 3) {
+      if (this.is68020) {
+        if (subOp <= 2) {
+          this.execCmp2Chk2020(subOp, mode, reg);
+          return;
+        }
+        if (subOp >= 5) {
+          if (mode === 7 && reg === 4 && (subOp === 6 || subOp === 7)) {
+            this.execCas2020(subOp === 7 ? 4 : 2);
+            return;
+          }
+          if (mode >= 2 && !(mode === 7 && reg === 4)) {
+            this.execCas020(subOp === 5 ? 1 : subOp === 6 ? 2 : 4, mode, reg);
+            return;
+          }
+        }
+      }
+      this.triggerException(4);
+      return;
+    }
+    if (subOp === 7) {
+      if (this.is68020) {
+        if ((this.sr & SR_S) === 0) {
+          this.triggerException(8);
+          return;
+        }
+        this.execMoves020(this.sizeFromBits(sizeBits), mode, reg);
+        return;
+      }
+      this.triggerException(4);
+      return;
+    }
+    if (subOp === 4) {
       this.triggerException(4);
       return;
     }
@@ -686,6 +860,15 @@ export class M68000 {
     const mode = (op >>> 3) & 7;
     const reg = op & 7;
 
+    // 68EC020: EXTB.L Dn ($49C0-$49C7) MUST be checked before LEA ($41C0.. mask & 0x01c0)
+    if (this.is68020 && (op & 0xfff8) === 0x49c0) {
+      const res = (this.d[reg] << 24) >> 24;
+      this.d[reg] = res;
+      this.setLogicFlags(res, 4);
+      this.cycles += 4;
+      return;
+    }
+
     // LEA <ea>, An
     if ((op & 0x01c0) === 0x01c0) {
       const dstAn = (op >>> 9) & 7;
@@ -694,10 +877,13 @@ export class M68000 {
       return;
     }
 
-    // CHK <ea>, Dn
-    if ((op & 0x01c0) === 0x0180) {
-      const dn = (this.d[(op >>> 9) & 7] << 16) >> 16;
-      const bound = (this.readEa(mode, reg, 2, false) << 16) >> 16;
+    // CHK.W <ea>, Dn (and 68020 CHK.L <ea>, Dn)
+    if ((op & 0x01c0) === 0x0180 || (this.is68020 && (op & 0x01c0) === 0x0100)) {
+      const isLong = (op & 0x01c0) === 0x0100;
+      const dn = isLong ? (this.d[(op >>> 9) & 7] | 0) : ((this.d[(op >>> 9) & 7] << 16) >> 16);
+      const bound = isLong
+        ? (this.readEa(mode, reg, 4, false) | 0)
+        : ((this.readEa(mode, reg, 2, false) << 16) >> 16);
       this.cycles += 10;
       if (dn < 0) {
         this.sr |= SR_N;
@@ -713,7 +899,11 @@ export class M68000 {
     switch (op & 0xff00) {
       case 0x4000: { // NEGX / MOVE from SR
         const szBits = (op >>> 6) & 3;
-        if (szBits === 3) { // MOVE SR, <ea>
+        if (szBits === 3) { // MOVE SR, <ea> (privileged on 68010/68EC020)
+          if (this.is68020 && (this.sr & SR_S) === 0) {
+            this.triggerException(8);
+            return;
+          }
           this.writeEa(mode, reg, 2, this.sr);
           this.cycles += 6;
         } else {
@@ -728,12 +918,17 @@ export class M68000 {
       case 0x4200: { // CLR (szBits=3 is MOVE CCR,<ea> on 68010+, illegal on 68000)
         const szBits = (op >>> 6) & 3;
         if (szBits === 3) {
-          this.triggerException(4);
+          if (this.is68020) {
+            this.writeEa(mode, reg, 2, this.getCCR());
+            this.cycles += 6;
+          } else {
+            this.triggerException(4);
+          }
           return;
         }
         const sz = this.sizeFromBits(szBits);
-        if (mode >= 2) {
-          // Hardware reads before clearing on 68000
+        if (!this.is68020 && mode >= 2) {
+          // 68000 reads before writing zero; 68010/68EC020 performs a single write-only cycle
           this.readEa(mode, reg, sz, true);
           this.writeSavedEa(mode, reg, sz, 0);
         } else {
@@ -778,9 +973,18 @@ export class M68000 {
         }
         return;
       }
-      case 0x4800: { // NBCD / SWAP / PEA / EXT / MOVEM reg->mem
+      case 0x4800: { // NBCD / LINK.L / SWAP / PEA / EXT / MOVEM reg->mem
         const sub = (op >>> 6) & 3;
-        if (sub === 0) { // NBCD
+        if (sub === 0) {
+          if (this.is68020 && mode === 1) { // LINK.L An, #d32
+            const disp = this.fetch32();
+            this.push32(this.a[reg]);
+            this.a[reg] = this.a[7];
+            this.a[7] = (this.a[7] + disp) | 0;
+            this.cycles += 20;
+            return;
+          }
+          // NBCD
           const v = this.readEa(mode, reg, 1, true);
           const x = (this.sr & SR_X) ? 1 : 0;
           let lo = -(v & 0x0f) - x;
@@ -803,6 +1007,9 @@ export class M68000 {
             this.d[reg] = res;
             this.setLogicFlags(res, 4);
             this.cycles += 4;
+          } else if (mode === 1) { // BKPT #n ($4848-$484F)
+            this.triggerException(4);
+            return;
           } else { // PEA <ea>
             const addr = this.resolveEaAddr(mode, reg, 4);
             this.push32(addr);
@@ -843,16 +1050,24 @@ export class M68000 {
         }
         return;
       }
-      case 0x4c00: { // MOVEM mem -> reg (only $4C80-$4CFF on 68000)
+      case 0x4c00: { // MULU.L / MULS.L / DIVU.L / DIVS.L (68020+) or MOVEM mem -> reg
         if ((op & 0x0080) === 0) {
-          this.triggerException(4);
+          if (!this.is68020) {
+            this.triggerException(4);
+            return;
+          }
+          if ((op & 0x0040) === 0) {
+            this.execMulLong020(mode, reg);
+          } else {
+            this.execDivLong020(mode, reg);
+          }
           return;
         }
         const sz = ((op >>> 6) & 1) ? 4 : 2;
         this.execMovemFromMem(mode, reg, sz);
         return;
       }
-      case 0x4e00: { // TRAP, LINK, UNLK, MOVE USP, RESET, NOP, STOP, RTE, RTS, TRAPV, RTR, JSR, JMP
+      case 0x4e00: { // TRAP, LINK, UNLK, MOVE USP, RESET, NOP, STOP, RTE, RTD, RTS, TRAPV, RTR, MOVEC, JSR, JMP
         const sub = op & 0x00ff;
         if (sub >= 0x80 && sub <= 0xbf) { // JSR <ea>
           const target = this.resolveEaAddr(mode, reg, 4) & 0x00ffffff;
@@ -915,11 +1130,34 @@ export class M68000 {
             if ((this.sr & SR_S) === 0) { this.triggerException(8); return; }
             const newSr = this.pop16();
             const newPc = this.pop32() & 0x00ffffff;
+            if (this.is68020) {
+              const fmt = this.pop16();
+              const fmtType = (fmt >>> 12) & 0xf;
+              if (fmtType === 2) {
+                this.a[7] = (this.a[7] + 4) | 0;
+              } else if (fmtType === 0xa) {
+                this.a[7] = (this.a[7] + 24) | 0;
+              } else if (fmtType === 0xb) {
+                this.a[7] = (this.a[7] + 84) | 0;
+              }
+            }
             this.setSR(newSr);
             this.pc = newPc;
             this.cycles += 20;
             return;
           }
+          case 0x74: // RTD #d16 (68010+)
+            if (!this.is68020) {
+              this.triggerException(4);
+              return;
+            }
+            {
+              const disp = this.fetch16s();
+              this.pc = this.pop32() & 0x00ffffff;
+              this.a[7] = (this.a[7] + disp) | 0;
+              this.cycles += 16;
+            }
+            return;
           case 0x75: // RTS
             this.pc = this.pop32() & 0x00ffffff;
             this.cycles += 16;
@@ -935,6 +1173,18 @@ export class M68000 {
             this.cycles += 20;
             return;
           }
+          case 0x7a: // MOVEC Rc, Rn
+          case 0x7b: // MOVEC Rn, Rc
+            if (!this.is68020) {
+              this.triggerException(4);
+              return;
+            }
+            if ((this.sr & SR_S) === 0) {
+              this.triggerException(8);
+              return;
+            }
+            this.execMovec020(sub === 0x7b);
+            return;
           default:
             this.triggerException(4);
             return;
@@ -1019,6 +1269,13 @@ export class M68000 {
         } else {
           this.cycles += 12;
         }
+      } else if (this.is68020 && mode === 7 && reg >= 2 && reg <= 4) { // TRAPcc (68020)
+        if (reg === 2) this.fetch16();
+        else if (reg === 3) this.fetch32();
+        if (this.testCondition(cc)) {
+          this.triggerException(7);
+        }
+        this.cycles += 6;
       } else { // Scc <ea>
         const cond = this.testCondition(cc);
         this.writeEa(mode, reg, 1, cond ? 0xff : 0x00);
@@ -1054,6 +1311,8 @@ export class M68000 {
     const basePc = this.pc;
     if (disp === 0) {
       disp = this.fetch16s();
+    } else if (disp === -1 && this.is68020) {
+      disp = this.fetch32();
     }
     if (cc === 0) { // BRA
       this.pc = (basePc + disp) & 0x00ffffff;
@@ -1142,6 +1401,54 @@ export class M68000 {
       if (res !== 0) f &= ~SR_Z;
       this.sr = f;
       this.cycles += isMem ? 18 : 6;
+      return;
+    }
+
+    // 68EC020: PACK ($8140-$81FF) and UNPK ($8180-$81FF)
+    if (this.is68020 && (opmode === 5 || opmode === 6) && (mode === 0 || mode === 1)) {
+      const adj = this.fetch16();
+      if (opmode === 5) { // PACK
+        let srcWord = 0;
+        if (mode === 0) {
+          srcWord = this.d[reg] & 0xffff;
+        } else {
+          const stepSrc = reg === 7 ? 2 : 1;
+          this.a[reg] = (this.a[reg] - stepSrc) | 0;
+          const lo = this.bus.read8(this.a[reg] & 0x00ffffff);
+          this.a[reg] = (this.a[reg] - stepSrc) | 0;
+          const hi = this.bus.read8(this.a[reg] & 0x00ffffff);
+          srcWord = (hi << 8) | lo;
+        }
+        const adjusted = (srcWord + adj) & 0xffff;
+        const packed = ((adjusted >>> 4) & 0xf0) | (adjusted & 0x0f);
+        if (mode === 0) {
+          this.d[dReg] = (this.d[dReg] & 0xffffff00) | packed;
+        } else {
+          const stepDst = dReg === 7 ? 2 : 1;
+          this.a[dReg] = (this.a[dReg] - stepDst) | 0;
+          this.bus.write8(this.a[dReg] & 0x00ffffff, packed);
+        }
+      } else { // UNPK
+        let b = 0;
+        if (mode === 0) {
+          b = this.d[reg] & 0xff;
+        } else {
+          const stepSrc = reg === 7 ? 2 : 1;
+          this.a[reg] = (this.a[reg] - stepSrc) | 0;
+          b = this.bus.read8(this.a[reg] & 0x00ffffff);
+        }
+        const unpacked = ((((b & 0xf0) << 4) | (b & 0x0f)) + adj) & 0xffff;
+        if (mode === 0) {
+          this.d[dReg] = (this.d[dReg] & 0xffff0000) | unpacked;
+        } else {
+          const stepDst = dReg === 7 ? 2 : 1;
+          this.a[dReg] = (this.a[dReg] - stepDst) | 0;
+          this.bus.write8(this.a[dReg] & 0x00ffffff, unpacked & 0xff);
+          this.a[dReg] = (this.a[dReg] - stepDst) | 0;
+          this.bus.write8(this.a[dReg] & 0x00ffffff, (unpacked >>> 8) & 0xff);
+        }
+      }
+      this.cycles += mode === 1 ? 16 : 8;
       return;
     }
 
@@ -1376,6 +1683,10 @@ export class M68000 {
     const dirLeft = (op & 0x0100) !== 0;
 
     if (szBits === 3) {
+      if (this.is68020 && (op & 0x0800) !== 0) {
+        this.execBitfield020(op);
+        return;
+      }
       // Memory shift/rotate by 1 bit (.W)
       const kind = (op >>> 9) & 3;
       const mode = (op >>> 3) & 7;
@@ -1489,5 +1800,410 @@ export class M68000 {
     if ((u & msb) !== 0) f |= SR_N;
     this.sr = f;
     return u;
+  }
+
+  private execMovec020(regToCtrl: boolean): void {
+    const ext = this.fetch16();
+    const isAddr = (ext & 0x8000) !== 0;
+    const regIdx = (ext >>> 12) & 7;
+    const ctrl = ext & 0x0fff;
+    const targetArr = isAddr ? this.a : this.d;
+
+    if (regToCtrl) {
+      const val = targetArr[regIdx] | 0;
+      switch (ctrl) {
+        case 0x000: this.sfc = val & 7; break;
+        case 0x001: this.dfc = val & 7; break;
+        case 0x002: this.cacr = val & 0x0003; break; // 68EC020: Instruction Cache Enable/Freeze bits only
+        case 0x800: this.usp = val; break;
+        case 0x801: this.vbr = val; break;
+        case 0x802: this.caar = val; break;
+        case 0x803: this.msp = val; break;
+        case 0x804: this.ssp = val; this.a[7] = val; break;
+        default:
+          this.triggerException(4);
+          return;
+      }
+    } else {
+      let val = 0;
+      switch (ctrl) {
+        case 0x000: val = this.sfc; break;
+        case 0x001: val = this.dfc; break;
+        case 0x002: val = this.cacr; break;
+        case 0x800: val = this.usp; break;
+        case 0x801: val = this.vbr; break;
+        case 0x802: val = this.caar; break;
+        case 0x803: val = this.msp; break;
+        case 0x804: val = this.a[7]; break;
+        default:
+          this.triggerException(4);
+          return;
+      }
+      targetArr[regIdx] = val;
+    }
+    this.cycles += 12;
+  }
+
+  private execMulLong020(mode: number, reg: number): void {
+    const ext = this.fetch16();
+    const dl = (ext >>> 12) & 7;
+    const isSigned = (ext & 0x0800) !== 0;
+    const is64 = (ext & 0x0400) !== 0;
+    const dh = ext & 7;
+
+    const src = this.readEa(mode, reg, 4, false) | 0;
+    const dst = this.d[dl] | 0;
+
+    // Exact 32x32 -> 64-bit unsigned product via 16-bit halves (zero heap allocations)
+    const au = src >>> 0;
+    const bu = dst >>> 0;
+    const aLo = au & 0xffff;
+    const aHi = au >>> 16;
+    const bLo = bu & 0xffff;
+    const bHi = bu >>> 16;
+    const p0 = Math.imul(aLo, bLo) >>> 0;
+    const p1 = Math.imul(aHi, bLo) >>> 0;
+    const p2 = Math.imul(aLo, bHi) >>> 0;
+    const p3 = Math.imul(aHi, bHi) >>> 0;
+    const mid = (p0 >>> 16) + (p1 & 0xffff) + (p2 & 0xffff);
+    const lo = ((p0 & 0xffff) | ((mid & 0xffff) << 16)) >>> 0;
+    let hi = (p3 + (p1 >>> 16) + (p2 >>> 16) + (mid >>> 16)) >>> 0;
+
+    if (isSigned) {
+      if (src < 0) hi = (hi - bu) >>> 0;
+      if (dst < 0) hi = (hi - au) >>> 0;
+    }
+
+    let nFlag = false;
+    let zFlag = false;
+    let vFlag = false;
+
+    if (is64) {
+      this.d[dh] = hi | 0;
+      this.d[dl] = lo | 0;
+      nFlag = (hi & 0x80000000) !== 0;
+      zFlag = hi === 0 && lo === 0;
+      vFlag = false;
+    } else {
+      const loSigned = lo | 0;
+      this.d[dl] = loSigned;
+      nFlag = loSigned < 0;
+      zFlag = lo === 0;
+      vFlag = isSigned
+        ? (loSigned < 0 ? hi !== 0xffffffff : hi !== 0)
+        : (hi !== 0);
+    }
+
+    let f = this.sr & ~0x0f;
+    if (nFlag) f |= SR_N;
+    if (zFlag) f |= SR_Z;
+    if (vFlag) f |= SR_V;
+    this.sr = f;
+    this.cycles += 28;
+  }
+
+  private execDivLong020(mode: number, reg: number): void {
+    const ext = this.fetch16();
+    const dq = (ext >>> 12) & 7;
+    const isSigned = (ext & 0x0800) !== 0;
+    const is64 = (ext & 0x0400) !== 0;
+    const dr = ext & 7;
+
+    const divisor = this.readEa(mode, reg, 4, false) | 0;
+    if (divisor === 0) {
+      this.triggerException(5);
+      return;
+    }
+
+    let q32 = 0;
+    let r32 = 0;
+    let overflow = false;
+
+    if (!is64) {
+      if (isSigned) {
+        const dvd = this.d[dq] | 0;
+        if (dvd === -2147483648 && divisor === -1) {
+          overflow = true;
+        } else {
+          q32 = Math.trunc(dvd / divisor) | 0;
+          r32 = (dvd - q32 * divisor) | 0;
+        }
+      } else {
+        const dvd = this.d[dq] >>> 0;
+        const dvs = divisor >>> 0;
+        const q = Math.floor(dvd / dvs) >>> 0;
+        q32 = q | 0;
+        r32 = (dvd - q * dvs) | 0;
+      }
+    } else {
+      const hi = BigInt(this.d[dr] >>> 0);
+      const lo = BigInt(this.d[dq] >>> 0);
+      let dvd64 = (hi << 32n) | lo;
+      if (isSigned) {
+        dvd64 = BigInt.asIntN(64, dvd64);
+        const dvs64 = BigInt(divisor);
+        const q64 = dvd64 / dvs64;
+        const r64 = dvd64 % dvs64;
+        if (q64 < -0x80000000n || q64 > 0x7fffffffn) {
+          overflow = true;
+        } else {
+          q32 = Number(q64) | 0;
+          r32 = Number(r64) | 0;
+        }
+      } else {
+        const dvs64 = BigInt(divisor >>> 0);
+        const q64 = dvd64 / dvs64;
+        const r64 = dvd64 % dvs64;
+        if (q64 > 0xffffffffn) {
+          overflow = true;
+        } else {
+          q32 = Number(q64) | 0;
+          r32 = Number(r64) | 0;
+        }
+      }
+    }
+
+    if (overflow) {
+      this.sr = (this.sr & ~SR_C) | SR_V;
+      this.cycles += 40;
+      return;
+    }
+
+    if (is64 || dr !== dq) {
+      this.d[dr] = r32;
+    }
+    this.d[dq] = q32;
+    this.setLogicFlags(q32, 4);
+    this.cycles += 40;
+  }
+
+  private execBitfield020(op: number): void {
+    const type = (op >>> 8) & 7; // 0=BFTST,1=BFEXTU,2=BFCHG,3=BFEXTS,4=BFCLR,5=BFFFO,6=BFSET,7=BFINS
+    const mode = (op >>> 3) & 7;
+    const reg = op & 7;
+    const ext = this.fetch16();
+
+    const regDn = (ext >>> 12) & 7;
+    const rawOffset = (ext & 0x0800) !== 0 ? (this.d[(ext >>> 6) & 7] | 0) : ((ext >>> 6) & 31);
+    let width = (ext & 0x0020) !== 0 ? (this.d[ext & 7] & 31) : (ext & 31);
+    if (width === 0) width = 32;
+
+    const shiftW = 32 - width;
+    const rotMask = width === 32 ? 0xffffffff : ((0xffffffff << shiftW) >>> 0);
+    let fieldU = 0;
+
+    if (mode === 0) {
+      const offset = rawOffset & 31;
+      const v = this.d[reg] >>> 0;
+      const rot = offset === 0 ? v : (((v << offset) | (v >>> (32 - offset))) >>> 0);
+      fieldU = rot >>> shiftW;
+
+      const regMask = offset === 0 ? rotMask : (((rotMask >>> offset) | (rotMask << (32 - offset))) >>> 0);
+      if (type === 2) { // BFCHG
+        this.d[reg] = (v ^ regMask) | 0;
+      } else if (type === 4) { // BFCLR
+        this.d[reg] = (v & ~regMask) | 0;
+      } else if (type === 6) { // BFSET
+        this.d[reg] = (v | regMask) | 0;
+      } else if (type === 7) { // BFINS
+        const insShifted = (this.d[regDn] << shiftW) >>> 0;
+        const placed = offset === 0 ? insShifted : (((insShifted >>> offset) | (insShifted << (32 - offset))) >>> 0);
+        this.d[reg] = ((v & ~regMask) | placed) | 0;
+        fieldU = insShifted >>> shiftW;
+      }
+    } else {
+      const baseAddr = this.resolveEaAddr(mode, reg, 1);
+      const byteOff = rawOffset >> 3;
+      const bitInByte = rawOffset & 7;
+      const spanBytes = (bitInByte + width + 7) >>> 3;
+      const startAddr = (baseAddr + byteOff) | 0;
+
+      const b0 = this.bus.read8(startAddr);
+      const b1 = spanBytes > 1 ? this.bus.read8(startAddr + 1) : 0;
+      const b2 = spanBytes > 2 ? this.bus.read8(startAddr + 2) : 0;
+      const b3 = spanBytes > 3 ? this.bus.read8(startAddr + 3) : 0;
+      const b4 = spanBytes > 4 ? this.bus.read8(startAddr + 4) : 0;
+
+      const origW0 = ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3) >>> 0;
+      let alignedW0 = origW0;
+      if (bitInByte !== 0) {
+        alignedW0 = ((origW0 << bitInByte) | (b4 >>> (8 - bitInByte))) >>> 0;
+      }
+      fieldU = alignedW0 >>> shiftW;
+
+      if (type === 2 || type === 4 || type === 6 || type === 7) {
+        let outAligned = 0;
+        if (type === 2) { // BFCHG
+          outAligned = (~alignedW0) >>> 0;
+        } else if (type === 4) { // BFCLR
+          outAligned = 0;
+        } else if (type === 6) { // BFSET
+          outAligned = 0xffffffff;
+        } else { // BFINS
+          outAligned = (this.d[regDn] << shiftW) >>> 0;
+          fieldU = outAligned >>> shiftW;
+        }
+
+        const mask32 = (rotMask >>> bitInByte) >>> 0;
+        const val32 = (outAligned >>> bitInByte) >>> 0;
+        const finalW0 = ((origW0 & ~mask32) | (val32 & mask32)) >>> 0;
+
+        this.bus.write8(startAddr, (finalW0 >>> 24) & 0xff);
+        if (spanBytes > 1) this.bus.write8(startAddr + 1, (finalW0 >>> 16) & 0xff);
+        if (spanBytes > 2) this.bus.write8(startAddr + 2, (finalW0 >>> 8) & 0xff);
+        if (spanBytes > 3) this.bus.write8(startAddr + 3, finalW0 & 0xff);
+        if (spanBytes > 4) {
+          const maskB4 = (rotMask << (8 - bitInByte)) & 0xff;
+          const valB4 = (outAligned << (8 - bitInByte)) & 0xff;
+          this.bus.write8(startAddr + 4, (b4 & ~maskB4) | (valB4 & maskB4));
+        }
+      }
+    }
+
+    if (type === 1) { // BFEXTU
+      this.d[regDn] = fieldU | 0;
+    } else if (type === 3) { // BFEXTS
+      this.d[regDn] = ((fieldU << shiftW) >> shiftW);
+    } else if (type === 5) { // BFFFO
+      const baseOffset = mode === 0 ? (rawOffset & 31) : rawOffset;
+      const msbAligned = (fieldU << shiftW) >>> 0;
+      this.d[regDn] = msbAligned === 0
+        ? ((baseOffset + width) | 0)
+        : ((baseOffset + Math.clz32(msbAligned)) | 0);
+    }
+
+    const msbVal = (fieldU << shiftW) >>> 0;
+    let f = this.sr & ~0x0f;
+    if ((msbVal & 0x80000000) !== 0) f |= SR_N;
+    if (fieldU === 0) f |= SR_Z;
+    this.sr = f;
+    this.cycles += mode === 0 ? 8 : 14;
+  }
+
+  private execCmp2Chk2020(sizeBits: number, mode: number, reg: number): void {
+    const ext = this.fetch16();
+    const sz = sizeBits === 0 ? 1 : sizeBits === 1 ? 2 : 4;
+    const addr = this.resolveEaAddr(mode, reg, sz);
+    const lowerRaw = sz === 1 ? this.bus.read8(addr) : sz === 2 ? this.bus.read16(addr) : (this.bus.read32(addr) | 0);
+    const upperAddr = (addr + sz) | 0;
+    const upperRaw = sz === 1 ? this.bus.read8(upperAddr) : sz === 2 ? this.bus.read16(upperAddr) : (this.bus.read32(upperAddr) | 0);
+
+    const isAddr = (ext & 0x8000) !== 0;
+    const rn = (ext >>> 12) & 7;
+    const isChk2 = (ext & 0x0800) !== 0;
+
+    let val: number;
+    let lower: number;
+    let upper: number;
+    let outOfBounds: boolean;
+    if (isAddr) {
+      val = this.a[rn] >>> 0;
+      lower = this.signExtend(lowerRaw, sz) >>> 0;
+      upper = this.signExtend(upperRaw, sz) >>> 0;
+      outOfBounds = ((val - lower) >>> 0) > ((upper - lower) >>> 0);
+    } else if (sz === 1) {
+      val = this.d[rn] & 0xff;
+      lower = lowerRaw & 0xff;
+      upper = upperRaw & 0xff;
+      outOfBounds = ((val - lower) & 0xff) > ((upper - lower) & 0xff);
+    } else if (sz === 2) {
+      val = this.d[rn] & 0xffff;
+      lower = lowerRaw & 0xffff;
+      upper = upperRaw & 0xffff;
+      outOfBounds = ((val - lower) & 0xffff) > ((upper - lower) & 0xffff);
+    } else {
+      val = this.d[rn] >>> 0;
+      lower = lowerRaw >>> 0;
+      upper = upperRaw >>> 0;
+      outOfBounds = ((val - lower) >>> 0) > ((upper - lower) >>> 0);
+    }
+
+    let f = this.sr & ~(SR_Z | SR_C);
+    if (val === lower || val === upper) f |= SR_Z;
+    if (outOfBounds) f |= SR_C;
+    this.sr = f;
+    this.cycles += 18;
+    if (isChk2 && outOfBounds) {
+      this.triggerException(6);
+    }
+  }
+
+  private execCas020(size: number, mode: number, reg: number): void {
+    const ext = this.fetch16();
+    const dc = ext & 7;
+    const du = (ext >>> 6) & 7;
+    const dst = this.readEa(mode, reg, size, true);
+    const cmp = this.readEa(0, dc, size, false);
+    this.subVal(cmp, dst, size, false, true);
+    if ((this.sr & SR_Z) !== 0) {
+      this.writeSavedEa(mode, reg, size, this.d[du]);
+    } else {
+      this.writeEa(0, dc, size, dst);
+    }
+    this.cycles += 14;
+  }
+
+  private execCas2020(size: number): void {
+    const ext1 = this.fetch16();
+    const ext2 = this.fetch16();
+    const rn1 = (ext1 >>> 12) & 7;
+    const rn2 = (ext2 >>> 12) & 7;
+    const addr1 = (ext1 & 0x8000) !== 0 ? (this.a[rn1] | 0) : (this.d[rn1] | 0);
+    const addr2 = (ext2 & 0x8000) !== 0 ? (this.a[rn2] | 0) : (this.d[rn2] | 0);
+    const dc1 = ext1 & 7;
+    const dc2 = ext2 & 7;
+    const du1 = (ext1 >>> 6) & 7;
+    const du2 = (ext2 >>> 6) & 7;
+
+    const op1 = size === 2 ? this.bus.read16(addr1) : (this.bus.read32(addr1) | 0);
+    this.subVal(this.readEa(0, dc1, size, false), op1, size, false, true);
+    if ((this.sr & SR_Z) !== 0) {
+      const op2 = size === 2 ? this.bus.read16(addr2) : (this.bus.read32(addr2) | 0);
+      this.subVal(this.readEa(0, dc2, size, false), op2, size, false, true);
+      if ((this.sr & SR_Z) !== 0) {
+        if (size === 2) {
+          this.bus.write16(addr1, this.d[du1] & 0xffff);
+          this.bus.write16(addr2, this.d[du2] & 0xffff);
+        } else {
+          this.bus.write32(addr1, this.d[du1]);
+          this.bus.write32(addr2, this.d[du2]);
+        }
+        this.cycles += 24;
+        return;
+      }
+      this.writeEa(0, dc1, size, op1);
+      this.writeEa(0, dc2, size, op2);
+    } else {
+      this.writeEa(0, dc1, size, op1);
+      const op2 = size === 2 ? this.bus.read16(addr2) : (this.bus.read32(addr2) | 0);
+      this.writeEa(0, dc2, size, op2);
+    }
+    this.cycles += 24;
+  }
+
+  private execMoves020(size: number, mode: number, reg: number): void {
+    const ext = this.fetch16();
+    const isAddr = (ext & 0x8000) !== 0;
+    const rn = (ext >>> 12) & 7;
+    const toMem = (ext & 0x0800) !== 0;
+    const addr = this.resolveEaAddr(mode, reg, size);
+    if (toMem) {
+      const val = isAddr ? this.a[rn] : this.d[rn];
+      if (size === 1) this.bus.write8(addr, val & 0xff);
+      else if (size === 2) this.bus.write16(addr, val & 0xffff);
+      else this.bus.write32(addr, val | 0);
+    } else {
+      const raw = size === 1 ? this.bus.read8(addr) : size === 2 ? this.bus.read16(addr) : (this.bus.read32(addr) | 0);
+      if (isAddr) {
+        this.a[rn] = this.signExtend(raw, size);
+      } else if (size === 1) {
+        this.d[rn] = (this.d[rn] & 0xffffff00) | (raw & 0xff);
+      } else if (size === 2) {
+        this.d[rn] = (this.d[rn] & 0xffff0000) | (raw & 0xffff);
+      } else {
+        this.d[rn] = raw | 0;
+      }
+    }
+    this.cycles += 14;
   }
 }

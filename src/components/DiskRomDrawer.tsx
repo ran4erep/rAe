@@ -57,6 +57,9 @@ interface DiskRomDrawerProps {
   onSaveSlot: (slot: SaveSlotIndex) => Promise<void>;
   onLoadSlot: (slot: SaveSlotIndex) => Promise<boolean>;
   onDeleteSlot: (slot: SaveSlotIndex) => Promise<void>;
+  onDownloadSlot: (slot: SaveSlotIndex) => Promise<void>;
+  onDownloadLiveSavestate: () => void;
+  onImportSavestateFile: (file: File) => Promise<void>;
   launchingCatalogId: string | null;
   onLaunchCatalogItem: (item: CatalogGameItem) => Promise<void>;
 }
@@ -95,6 +98,9 @@ export const DiskRomDrawer: React.FC<DiskRomDrawerProps> = ({
   onSaveSlot,
   onLoadSlot,
   onDeleteSlot,
+  onDownloadSlot,
+  onDownloadLiveSavestate,
+  onImportSavestateFile,
   launchingCatalogId,
   onLaunchCatalogItem,
 }) => {
@@ -586,10 +592,14 @@ export const DiskRomDrawer: React.FC<DiskRomDrawerProps> = ({
                   <button
                     type="button"
                     onClick={() => void onLoadDefaultBios()}
-                    aria-label="Загрузить Kickstart 1.3 из BIOS"
+                    aria-label={
+                      status.chipset === 'AGA'
+                        ? 'Загрузить Kickstart 3.1 из BIOS'
+                        : 'Загрузить Kickstart 1.3 из BIOS'
+                    }
                     className="h-9 px-2.5 rounded-md bg-[#2A2D33] hover:bg-[#383C44] text-xs font-medium text-[#E6E2D9] whitespace-nowrap"
                   >
-                    BIOS 1.3
+                    {status.chipset === 'AGA' ? 'BIOS 3.1' : 'BIOS 1.3'}
                   </button>
                 ) : (
                   <button
@@ -616,6 +626,9 @@ export const DiskRomDrawer: React.FC<DiskRomDrawerProps> = ({
                 onSaveSlot={onSaveSlot}
                 onLoadSlot={onLoadSlot}
                 onDeleteSlot={onDeleteSlot}
+                onDownloadSlot={onDownloadSlot}
+                onDownloadLiveSavestate={onDownloadLiveSavestate}
+                onImportSavestateFile={onImportSavestateFile}
               />
             </section>
           ) : (

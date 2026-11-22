@@ -6,7 +6,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Check, CircleSlash, Download, FilePlus2, FolderUp, Gamepad2, HardDrive, Hash, Keyboard, LayoutGrid, Lock, MousePointer, Pencil } from 'lucide-react';
 import { ArchiveMediaCandidate, resolveUploadedFileAsync } from './emulator/archives/archiveManager';
-import { CatalogGameItem, downloadCatalogArchive } from './emulator/catalog/amigaArchiveCatalog';
+import {
+  CatalogDiskFile,
+  CatalogGameItem,
+  downloadCatalogArchive,
+  downloadCatalogArchiveByUrl,
+} from './emulator/catalog/amigaArchiveCatalog';
 import {
   clampPct,
   ControlButtonSize,
@@ -28,9 +33,23 @@ import {
   PhysicalGamepadSink,
   PhysicalGamepadTracker,
 } from './emulator/controls/physicalGamepad';
+import {
+  createInitialSecretTapState,
+  registerSecretTap,
+  SecretTapState,
+} from './emulator/controls/secretTapUnlock';
 import { setHapticsEnabled } from './emulator/haptics';
+import { buildAmigaDebugDump, formatDebugDumpFilename } from './emulator/debug/debugDump';
+import { formatAmigaTriageText, formatTriageReportFilename } from './emulator/debug/triageReport';
+import {
+  buildDiagnosticSavestateFromMachine,
+  buildDiagnosticSavestateFromSlot,
+  formatSavestateFilename,
+  parseDiagnosticSavestateJson,
+} from './emulator/debug/savestateFile';
 import { AmigaMachine } from './emulator/hardware/amigaMachine';
 import { AutoCropTracker, CropRect, cropPhysicalAspect, FULL_CROP } from './emulator/hardware/autoCrop';
+import { computeOverscanDisplayAspect } from './emulator/hardware/overscan';
 import { AMIGA_RAW, BROWSER_CODE_TO_AMIGA } from './emulator/keyboard/amigaKeyMap';
 import {
   hasConfigChanged,
@@ -57,6 +76,11 @@ import {
   SaveSlotIndex,
   SaveSlotSummary,
 } from './emulator/types';
+import {
+  createEmptyEmuPerf,
+  EmuPerfSnapshot,
+  evaluateEmuPerformance,
+} from './emulator/performanceStats';
 import { FullscreenOverlayMode, HardwareTopBar } from './components/HardwareTopBar';
 import { AmigaScreen } from './components/AmigaScreen';
 import { FloppyDiskIcon } from './components/FloppyDiskIcon';
@@ -67,6 +91,7 @@ import { CustomEditToolbar, CustomSelection } from './components/CustomEditToolb
 import { TouchGamepad } from './components/TouchGamepad';
 import { TouchpadDeck } from './components/TouchpadDeck';
 import { ArchiveModal, PendingArchiveChoice } from './components/ArchiveModal';
+import { BlankDiskModal } from './components/BlankDiskModal';
 import { CatalogViewState, createInitialCatalogViewState } from './components/CatalogTab';
 import { DiskRomDrawer, LaunchDrawerTab } from './components/DiskRomDrawer';
 import { HardfileSizePanel } from './components/HardfileSizePanel';
@@ -74,11 +99,13 @@ import { SettingsDrawer } from './components/SettingsDrawer';
 import { SaveSlotsList } from './components/SaveSlotsList';
 import { ToastContainer, ToastMessage } from './components/ToastContainer';
 import { getAppAssetUrl } from './utils/assetUrl';
+import {
+  getModelRomProfile,
+  isModelRomSwitchNeeded,
+} from './emulator/roms/biosProfiles';
 
 type MobileDeckMode = 'qwerty' | 'numpad' | 'mouse' | 'gamepad' | 'custom';
 
-const DEFAULT_BIOS_ROM_NAME = 'Kickstart v1.3 r34.005 (1987-12)(Commodore)(A3000)[!].rom';
-const DEFAULT_BIOS_ROM_URL = getAppAssetUrl(`bios/${encodeURIComponent(DEFAULT_BIOS_ROM_NAME)}`);
 const DEFAULT_WORKBENCH_NAME = 'workbench.LHA';
 const DEFAULT_WORKBENCH_URL = getAppAssetUrl(`bios/${encodeURIComponent(DEFAULT_WORKBENCH_NAME)}`);
 const SYSTEM_DH0_STORAGE_KEY = 'system_dh0_hdf_v2';
@@ -111,6 +138,9 @@ export default function App() {
   const [config, setConfig] = useState<AmigaConfig>(() => loadSavedAmigaConfig());
   const configRef = useRef<AmigaConfig>(config);
   configRef.current = config;
+  const biosCacheRef = useRef<Map<string, Uint8Array>>(new Map());
+  const romSwitchSeqRef = useRef(0);
+  const romSwitchPendingRef = useRef(false);
   const [cropAspect, setCropAspect] = useState<number>(4 / 3);
   const autoCropRef = useRef<AutoCropTracker>(new AutoCropTracker());
   const cropRectRef = useRef<CropRect>({ ...FULL_CROP });
@@ -130,7 +160,10 @@ export default function App() {
   const sidebarDf1InputRef = useRef<HTMLInputElement | null>(null);
   const sidebarDh1InputRef = useRef<HTMLInputElement | null>(null);
   const [disksOpen, setDisksOpen] = useState(false);
+  const [blankDiskDrive, setBlankDiskDrive] = useState<0 | 1 | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [debugUnlocked, setDebugUnlocked] = useState(false);
+  const modelTapStateRef = useRef<SecretTapState>(createInitialSecretTapState());
   const modalOpenRef = useRef(false);
   const [dh0SizeMB, setDh0SizeMB] = useState<number>(() =>
     loadSavedHdfSizeMB(DH0_SIZE_STORAGE_KEY, 'amiga_hdf_size_mb')
@@ -152,8 +185,14 @@ export default function App() {
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const toastSeqRef = useRef(0);
   const toastTimersRef = useRef<Map<number, number>>(new Map());
+  const showToastRef = useRef<(type: 'ok' | 'err', text: string) => void>(() => {});
   const [saveSlots, setSaveSlots] = useState<Record<SaveSlotIndex, SaveSlotSummary | null>>(() =>
     createEmptySlotMap()
+  );
+  const [emuPerf, setEmuPerf] = useState<EmuPerfSnapshot | null>(() =>
+    config.showEmuPerf
+      ? createEmptyEmuPerf(config.videoStandard === 'NTSC' ? 'NTSC' : 'PAL')
+      : null
   );
   const [status, setStatus] = useState<AmigaStatusSnapshot>({
     running: true,
@@ -161,8 +200,8 @@ export default function App() {
     fps: 50,
     cpuUsageHint: 4,
     chipset: DEFAULT_AMIGA_CONFIG.chipset,
-    videoStandard: DEFAULT_AMIGA_CONFIG.videoStandard,
-    romName: DEFAULT_BIOS_ROM_NAME,
+    videoStandard: DEFAULT_AMIGA_CONFIG.videoStandard === 'NTSC' ? 'NTSC' : 'PAL',
+    romName: getModelRomProfile(config.chipset).romName,
     isOpenKick: false,
     powerLed: true,
     capsLock: false,
@@ -206,6 +245,39 @@ export default function App() {
     setHapticsEnabled(configRef.current.hapticsEnabled);
     const machine = new AmigaMachine(configRef.current, { skipDefaultDisk: true });
     machineRef.current = machine;
+    machine.onAutoVideoStandardChange = (nextStd, reason) => {
+      if (disposed || machineRef.current !== machine) return;
+      if (configRef.current.videoStandard !== 'auto') {
+        const nextCfg = { ...configRef.current, videoStandard: nextStd };
+        configRef.current = nextCfg;
+        setConfig(nextCfg);
+        saveAmigaConfig(nextCfg);
+      }
+      const sz = machine.getFramebufferSize();
+      cropRectRef.current = autoCropRef.current.reset(sz.width, sz.height);
+      setCropAspect(
+        computeOverscanDisplayAspect(
+          cropRectRef.current.w,
+          cropRectRef.current.h,
+          nextStd,
+          configRef.current.autoCrop
+        )
+      );
+      setStatus(machine.getStatusSnapshot());
+      const msg =
+        reason === 'deadlock'
+          ? 'Игра ожидает PAL-строку (>262) — переключено на PAL 50 Гц'
+          : reason === 'diw' || reason === 'copper'
+            ? 'Обнаружен PAL-экран — Авто выбрало PAL 50 Гц'
+            : reason === 'beamcon0'
+              ? nextStd === 'PAL'
+                ? 'Игра переключила ECS в PAL 50 Гц'
+                : 'Игра переключила ECS в NTSC 60 Гц'
+              : nextStd === 'NTSC'
+                ? 'По метке образа выбрано NTSC 60 Гц'
+                : 'По метке образа выбрано PAL 50 Гц';
+      showToastRef.current('ok', msg);
+    };
 
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext('2d', { alpha: false, desynchronized: true }) ?? null;
@@ -216,15 +288,22 @@ export default function App() {
       imageU32: Uint32Array | null;
     } = { w: 0, h: 0, imageData: null, imageU32: null };
     let lastCanvasOverscan = '';
-    let lastVideoStd = machine.config.videoStandard;
+    let lastVideoStd = machine.getActiveVideoStandard();
 
     const ensureSurface = (w: number, h: number): { imageData: ImageData; imageU32: Uint32Array } | null => {
       if (!ctx) return null;
-      const std = machine.config.videoStandard;
+      const std = machine.getActiveVideoStandard();
       if (surface.imageData && surface.imageU32 && surface.w === w && surface.h === h) {
         if (std !== lastVideoStd) {
           lastVideoStd = std;
-          setCropAspect(cropPhysicalAspect(cropRectRef.current, std));
+          setCropAspect(
+            computeOverscanDisplayAspect(
+              cropRectRef.current.w,
+              cropRectRef.current.h,
+              std,
+              configRef.current.autoCrop
+            )
+          );
         }
         return surface as { imageData: ImageData; imageU32: Uint32Array };
       }
@@ -234,7 +313,14 @@ export default function App() {
       surface.imageData = ctx.createImageData(w, h);
       surface.imageU32 = new Uint32Array(surface.imageData.data.buffer);
       cropRectRef.current = autoCropRef.current.reset(w, h);
-      setCropAspect(cropPhysicalAspect(cropRectRef.current, std));
+      setCropAspect(
+        computeOverscanDisplayAspect(
+          cropRectRef.current.w,
+          cropRectRef.current.h,
+          std,
+          configRef.current.autoCrop
+        )
+      );
       if (canvas) {
         canvas.dataset.fbSize = `${w}x${h}`;
       }
@@ -244,7 +330,7 @@ export default function App() {
     const initSize = machine.getFramebufferSize();
     ensureSurface(initSize.width, initSize.height);
     if (canvas) {
-      lastCanvasOverscan = machine.config.overscan;
+      lastCanvasOverscan = String(machine.config.overscan);
       canvas.dataset.overscan = lastCanvasOverscan;
     }
 
@@ -265,6 +351,37 @@ export default function App() {
     let lastScheduledDh0Seq = machine.hardfile.units[0].writeSeq;
     let dh0SaveTimer: number | null = null;
     let tabHidden = document.hidden;
+
+    // Zero-overhead emulation performance telemetry (active ONLY when config.showEmuPerf is true)
+    let perfPrevSteps = 0;
+    let perfPrevRendered = 0;
+    let perfPrevDrops = 0;
+    let perfPrevElapsed = 0;
+    let perfPrevCoreMs = 0;
+    let perfPrevBlitMs = 0;
+    let perfCurSteps = 0;
+    let perfCurRendered = 0;
+    let perfCurDrops = 0;
+    let perfCurCoreMs = 0;
+    let perfCurBlitMs = 0;
+    let perfWindowStart = lastTime;
+    let perfWasEnabled = configRef.current.showEmuPerf;
+    let perfPausedReported = false;
+    const resetPerfWindow = (nowMs: number) => {
+      perfPrevSteps = 0;
+      perfPrevRendered = 0;
+      perfPrevDrops = 0;
+      perfPrevElapsed = 0;
+      perfPrevCoreMs = 0;
+      perfPrevBlitMs = 0;
+      perfCurSteps = 0;
+      perfCurRendered = 0;
+      perfCurDrops = 0;
+      perfCurCoreMs = 0;
+      perfCurBlitMs = 0;
+      perfWindowStart = nowMs;
+      perfPausedReported = false;
+    };
 
     const gamepadTracker = new PhysicalGamepadTracker();
     const gamepadSink: PhysicalGamepadSink = {
@@ -365,6 +482,7 @@ export default function App() {
       } else {
         lastTime = performance.now();
         accumulator = 0;
+        resetPerfWindow(lastTime);
         if (canPollGamepads) {
           hasPhysicalGamepad = hasAnyConnectedGamepad(navigator.getGamepads());
         }
@@ -379,13 +497,21 @@ export default function App() {
     // Load Kickstart ROM + cached/default DH0 Workbench in parallel BEFORE stepping any frame
     // so Kickstart boots cleanly on frame 1 with zero OpenKick/Boing flash
     void (async () => {
+      // Clear legacy single-slot ROM key so A500/A1200 cleanly default to KS 1.3 / KS 3.1
+      void deleteFromStorage('custom_kickstart_rom');
+
       const loadStartupRom = async (): Promise<{ bytes: Uint8Array; name: string } | null> => {
-        const savedRom = await loadBinaryFromStorage('custom_kickstart_rom');
+        const profile = getModelRomProfile(configRef.current.chipset);
+        const savedRom = await loadBinaryFromStorage(profile.customStorageKey);
         if (savedRom) return savedRom;
+        const cached = biosCacheRef.current.get(profile.romName);
+        if (cached) return { bytes: cached, name: profile.romName };
         try {
-          const resp = await fetch(DEFAULT_BIOS_ROM_URL);
+          const resp = await fetch(profile.romUrl);
           if (resp.ok) {
-            return { bytes: new Uint8Array(await resp.arrayBuffer()), name: DEFAULT_BIOS_ROM_NAME };
+            const bytes = new Uint8Array(await resp.arrayBuffer());
+            biosCacheRef.current.set(profile.romName, bytes);
+            return { bytes, name: profile.romName };
           }
         } catch {
           // Keep OpenKick fallback if /bios ROM is unavailable
@@ -458,6 +584,7 @@ export default function App() {
       bootReady = true;
       lastTime = performance.now();
       accumulator = 0;
+      resetPerfWindow(lastTime);
 
       // Paint first Kickstart frame immediately
       machine.stepFrame(true);
@@ -479,12 +606,38 @@ export default function App() {
     const tick = (now: number) => {
       rafId = requestAnimationFrame(tick);
 
-      if (!bootReady || tabHidden || machine.paused) {
+      const trackPerf = configRef.current.showEmuPerf;
+      if (trackPerf !== perfWasEnabled) {
+        perfWasEnabled = trackPerf;
+        resetPerfWindow(now);
+      }
+
+      if (!bootReady || tabHidden || machine.paused || romSwitchPendingRef.current) {
         if (gamepadTracker.activeMask !== 0) {
           gamepadTracker.releaseAll(gamepadSink);
         }
+        if (trackPerf && bootReady && machine.paused && !perfPausedReported) {
+          resetPerfWindow(now);
+          perfPausedReported = true;
+          setEmuPerf(
+            evaluateEmuPerformance({
+              paused: true,
+              videoStandard: machine.getActiveVideoStandard(),
+              steps: 0,
+              renderedFrames: 0,
+              droppedFrames: 0,
+              elapsedMs: 0,
+              coreMsSum: 0,
+              blitMsSum: 0,
+            })
+          );
+        }
         lastTime = now;
         return;
+      }
+
+      if (perfPausedReported) {
+        resetPerfWindow(now);
       }
 
       if (hasPhysicalGamepad && !modalOpenRef.current) {
@@ -493,9 +646,13 @@ export default function App() {
         gamepadTracker.releaseAll(gamepadSink);
       }
 
-      const targetFps = machine.config.videoStandard === 'PAL' ? PAL_FPS : NTSC_FPS;
+      const targetFps = machine.chipset.isPalTiming() ? PAL_FPS : NTSC_FPS;
       const frameMs = 1000 / targetFps;
-      const delta = Math.min(now - lastTime, frameMs * 2);
+      const rawDelta = now - lastTime;
+      const delta = rawDelta > frameMs * 2 ? frameMs * 2 : rawDelta;
+      if (trackPerf && rawDelta > frameMs * 2.5) {
+        perfCurDrops += Math.floor((rawDelta - frameMs * 2) / frameMs);
+      }
       lastTime = now;
       accumulator += delta;
 
@@ -509,11 +666,22 @@ export default function App() {
         const skip = machine.config.frameSkip;
         const doRender = skip === 0 || (skipCounter % (skip + 1)) === 0;
         skipCounter++;
-        machine.stepFrame(doRender);
+        if (trackPerf) {
+          const cs = performance.now();
+          machine.stepFrame(doRender);
+          perfCurCoreMs += performance.now() - cs;
+          perfCurSteps++;
+          if (doRender) perfCurRendered++;
+        } else {
+          machine.stepFrame(doRender);
+        }
         stepped = true;
         if (doRender) rendered = true;
         fpsFrames++;
         if (performance.now() - t0 > frameMs * 0.85) {
+          if (trackPerf && accumulator >= frameMs) {
+            perfCurDrops += Math.floor(accumulator / frameMs);
+          }
           accumulator = 0;
           break;
         }
@@ -544,6 +712,7 @@ export default function App() {
       }
 
       if (rendered && ctx && canvas) {
+        const bs = trackPerf ? performance.now() : 0;
         const fbW = machine.chipset.fbWidth;
         const fbH = machine.chipset.fbHeight;
         const surf = ensureSurface(fbW, fbH);
@@ -551,9 +720,10 @@ export default function App() {
           const fb = machine.getFramebuffer();
           surf.imageU32.set(fb);
 
-          if (lastCanvasOverscan !== machine.config.overscan) {
-            lastCanvasOverscan = machine.config.overscan;
-            canvas.dataset.overscan = lastCanvasOverscan;
+          const curOverscan = String(machine.config.overscan);
+          if (lastCanvasOverscan !== curOverscan) {
+            lastCanvasOverscan = curOverscan;
+            canvas.dataset.overscan = curOverscan;
           }
 
           if (machine.config.autoCrop) {
@@ -561,7 +731,7 @@ export default function App() {
               const res = autoCropRef.current.update(fb, fbW, fbH);
               if (res.changed) {
                 cropRectRef.current = res.rect;
-                setCropAspect(cropPhysicalAspect(res.rect, machine.config.videoStandard));
+                setCropAspect(cropPhysicalAspect(res.rect, machine.getActiveVideoStandard()));
               }
             }
           } else if (
@@ -571,7 +741,14 @@ export default function App() {
             cropRectRef.current.h !== fbH
           ) {
             cropRectRef.current = autoCropRef.current.reset(fbW, fbH);
-            setCropAspect(cropPhysicalAspect(cropRectRef.current, machine.config.videoStandard));
+            setCropAspect(
+              computeOverscanDisplayAspect(
+                cropRectRef.current.w,
+                cropRectRef.current.h,
+                machine.getActiveVideoStandard(),
+                false
+              )
+            );
           }
 
           const crop = cropRectRef.current;
@@ -581,12 +758,46 @@ export default function App() {
           }
           ctx.putImageData(surf.imageData, -crop.x, -crop.y, crop.x, crop.y, crop.w, crop.h);
         }
+        if (trackPerf) {
+          perfCurBlitMs += performance.now() - bs;
+        }
       }
 
       if (now - fpsTimer >= 1000) {
         machine.measuredFps = Math.round((fpsFrames * 1000) / (now - fpsTimer));
         fpsFrames = 0;
         fpsTimer = now;
+      }
+
+      if (trackPerf) {
+        const curElapsed = now - perfWindowStart;
+        const thresholdMs = perfPrevElapsed === 0 ? 250 : 500;
+        if (curElapsed >= thresholdMs) {
+          setEmuPerf(
+            evaluateEmuPerformance({
+              paused: false,
+              videoStandard: machine.getActiveVideoStandard(),
+              steps: perfPrevSteps + perfCurSteps,
+              renderedFrames: perfPrevRendered + perfCurRendered,
+              droppedFrames: perfPrevDrops + perfCurDrops,
+              elapsedMs: perfPrevElapsed + curElapsed,
+              coreMsSum: perfPrevCoreMs + perfCurCoreMs,
+              blitMsSum: perfPrevBlitMs + perfCurBlitMs,
+            })
+          );
+          perfPrevSteps = perfCurSteps;
+          perfPrevRendered = perfCurRendered;
+          perfPrevDrops = perfCurDrops;
+          perfPrevElapsed = curElapsed;
+          perfPrevCoreMs = perfCurCoreMs;
+          perfPrevBlitMs = perfCurBlitMs;
+          perfCurSteps = 0;
+          perfCurRendered = 0;
+          perfCurDrops = 0;
+          perfCurCoreMs = 0;
+          perfCurBlitMs = 0;
+          perfWindowStart = now;
+        }
       }
 
       // Fast LED/track sync for DF0/DF1/DH0/DH1 (~70ms on activity changes) + gentle 2.5Hz full status sync
@@ -649,10 +860,14 @@ export default function App() {
 
   // Physical PC / Bluetooth keyboard mapping 1:1 to real Amiga raw keycodes
   const archiveModalOpen = pendingArchive !== null;
-  modalOpenRef.current = disksOpen || settingsOpen || archiveModalOpen;
+  const blankDiskModalOpen = blankDiskDrive !== null;
+  const customPickerOpen = customPickerContext !== null;
+  modalOpenRef.current =
+    disksOpen || settingsOpen || archiveModalOpen || blankDiskModalOpen || customPickerOpen;
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (disksOpen || settingsOpen || archiveModalOpen) return;
+      if (disksOpen || settingsOpen || archiveModalOpen || blankDiskModalOpen || customPickerOpen) return;
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       const raw = BROWSER_CODE_TO_AMIGA[e.code];
       if (raw === undefined) return;
       e.preventDefault();
@@ -669,6 +884,8 @@ export default function App() {
     };
 
     const onKeyUp = (e: KeyboardEvent) => {
+      if (customPickerOpen) return;
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       const raw = BROWSER_CODE_TO_AMIGA[e.code];
       if (raw === undefined) return;
       e.preventDefault();
@@ -681,7 +898,7 @@ export default function App() {
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
     };
-  }, [archiveModalOpen, disksOpen, settingsOpen]);
+  }, [archiveModalOpen, blankDiskModalOpen, customPickerOpen, disksOpen, settingsOpen]);
 
   const wakeAudio = useCallback(() => {
     if (configRef.current.audioEnabled) {
@@ -702,8 +919,8 @@ export default function App() {
     machineRef.current?.moveMouse(dx, dy);
   }, []);
 
-  const handleMouseButton = useCallback((left?: boolean, right?: boolean) => {
-    machineRef.current?.setMouseButtons(left, right);
+  const handleMouseButton = useCallback((left?: boolean, right?: boolean, middle?: boolean) => {
+    machineRef.current?.setMouseButtons(left, right, middle);
   }, []);
 
   const handleJoystickChange = useCallback((patch: Partial<JoystickState>) => {
@@ -747,12 +964,13 @@ export default function App() {
 
   const handleUpdateConfig = useCallback((patch: Partial<AmigaConfig>) => {
     if (!hasConfigChanged(configRef.current, patch)) return;
+    const prevChipset = configRef.current.chipset;
     const nextCfg = { ...configRef.current, ...patch };
     configRef.current = nextCfg;
     setConfig(nextCfg);
     saveAmigaConfig(nextCfg);
     if (patch.overscan !== undefined && canvasRef.current) {
-      canvasRef.current.dataset.overscan = patch.overscan;
+      canvasRef.current.dataset.overscan = String(patch.overscan);
     }
     if (patch.hapticsEnabled !== undefined) {
       setHapticsEnabled(patch.hapticsEnabled);
@@ -760,12 +978,21 @@ export default function App() {
     if (patch.joystickConnected === false) {
       setMobileDeck((prev) => (prev === 'gamepad' ? 'qwerty' : prev));
     }
+    if (patch.showEmuPerf !== undefined) {
+      setEmuPerf(
+        patch.showEmuPerf
+          ? createEmptyEmuPerf(machineRef.current?.getActiveVideoStandard() ?? 'PAL')
+          : null
+      );
+    }
     const m = machineRef.current;
     if (m) {
       if (patch.audioVolume !== undefined && nextCfg.audioEnabled) {
         m.audio.initFromGesture();
       }
-      m.updateConfig(patch, true);
+      const needsModelRomSwitch =
+        patch.chipset !== undefined && isModelRomSwitchNeeded(prevChipset, nextCfg.chipset);
+      m.updateConfig(patch, !needsModelRomSwitch);
       if (
         patch.autoCrop === false ||
         patch.overscan !== undefined ||
@@ -773,9 +1000,70 @@ export default function App() {
       ) {
         const size = m.getFramebufferSize();
         cropRectRef.current = autoCropRef.current.reset(size.width, size.height);
-        setCropAspect(cropPhysicalAspect(cropRectRef.current, nextCfg.videoStandard));
+        setCropAspect(
+          computeOverscanDisplayAspect(
+            cropRectRef.current.w,
+            cropRectRef.current.h,
+            m.getActiveVideoStandard(),
+            nextCfg.autoCrop
+          )
+        );
       }
       setStatus(m.getStatusSnapshot());
+
+      if (needsModelRomSwitch) {
+        const switchSeq = ++romSwitchSeqRef.current;
+        romSwitchPendingRef.current = true;
+        const targetProfile = getModelRomProfile(nextCfg.chipset);
+        void (async () => {
+          try {
+            let romPayload: { bytes: Uint8Array; name: string } | null =
+              await loadBinaryFromStorage(targetProfile.customStorageKey);
+            if (!romPayload) {
+              const cached = biosCacheRef.current.get(targetProfile.romName);
+              if (cached) {
+                romPayload = { bytes: cached, name: targetProfile.romName };
+              } else {
+                try {
+                  const resp = await fetch(targetProfile.romUrl);
+                  if (resp.ok) {
+                    const bytes = new Uint8Array(await resp.arrayBuffer());
+                    biosCacheRef.current.set(targetProfile.romName, bytes);
+                    romPayload = { bytes, name: targetProfile.romName };
+                  }
+                } catch {
+                  // Fall back to hardReset with current ROM if BIOS fetch fails
+                }
+              }
+            }
+            if (
+              romSwitchSeqRef.current !== switchSeq ||
+              machineRef.current !== m ||
+              configRef.current.chipset !== nextCfg.chipset
+            ) {
+              return;
+            }
+            if (romPayload) {
+              m.loadCustomRom(romPayload.bytes, romPayload.name);
+            } else {
+              m.hardReset();
+            }
+            setStatus(m.getStatusSnapshot());
+          } finally {
+            if (romSwitchSeqRef.current === switchSeq) {
+              romSwitchPendingRef.current = false;
+            }
+          }
+        })();
+      }
+    }
+    if (patch.chipset !== undefined && (prevChipset === 'AGA') !== (patch.chipset === 'AGA')) {
+      showToastRef.current?.(
+        'ok',
+        patch.chipset === 'AGA'
+          ? 'Режим Amiga 1200 (AGA · Kickstart 3.1)'
+          : 'Режим Amiga 500 (OCS/ECS · Kickstart 1.3)'
+      );
     }
   }, []);
 
@@ -846,6 +1134,7 @@ export default function App() {
     },
     []
   );
+  showToastRef.current = showToast;
 
   const mountResolvedMedia = useCallback(
     async (
@@ -863,6 +1152,7 @@ export default function App() {
       if (kind === 'adf') {
         const drive: 0 | 1 = targetDrive === 1 ? 1 : 0;
         const hintReset = drive === 0 && m.shouldHintResetForDf0Boot(bytes);
+        const compatWarn = drive === 0 ? m.checkDf0KickstartCompat(bytes, name) : null;
         const res = m.insertAdf(drive, bytes, name, false);
         if (!res.ok) {
           const msg = res.error ?? 'Ошибка чтения ADF.';
@@ -874,6 +1164,9 @@ export default function App() {
           'ok',
           hintReset ? `DF${drive}: ${name} · нажмите Сброс для запуска` : `DF${drive}: ${name}`
         );
+        if (compatWarn) {
+          showToast('err', compatWarn);
+        }
         return null;
       }
       if (kind === 'hdf') {
@@ -900,7 +1193,8 @@ export default function App() {
         showToast('err', msg);
         return msg;
       }
-      await saveBinaryToStorage('custom_kickstart_rom', name, bytes);
+      const profile = getModelRomProfile(m.config.chipset);
+      await saveBinaryToStorage(profile.customStorageKey, name, bytes);
       setStatus(m.getStatusSnapshot());
       showToast('ok', `ROM: ${name}`);
       return null;
@@ -958,6 +1252,100 @@ export default function App() {
         showToast('err', 'Эмулятор не инициализирован.');
         return;
       }
+
+      // Grouped multi-disk / per-disk virtual archive (e.g. Planetemu):
+      // Open ArchiveModal immediately as a virtual archive and download disks on demand.
+      if (item.files && item.files.length > 0) {
+        const singleDiskMultiVariants = (item.diskCount ?? 1) === 1 && item.files.length > 1;
+        const makeLazyCandidate = (file: CatalogDiskFile, idx: number): ArchiveMediaCandidate => {
+          let cachedBytes: Uint8Array | null = null;
+          let inflight: Promise<Uint8Array> | null = null;
+
+          const candidate: ArchiveMediaCandidate = {
+            id: `${idx}_${file.id}`,
+            name: file.name,
+            path: file.name,
+            size: file.sizeBytes,
+            kind: 'adf',
+            diskNumber: file.diskNumber ?? (singleDiskMultiVariants ? 1 : null),
+            diskTotal: file.diskTotal ?? (item.diskCount ?? null),
+            isBadDump: file.isBadDump,
+            isVerified: file.isVerified,
+            isClean: file.isClean,
+            crackTag: file.crackTag ?? null,
+            prereleaseKind: file.prereleaseKind ?? null,
+            variantTags: file.variantTags,
+            extractBytes: () => {
+              if (!cachedBytes) {
+                throw new Error('Диск ещё не скачан.');
+              }
+              return cachedBytes;
+            },
+            extractBytesAsync: async () => {
+              if (cachedBytes) return cachedBytes;
+              if (!inflight) {
+                inflight = (async () => {
+                  const { filename, bytes } = await downloadCatalogArchiveByUrl({
+                    proxyDownloadUrl: file.proxyDownloadUrl,
+                    fallbackTitle: file.name,
+                  });
+                  const resolved = await resolveUploadedFileAsync(filename, bytes);
+                  if (resolved.kind === 'adf') {
+                    candidate.name = resolved.name;
+                    candidate.path = resolved.name;
+                    candidate.size = resolved.bytes.length;
+                    cachedBytes = resolved.bytes;
+                    return resolved.bytes;
+                  }
+                  if (resolved.kind === 'archive-choices') {
+                    const firstAdf =
+                      resolved.mediaItems.find((c) => c.kind === 'adf') ?? resolved.mediaItems[0];
+                    if (firstAdf) {
+                      const inner = firstAdf.extractBytes();
+                      candidate.name = firstAdf.name;
+                      candidate.path = firstAdf.name;
+                      candidate.size = inner.length;
+                      cachedBytes = inner;
+                      return inner;
+                    }
+                  }
+                  throw new Error(`В архиве «${file.name}» не найден образ ADF.`);
+                })().finally(() => {
+                  inflight = null;
+                });
+              }
+              return inflight;
+            },
+          };
+          return candidate;
+        };
+
+        const candidates = item.files.map(makeLazyCandidate);
+        const totalBytes = candidates.reduce((acc, c) => acc + c.size, 0);
+        const nextArchive: PendingArchiveChoice = {
+          target: 0,
+          result: {
+            kind: 'archive-choices',
+            archiveName: item.title,
+            archiveFormat: item.platform ? `PLANETEMU · ${item.platform}` : 'PLANETEMU',
+            volumeName: item.title,
+            totalBytes,
+            mediaItems: candidates,
+            allFiles: candidates,
+            otherFileCount: 0,
+            fitsFloppy: false,
+            extractAllAsFiles: () => [],
+            buildAdf: () => new Uint8Array(0),
+            buildHdf: () => new Uint8Array(0),
+          },
+        };
+        lastLaunchViewRef.current = 'archive';
+        setDisksOpen(false);
+        setLastArchive(nextArchive);
+        setPendingArchive(nextArchive);
+        return;
+      }
+
       setLaunchingCatalogId(item.id);
       try {
         const { filename, bytes } = await downloadCatalogArchive({ item });
@@ -1032,7 +1420,9 @@ export default function App() {
   const handleSelectArchiveMedia = useCallback(
     async (item: ArchiveMediaCandidate, target: 0 | 1 | 'dh1' | 'rom') => {
       try {
-        const bytes = item.extractBytes();
+        const bytes = item.extractBytesAsync
+          ? await item.extractBytesAsync()
+          : item.extractBytes();
         setPendingArchive(null);
         await mountResolvedMedia(item.kind, item.name, bytes, target);
       } catch (err) {
@@ -1047,9 +1437,14 @@ export default function App() {
       const m = machineRef.current;
       if (!m) return;
       try {
-        const b0 = first.extractBytes();
-        const b1 = second.extractBytes();
+        const b0 = first.extractBytesAsync
+          ? await first.extractBytesAsync()
+          : first.extractBytes();
+        const b1 = second.extractBytesAsync
+          ? await second.extractBytesAsync()
+          : second.extractBytes();
         const hintReset = m.shouldHintResetForDf0Boot(b0);
+        const compatWarn = m.checkDf0KickstartCompat(b0, first.name);
         const r1 = m.insertAdf(1, b1, second.name, false);
         const r0 = m.insertAdf(0, b0, first.name, false);
         if (!r0.ok || !r1.ok) {
@@ -1065,6 +1460,9 @@ export default function App() {
             ? `DF0: ${first.name} · DF1: ${second.name} · нажмите Сброс для запуска`
             : `DF0: ${first.name} · DF1: ${second.name}`
         );
+        if (compatWarn) {
+          showToast('err', compatWarn);
+        }
       } catch (err) {
         showToast('err', err instanceof Error ? err.message : 'Ошибка распаковки архива.');
       }
@@ -1217,6 +1615,104 @@ export default function App() {
     [showToast]
   );
 
+  const triggerDownloadJson = useCallback(
+    (fileName: string, data: unknown, toastLabel: string) => {
+      const jsonText = JSON.stringify(data, null, 2);
+      const blob = new Blob([jsonText], { type: 'application/json;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1500);
+      showToast('ok', `${toastLabel}: ${fileName}`);
+    },
+    [showToast]
+  );
+
+  const handleDownloadDebugDump = useCallback(() => {
+    const m = machineRef.current;
+    if (!m) {
+      showToast('err', 'Эмулятор не инициализирован.');
+      return;
+    }
+    try {
+      const dump = buildAmigaDebugDump(m);
+      const fileName = formatDebugDumpFilename(m);
+      triggerDownloadJson(fileName, dump, 'Дамп отладки');
+    } catch {
+      showToast('err', 'Не удалось сформировать дамп отладки.');
+    }
+  }, [showToast, triggerDownloadJson]);
+
+  const handleDownloadTriageReport = useCallback(() => {
+    const m = machineRef.current;
+    if (!m) {
+      showToast('err', 'Эмулятор не инициализирован.');
+      return;
+    }
+    try {
+      const report = formatAmigaTriageText(m);
+      const fileName = formatTriageReportFilename(m);
+      const blob = new Blob([report], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1500);
+      const kb = (report.length / 1024).toFixed(1);
+      showToast('ok', `Triage-лог (${kb} КБ): ${fileName}`);
+    } catch {
+      showToast('err', 'Не удалось сформировать triage-лог.');
+    }
+  }, [showToast]);
+
+  const handleCopyTriageReport = useCallback(async () => {
+    const m = machineRef.current;
+    if (!m) {
+      showToast('err', 'Эмулятор не инициализирован.');
+      return;
+    }
+    try {
+      const report = formatAmigaTriageText(m);
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(report);
+        const kb = (report.length / 1024).toFixed(1);
+        showToast('ok', `Triage-лог (${kb} КБ) скопирован в буфер`);
+        return;
+      }
+      showToast('err', 'Буфер обмена недоступен — скачайте .txt файл.');
+    } catch {
+      showToast('err', 'Не удалось скопировать triage-лог.');
+    }
+  }, [showToast]);
+
+  const handleDownloadLiveSavestate = useCallback(() => {
+    const m = machineRef.current;
+    if (!m) {
+      showToast('err', 'Эмулятор не инициализирован.');
+      return;
+    }
+    try {
+      const thumb = captureScreenThumbnail();
+      const payload = buildDiagnosticSavestateFromMachine(m, thumb);
+      const label =
+        m.floppy.drives[0].name ||
+        m.hardfile.units[1].name ||
+        m.hardfile.units[0].name ||
+        'amiga500';
+      const fileName = formatSavestateFilename(label, 'live');
+      triggerDownloadJson(fileName, payload, 'Сейвстейт');
+    } catch {
+      showToast('err', 'Не удалось сохранить файл сейвстейта.');
+    }
+  }, [captureScreenThumbnail, showToast, triggerDownloadJson]);
+
   const handleDownloadDh0 = useCallback(() => {
     const hdf = machineRef.current?.exportHdf(0);
     if (!hdf) return;
@@ -1313,13 +1809,18 @@ export default function App() {
     [showToast]
   );
 
-  const handleInsertBlankAdf = useCallback(
-    (drive: 0 | 1) => {
+  const handleInsertBlankAdf = useCallback((drive: 0 | 1) => {
+    setBlankDiskDrive(drive);
+  }, []);
+
+  const handleConfirmBlankAdf = useCallback(
+    (drive: 0 | 1, volumeLabel: string) => {
       const m = machineRef.current;
       if (!m) return;
-      const diskName = m.insertBlankAdf(drive);
+      const diskName = m.insertBlankAdf(drive, undefined, volumeLabel);
       setStatus(m.getStatusSnapshot());
-      showToast('ok', `DF${drive}: ${diskName}`);
+      setBlankDiskDrive(null);
+      showToast('ok', `DF${drive}: ${diskName} (метка: ${volumeLabel})`);
     },
     [showToast]
   );
@@ -1386,8 +1887,9 @@ export default function App() {
   const handleRestoreOpenKick = useCallback(() => {
     const m = machineRef.current;
     if (!m) return;
+    const profile = getModelRomProfile(m.config.chipset);
     m.loadOpenKickRom();
-    void deleteFromStorage('custom_kickstart_rom');
+    void deleteFromStorage(profile.customStorageKey);
     setStatus(m.getStatusSnapshot());
     showToast('ok', 'OpenKick 1.3');
   }, [showToast]);
@@ -1399,26 +1901,31 @@ export default function App() {
       showToast('err', msg);
       return msg;
     }
+    const profile = getModelRomProfile(m.config.chipset);
     try {
-      const resp = await fetch(DEFAULT_BIOS_ROM_URL);
-      if (!resp.ok) {
-        const msg = 'Файл Kickstart ROM в /bios не найден.';
-        showToast('err', msg);
-        return msg;
+      let bytes = biosCacheRef.current.get(profile.romName);
+      if (!bytes) {
+        const resp = await fetch(profile.romUrl);
+        if (!resp.ok) {
+          const msg = `Файл ${profile.shortLabel} в /bios не найден.`;
+          showToast('err', msg);
+          return msg;
+        }
+        bytes = new Uint8Array(await resp.arrayBuffer());
+        biosCacheRef.current.set(profile.romName, bytes);
       }
-      const bytes = new Uint8Array(await resp.arrayBuffer());
-      const res = m.loadCustomRom(bytes, DEFAULT_BIOS_ROM_NAME);
+      const res = m.loadCustomRom(bytes, profile.romName);
       if (!res.ok) {
         const msg = res.error ?? 'Ошибка загрузки BIOS ROM.';
         showToast('err', msg);
         return msg;
       }
-      void deleteFromStorage('custom_kickstart_rom');
+      void deleteFromStorage(profile.customStorageKey);
       setStatus(m.getStatusSnapshot());
-      showToast('ok', 'Загружен Kickstart 1.3');
+      showToast('ok', `Загружен ${profile.shortLabel}`);
       return null;
     } catch {
-      const msg = 'Не удалось загрузить Kickstart ROM из /bios.';
+      const msg = `Не удалось загрузить ${profile.shortLabel} из /bios.`;
       showToast('err', msg);
       return msg;
     }
@@ -1463,11 +1970,18 @@ export default function App() {
       setConfig(m.config);
       setHapticsEnabled(m.config.hapticsEnabled);
       if (canvasRef.current) {
-        canvasRef.current.dataset.overscan = m.config.overscan;
+        canvasRef.current.dataset.overscan = String(m.config.overscan);
       }
       const loadedSize = m.getFramebufferSize();
       cropRectRef.current = autoCropRef.current.reset(loadedSize.width, loadedSize.height);
-      setCropAspect(cropPhysicalAspect(cropRectRef.current, m.config.videoStandard));
+      setCropAspect(
+        computeOverscanDisplayAspect(
+          cropRectRef.current.w,
+          cropRectRef.current.h,
+          m.getActiveVideoStandard(),
+          m.config.autoCrop
+        )
+      );
       setStatus(m.getStatusSnapshot());
       if (m.paused) {
         drawScreenshotToMainCanvas(data.screenshotDataUrl);
@@ -1485,6 +1999,76 @@ export default function App() {
       showToast('ok', `Слот ${slot} очищен`);
     },
     [showToast]
+  );
+
+  const handleDownloadSlot = useCallback(
+    async (slot: SaveSlotIndex) => {
+      const data = await loadSlotData(slot);
+      if (!data) {
+        showToast('err', `Слот ${slot} пуст`);
+        return;
+      }
+      try {
+        const payload = buildDiagnosticSavestateFromSlot(slot, data);
+        const label = data.df0Disk?.name || data.state.df0Name || 'amiga500';
+        const fileName = formatSavestateFilename(label, `slot-${slot}`);
+        triggerDownloadJson(fileName, payload, `Слот ${slot}`);
+      } catch {
+        showToast('err', `Не удалось экспортировать Слот ${slot}.`);
+      }
+    },
+    [showToast, triggerDownloadJson]
+  );
+
+  const handleImportSavestateFile = useCallback(
+    async (file: File) => {
+      const m = machineRef.current;
+      if (!m) {
+        showToast('err', 'Эмулятор не инициализирован.');
+        return;
+      }
+      if (file.size > 32 * 1024 * 1024) {
+        showToast('err', 'Файл сейвстейта слишком большой.');
+        return;
+      }
+      try {
+        const text = await file.text();
+        const parsed = parseDiagnosticSavestateJson(text);
+        if (!parsed.ok) {
+          showToast('err', parsed.error);
+          return;
+        }
+        const ok = m.loadSaveBundle(parsed.state, parsed.df0Disk, parsed.df1Disk);
+        if (!ok) {
+          showToast('err', 'Не удалось применить состояние из файла.');
+          return;
+        }
+        configRef.current = m.config;
+        setConfig(m.config);
+        setHapticsEnabled(m.config.hapticsEnabled);
+        if (canvasRef.current) {
+          canvasRef.current.dataset.overscan = String(m.config.overscan);
+        }
+        const loadedSize = m.getFramebufferSize();
+        cropRectRef.current = autoCropRef.current.reset(loadedSize.width, loadedSize.height);
+        setCropAspect(
+          computeOverscanDisplayAspect(
+            cropRectRef.current.w,
+            cropRectRef.current.h,
+            m.getActiveVideoStandard(),
+            m.config.autoCrop
+          )
+        );
+        setStatus(m.getStatusSnapshot());
+        if (m.paused && parsed.screenshotDataUrl) {
+          drawScreenshotToMainCanvas(parsed.screenshotDataUrl);
+        }
+        showToast('ok', `Загружен сейвстейт: ${file.name}`);
+      } catch {
+        showToast('err', 'Ошибка чтения файла сейвстейта.');
+      }
+    },
+    [drawScreenshotToMainCanvas, showToast]
   );
 
   useEffect(() => {
@@ -1565,8 +2149,8 @@ export default function App() {
     const count = activeCustomProfile.buttons.length;
     const newBtn: CustomButtonConfig = {
       id,
-      xPct: clampPct(50 + ((count % 3) - 1) * 14, 10, 90),
-      yPct: clampPct(50 + (Math.floor(count / 3) % 2) * 14, 14, 86),
+      xPct: clampPct(50 + ((count % 3) - 1) * 24, 14, 86),
+      yPct: clampPct(48 + (Math.floor(count / 3) % 2) * 18, 16, 84),
       size: 'md',
       target: { kind: 'key', code: AMIGA_RAW.SPACE },
     };
@@ -1579,6 +2163,30 @@ export default function App() {
     setCustomSelection({ kind: 'button', id });
     setCustomPickerContext({ kind: 'button', buttonId: id });
   }, [activeCustomProfile.buttons.length, commitCustomProfiles]);
+
+  const handleAddCustomMouseButton = useCallback(
+    (button: 'left' | 'right') => {
+      const id = `btn_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`;
+      const count = activeCustomProfile.buttons.length;
+      const defaultX = button === 'left' ? 72 : 86;
+      const defaultY = 74 - (count % 3) * 10;
+      const newBtn: CustomButtonConfig = {
+        id,
+        xPct: clampPct(defaultX, 10, 90),
+        yPct: clampPct(defaultY, 14, 86),
+        size: 'md',
+        target: { kind: 'mouse', button },
+      };
+      commitCustomProfiles((prev) =>
+        updateActiveProfile(prev, (prof) => ({
+          ...prof,
+          buttons: [...prof.buttons, newBtn],
+        }))
+      );
+      setCustomSelection({ kind: 'button', id });
+    },
+    [activeCustomProfile.buttons.length, commitCustomProfiles]
+  );
 
   const handleAddCustomStick = useCallback(() => {
     commitCustomProfiles((prev) =>
@@ -1667,6 +2275,7 @@ export default function App() {
         commitCustomProfiles((prev) => deleteProfile(prev, prev.activeProfileId));
       }}
       onAddButton={handleAddCustomButton}
+      onAddMouseButton={handleAddCustomMouseButton}
       onAddStick={handleAddCustomStick}
       onDeleteSelected={handleDeleteSelectedCustom}
       onOpenButtonPicker={(buttonId) => setCustomPickerContext({ kind: 'button', buttonId })}
@@ -1675,6 +2284,15 @@ export default function App() {
       onDone={handleToggleCustomEdit}
     />
   ) : null;
+
+  const handleModelTitleTap = useCallback(() => {
+    const res = registerSecretTap(modelTapStateRef.current, performance.now());
+    modelTapStateRef.current = res.state;
+    if (res.unlockedNow && !debugUnlocked) {
+      setDebugUnlocked(true);
+      showToast('ok', 'Вкладка «Отладка» доступна в настройках');
+    }
+  }, [debugUnlocked, showToast]);
 
   const handleOpenDisks = useCallback(() => {
     if (lastLaunchViewRef.current === 'archive' && lastArchive) {
@@ -1713,6 +2331,7 @@ export default function App() {
         onWarmReset={handleWarmReset}
         onOpenDisks={handleOpenDisks}
         onOpenSettings={() => setSettingsOpen(true)}
+        onModelTitleTap={handleModelTitleTap}
       />
 
       {/* Main Responsive Workspace */}
@@ -1740,6 +2359,7 @@ export default function App() {
               canvasRef={canvasRef}
               scanlines={config.crtScanlines}
               paused={status.paused}
+              emuPerf={config.showEmuPerf ? emuPerf : null}
               aspectRatio={cropAspect}
               fullscreen={isFullscreen}
               onMouseMove={handleMouseMove}
@@ -2109,6 +2729,9 @@ export default function App() {
                   onSaveSlot={handleSaveSlot}
                   onLoadSlot={handleLoadSlot}
                   onDeleteSlot={handleDeleteSlot}
+                  onDownloadSlot={handleDownloadSlot}
+                  onDownloadLiveSavestate={handleDownloadLiveSavestate}
+                  onImportSavestateFile={handleImportSavestateFile}
                 />
               </div>
             </div>
@@ -2404,6 +3027,9 @@ export default function App() {
         onSaveSlot={handleSaveSlot}
         onLoadSlot={handleLoadSlot}
         onDeleteSlot={handleDeleteSlot}
+        onDownloadSlot={handleDownloadSlot}
+        onDownloadLiveSavestate={handleDownloadLiveSavestate}
+        onImportSavestateFile={handleImportSavestateFile}
         launchingCatalogId={launchingCatalogId}
         onLaunchCatalogItem={handleLaunchCatalogItem}
       />
@@ -2431,9 +3057,21 @@ export default function App() {
 
       <SettingsDrawer
         open={settingsOpen}
+        debugUnlocked={debugUnlocked}
         config={config}
+        activeVideoStandard={status.videoStandard}
         onClose={() => setSettingsOpen(false)}
         onUpdateConfig={handleUpdateConfig}
+        onDownloadTriageReport={handleDownloadTriageReport}
+        onCopyTriageReport={handleCopyTriageReport}
+        onDownloadDebugDump={handleDownloadDebugDump}
+        onDownloadLiveSavestate={handleDownloadLiveSavestate}
+      />
+
+      <BlankDiskModal
+        drive={blankDiskDrive}
+        onConfirm={handleConfirmBlankAdf}
+        onClose={() => setBlankDiskDrive(null)}
       />
 
       <ToastContainer

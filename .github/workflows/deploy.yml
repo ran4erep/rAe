@@ -1,4 +1,4 @@
-name: Build & Deploy to GitHub Pages
+name: Build
 
 on:
   push:
@@ -9,11 +9,9 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
-  group: pages
+  group: build-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -41,7 +39,7 @@ jobs:
         run: npm run lint
 
       - name: Run unit tests
-        run: ./node_modules/.bin/tsx --test src/utils/assetUrl.test.ts src/emulator/hardware/overscan.test.ts src/emulator/hardware/autoCrop.test.ts src/emulator/hardware/amiga.test.ts
+        run: ./node_modules/.bin/tsx --test src/utils/assetUrl.test.ts src/emulator/hardware/overscan.test.ts src/emulator/hardware/autoCrop.test.ts src/emulator/hardware/amiga.test.ts src/emulator/settingsStorage.test.ts src/emulator/controls/physicalGamepad.test.ts
 
       - name: Build production bundle
         env:
@@ -55,20 +53,3 @@ jobs:
         with:
           name: amiga-dist
           path: dist
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: dist
-
-  deploy:
-    name: Deploy to GitHub Pages
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4

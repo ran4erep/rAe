@@ -74,6 +74,34 @@ export default defineConfig(() => {
             }
             next();
           });
+
+          const apiRoutes: Record<string, string> = {
+            '/api/catalog': './vercel-proxy/api/catalog.mjs',
+            '/api/cover': './vercel-proxy/api/cover.mjs',
+            '/api/download': './vercel-proxy/api/download.mjs',
+            '/api/health': './vercel-proxy/api/health.mjs',
+          };
+          server.middlewares.use(async (req, res, next) => {
+            const reqPath = (req.url ?? '').split('?')[0];
+            const modRel = apiRoutes[reqPath];
+            if (!modRel) {
+              next();
+              return;
+            }
+            try {
+              const mod = await import(path.resolve(__dirname, modRel));
+              await mod.default(req, res);
+            } catch (err) {
+              res.statusCode = 500;
+              res.setHeader('Content-Type', 'application/json; charset=utf-8');
+              res.end(
+                JSON.stringify({
+                  ok: false,
+                  error: err instanceof Error ? err.message : 'Local proxy error',
+                })
+              );
+            }
+          });
         },
       },
     ],

@@ -298,7 +298,7 @@ export const AmigaKeyboard: React.FC<AmigaKeyboardProps> = React.memo(
           <div
             className={`w-full max-w-[440px] mx-auto flex flex-col gap-1.5 ${
               fullscreenOverlay
-                ? 'pointer-events-auto bg-[#121318]/28 backdrop-blur-[1.5px] rounded-lg p-1.5 border border-white/12'
+                ? 'pointer-events-auto bg-[#1B1A18]/55 rounded-lg p-1.5 border border-white/10'
                 : ''
             }`}
           >
@@ -352,7 +352,7 @@ export const AmigaKeyboard: React.FC<AmigaKeyboardProps> = React.memo(
           <div
             className={`w-full mx-auto flex flex-col ${
               fullscreenOverlay
-                ? 'max-w-[660px] gap-[3px] pointer-events-auto bg-[#121318]/28 backdrop-blur-[1.5px] rounded-lg p-1.5 border border-white/12'
+                ? 'max-w-[660px] gap-[3px] pointer-events-auto bg-[#1B1A18]/55 rounded-lg p-1.5 border border-white/10'
                 : 'max-w-[540px] gap-[5px]'
             }`}
           >

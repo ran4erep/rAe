@@ -13,6 +13,7 @@ import {
   NTSC_LINES,
   PAL_FPS,
   PAL_LINES,
+  ResolvedVideoStandard,
   SaveSlotDiskPayload,
   SerializedAmigaState,
 } from '../types';
@@ -23,13 +24,11 @@ import { AmigaChipset, INT_EXTER, INT_PORTS, INT_VERTB } from './chipset';
 import { FloppyController, verifyAmigaBootblockChecksum } from './floppy';
 import { FloppyAudioEngine } from './floppyAudio';
 import { HardfileController } from './hardfile';
+import { computeCpuCyclesPerScanline } from './cpuOverclock';
 import { AmigaMemory } from './memory';
 import { PaulaAudioEngine } from './audio';
 import { createBlankFormattedHdf, resizeAmigaDosHdf } from '../archives/amigaDosFs';
 import { buildBuiltinAdf, buildOpenKickRom, BUILTIN_DISK_CATALOG, OpenKickRuntime } from '../roms/openKickKernel';
-
-const PAL_CYCLES_PER_SCANLINE = 454;  // 227 CCK = 454 CPU cycles = 45.4 E-clocks
-const NTSC_CYCLES_PER_SCANLINE = 455; // 227.5 CCK = 455 CPU cycles = 45.5 E-clocks
 
 function uint8ToBase64(bytes: Uint8Array): string {
   let binary = '';
@@ -50,6 +49,49 @@ function base64ToUint8(b64: string): Uint8Array {
   return new Uint8Array(Buffer.from(b64, 'base64'));
 }
 
+export type AutoVideoStandardReason = 'deadlock' | 'diw' | 'copper' | 'beamcon0' | 'disk-tag';
+
+const NTSC_TAG_RE = /(?:^|[\s([_.-])(ntsc|usa|us)(?:$|[\s)\]_.-])/i;
+const PAL_TAG_RE = /(?:^|[\s([_.-])(pal|eur|europe|uk)(?:$|[\s)\]_.-])/i;
+
+export function detectVideoStandardFromName(name: string): ResolvedVideoStandard | null {
+  if (!name) return null;
+  if (NTSC_TAG_RE.test(name)) return 'NTSC';
+  if (PAL_TAG_RE.test(name)) return 'PAL';
+  return null;
+}
+
+function extractAdfVolumeLabel(bytes: Uint8Array): string {
+  if (bytes.length < 901120) return '';
+  if (bytes[0] !== 0x44 || bytes[1] !== 0x4f || bytes[2] !== 0x53) return '';
+  const rootOff = 880 * 512;
+  const len = bytes[rootOff + 432];
+  if (len < 1 || len > 30) return '';
+  let out = '';
+  for (let i = 0; i < len; i++) {
+    const ch = bytes[rootOff + 433 + i];
+    if (ch >= 0x20 && ch < 0x7f) out += String.fromCharCode(ch);
+  }
+  return out;
+}
+
+export const TRIAGE_EVT_HARD_RESET = 1;
+export const TRIAGE_EVT_WARM_RESET = 2;
+export const TRIAGE_EVT_CPU_RESET = 3;
+export const TRIAGE_EVT_OVL = 4;
+export const TRIAGE_EVT_FLOPPY_MOTOR = 5;
+export const TRIAGE_EVT_FLOPPY_STEP = 6;
+export const TRIAGE_EVT_DISK_DMA = 7;
+
+export interface TriageEventEntry {
+  frame: number;
+  kind: number;
+  arg1: number;
+  arg2: number;
+}
+
+const TRIAGE_EVENT_CAP = 32;
+
 export class AmigaMachine {
   public config: AmigaConfig;
   public readonly floppy: FloppyController;
@@ -68,6 +110,10 @@ export class AmigaMachine {
   public frameCount = 0;
   public measuredFps = 50;
   public cpuUsageHint = 4;
+  public activeVideoStandard: ResolvedVideoStandard = 'PAL';
+  public onAutoVideoStandardChange:
+    | ((videoStandard: ResolvedVideoStandard, reason: AutoVideoStandardReason) => void)
+    | null = null;
 
   private powerLed = true;
   private mouseLeft = false;
@@ -79,6 +125,15 @@ export class AmigaMachine {
   private lastReportedMotor: [boolean, boolean] = [false, false];
   private saveStateInsertedDrives: [boolean, boolean] = [false, false];
   private eClockAccum = 0;
+  private readonly pcHistory = new Uint32Array(120);
+  private pcHistoryIdx = 0;
+  private pcHistoryCount = 0;
+  private readonly evtFrame = new Uint32Array(TRIAGE_EVENT_CAP);
+  private readonly evtKind = new Uint8Array(TRIAGE_EVENT_CAP);
+  private readonly evtArg1 = new Int32Array(TRIAGE_EVENT_CAP);
+  private readonly evtArg2 = new Int32Array(TRIAGE_EVENT_CAP);
+  private evtWriteIdx = 0;
+  private evtCount = 0;
 
   constructor(
     initialConfig: Partial<AmigaConfig> = {},
@@ -98,7 +153,17 @@ export class AmigaMachine {
     this.audio.setOnContextReady((ctx) => this.floppyAudio.attachContext(ctx));
     this.floppy.soundCallbacks = {
       onInsert: (d, ins) => this.floppyAudio.handleInsert(d, ins),
-      onStep: (d, cyl) => this.floppyAudio.handleStep(d, cyl),
+      onStep: (d, cyl) => {
+        this.recordTriageEvent(
+          TRIAGE_EVT_FLOPPY_STEP,
+          d,
+          (cyl << 1) | (this.floppy.drives[d]?.side ?? 0)
+        );
+        this.floppyAudio.handleStep(d, cyl);
+      },
+      onMotor: (d, on) => {
+        this.recordTriageEvent(TRIAGE_EVT_FLOPPY_MOTOR, d, on ? 1 : 0);
+      },
       onReset: (d0, d1) => {
         this.lastReportedMotor[0] = false;
         this.lastReportedMotor[1] = false;
@@ -114,14 +179,30 @@ export class AmigaMachine {
     this.chipset = new AmigaChipset(initialChipRam, this.floppy, (ipl) => {
       if (cpuRef) cpuRef.pendingIpl = ipl;
     });
+    this.chipset.onDiskDmaStart = (wordCount, isWrite) => {
+      const idx = this.floppy.drives[1].selected ? 1 : 0;
+      const drv = this.floppy.drives[idx];
+      this.recordTriageEvent(
+        TRIAGE_EVT_DISK_DMA,
+        ((idx & 1) << 16) | (isWrite ? 0x8000 : 0) | (wordCount & 0x7fff),
+        drv ? ((drv.cylinder << 1) | drv.side) : 0
+      );
+    };
     this.chipset.chipset = this.config.chipset;
     this.chipset.turboFloppy = this.config.turboFloppy;
     this.floppy.turboFloppy = this.config.turboFloppy;
-    this.chipset.setOverscanConfig(this.config.overscan, this.config.videoStandard, true);
+    this.activeVideoStandard =
+      this.config.videoStandard === 'auto' ? 'PAL' : this.config.videoStandard;
+    this.chipset.setOverscanConfig(this.config.overscan, this.activeVideoStandard, true);
 
     this.cia = new AmigaCIA({
       onOvlChange: (ovl) => {
-        if (this.memory) this.memory.ovl = ovl;
+        if (this.memory && this.memory.ovl !== ovl) {
+          this.memory.ovl = ovl;
+          this.recordTriageEvent(TRIAGE_EVT_OVL, ovl ? 1 : 0, 0);
+        } else if (this.memory) {
+          this.memory.ovl = ovl;
+        }
       },
       onPowerLedChange: (on) => {
         this.powerLed = on;
@@ -138,6 +219,9 @@ export class AmigaMachine {
       },
       getFloppyStatus: () => this.floppy.getCiaAStatusBits(),
       getFireButtons: () => {
+        if (!this.chipset.isPalTiming()) {
+          this.chipset.noteNtscInputPoll();
+        }
         let bits = 0xc0; // Active low: bit 6 = Mouse LMB, bit 7 = Joy2 Fire1
         if (this.mouseLeft) bits &= ~0x40;
         if (this.config.joystickConnected && this.chipset.joy1.fire1) bits &= ~0x80;
@@ -157,10 +241,14 @@ export class AmigaMachine {
     this.memory.hardfile = this.hardfile;
 
     this.cpu = new M68000(this.memory);
+    this.cpu.is68020 = this.config.chipset === 'AGA';
+    this.memory.allowUnaligned = this.cpu.is68020;
     cpuRef = this.cpu;
+    this.chipset.attachCycleSource(this.cpu);
 
     // Hook 68000 RESET instruction & Expansion/OpenKick Line-A kernel calls
     this.memory.onResetInstruction = () => {
+      this.recordTriageEvent(TRIAGE_EVT_CPU_RESET, this.cpu.pc >>> 0, 0);
       this.cia.reset();
       this.chipset.reset();
       this.floppy.reset();
@@ -217,6 +305,31 @@ export class AmigaMachine {
     }
   }
 
+  public getActiveVideoStandard(): ResolvedVideoStandard {
+    return this.activeVideoStandard;
+  }
+
+  private resolveAutoBootVideoStandard(): ResolvedVideoStandard {
+    if (this.config.videoStandard !== 'auto') {
+      return this.config.videoStandard;
+    }
+    const d0 = this.floppy.drives[0];
+    if (d0.data) {
+      const fromName = detectVideoStandardFromName(d0.name);
+      if (fromName) return fromName;
+      const fromLabel = detectVideoStandardFromName(extractAdfVolumeLabel(d0.data));
+      if (fromLabel) return fromLabel;
+    }
+    const h1 = this.hardfile.units[1];
+    if (h1.data) {
+      const fromName = detectVideoStandardFromName(h1.name);
+      if (fromName) return fromName;
+      const fromVol = detectVideoStandardFromName(h1.partitions[0]?.volumeName ?? '');
+      if (fromVol) return fromVol;
+    }
+    return 'PAL';
+  }
+
   public hardReset(): void {
     this.ejectSaveStateDisksOnReset();
     this.memory.clearRam();
@@ -228,14 +341,23 @@ export class AmigaMachine {
     this.chipset.chipset = this.config.chipset;
     this.chipset.turboFloppy = this.config.turboFloppy;
     this.floppy.turboFloppy = this.config.turboFloppy;
-    this.chipset.setOverscanConfig(this.config.overscan, this.config.videoStandard, true);
+    this.activeVideoStandard = this.resolveAutoBootVideoStandard();
+    this.chipset.setOverscanConfig(this.config.overscan, this.activeVideoStandard, true);
     this.chipset.joy1Connected = this.config.joystickConnected;
     this.openKick.reset();
     this.audio.resetSchedule();
     this.capsLock = false;
     this.eClockAccum = 0;
+    this.pcHistoryIdx = 0;
+    this.pcHistoryCount = 0;
+    this.cpu.is68020 = this.config.chipset === 'AGA';
+    this.memory.allowUnaligned = this.cpu.is68020;
+    this.memory.syncKickstart68020Compat(this.cpu.is68020);
     this.cpu.reset();
     this.frameCount = 0;
+    this.evtWriteIdx = 0;
+    this.evtCount = 0;
+    this.recordTriageEvent(TRIAGE_EVT_HARD_RESET, 0, 0);
   }
 
   public warmReset(): void {
@@ -247,11 +369,22 @@ export class AmigaMachine {
     this.chipset.chipset = this.config.chipset;
     this.chipset.turboFloppy = this.config.turboFloppy;
     this.floppy.turboFloppy = this.config.turboFloppy;
-    this.chipset.setOverscanConfig(this.config.overscan, this.config.videoStandard, true);
+    const prevStd = this.activeVideoStandard;
+    this.activeVideoStandard = this.resolveAutoBootVideoStandard();
+    this.chipset.setOverscanConfig(this.config.overscan, this.activeVideoStandard, true);
     this.chipset.joy1Connected = this.config.joystickConnected;
     this.audio.resetSchedule();
     this.eClockAccum = 0;
+    this.pcHistoryIdx = 0;
+    this.pcHistoryCount = 0;
+    this.cpu.is68020 = this.config.chipset === 'AGA';
+    this.memory.allowUnaligned = this.cpu.is68020;
+    this.memory.syncKickstart68020Compat(this.cpu.is68020);
     this.cpu.reset();
+    this.recordTriageEvent(TRIAGE_EVT_WARM_RESET, 0, 0);
+    if (this.config.videoStandard === 'auto' && this.activeVideoStandard !== prevStd) {
+      this.onAutoVideoStandardChange?.(this.activeVideoStandard, 'disk-tag');
+    }
   }
 
   public updateConfig(patch: Partial<AmigaConfig>, rebootIfHardwareChanged = true): void {
@@ -262,9 +395,18 @@ export class AmigaMachine {
         : (this.config.audioVolume ?? DEFAULT_AMIGA_CONFIG.audioVolume);
     this.config = { ...this.config, ...patch, audioVolume: nextVolume };
     this.chipset.chipset = this.config.chipset;
+    this.cpu.is68020 = this.config.chipset === 'AGA';
+    this.memory.allowUnaligned = this.cpu.is68020;
+    this.memory.syncKickstart68020Compat(this.cpu.is68020);
     this.chipset.turboFloppy = this.config.turboFloppy;
     this.floppy.turboFloppy = this.config.turboFloppy;
-    this.chipset.setOverscanConfig(this.config.overscan, this.config.videoStandard);
+    if (patch.videoStandard !== undefined) {
+      this.activeVideoStandard =
+        this.config.videoStandard === 'auto'
+          ? this.resolveAutoBootVideoStandard()
+          : this.config.videoStandard;
+    }
+    this.chipset.setOverscanConfig(this.config.overscan, this.activeVideoStandard);
     this.chipset.joy1Connected = this.config.joystickConnected;
     if (!this.config.joystickConnected) {
       this.chipset.joy1.up = false;
@@ -348,6 +490,32 @@ export class AmigaMachine {
     }
   }
 
+  public checkDf0KickstartCompat(bytes: Uint8Array, name: string): string | null {
+    const isDosDisk =
+      bytes.length >= 512 &&
+      bytes[0] === 0x44 &&
+      bytes[1] === 0x4f &&
+      bytes[2] === 0x53;
+    const fsVer = isDosDisk ? bytes[3] : -1;
+    const isFfsOrIntl = fsVer >= 1 && fsVer <= 5;
+    const ksVer = this.isOpenKick ? 34 : ((this.memory.rom[12] << 8) | this.memory.rom[13]);
+
+    if (isFfsOrIntl && ksVer > 0 && ksVer < 36) {
+      return `Дискета «${name}» использует DOS\\${fsVer} (FFS) и требует Kickstart 2.04+/3.1 (сейчас ${this.isOpenKick ? 'OpenKick 1.3' : `KS ${ksVer}`}).`;
+    }
+
+    if (/(?:^|[\s([_.-])AGA(?:$|[\s)\]_.-])/i.test(name)) {
+      if (this.config.chipset !== 'AGA') {
+        return `Образ «${name}» создан для Amiga 1200 (AGA). Включите Amiga 1200 в настройках.`;
+      }
+      if (this.isOpenKick || (ksVer > 0 && ksVer < 39)) {
+        return `AGA-образ «${name}» обычно требует ROM Kickstart 3.0/3.1 (V39+, сейчас ${this.isOpenKick ? 'OpenKick 1.3' : `KS ${ksVer}`}).`;
+      }
+    }
+
+    return null;
+  }
+
   public shouldHintResetForDf0Boot(bytes: Uint8Array): boolean {
     if (!verifyAmigaBootblockChecksum(bytes)) return false;
     if (this.hardfile.hasAnyReadSinceReset()) return true;
@@ -361,18 +529,36 @@ export class AmigaMachine {
         error: `Файл "${name}" не похож на образ ADF (ожидается ~880 КБ).`,
       };
     }
+    const wasEmpty = this.floppy.drives[driveIdx].data === null;
     const hotSwap = !resetIfDf0;
     this.floppy.drives[driveIdx].insert(bytes, name, hotSwap);
     this.saveStateInsertedDrives[driveIdx] = false;
     if (driveIdx === 0 && resetIfDf0) {
       this.warmReset();
+    } else if (driveIdx === 0 && this.config.videoStandard === 'auto' && wasEmpty) {
+      const tagged =
+        detectVideoStandardFromName(name) ??
+        detectVideoStandardFromName(extractAdfVolumeLabel(bytes));
+      if (tagged && tagged !== this.activeVideoStandard) {
+        this.activeVideoStandard = tagged;
+        this.chipset.setOverscanConfig(this.config.overscan, tagged);
+        this.onAutoVideoStandardChange?.(tagged, 'disk-tag');
+      }
     }
     return { ok: true };
   }
 
-  public insertBlankAdf(driveIdx: 0 | 1, name?: string): string {
-    const diskName = name ?? (driveIdx === 0 ? 'SaveDisk.adf' : 'SaveDisk_DF1.adf');
-    this.floppy.drives[driveIdx].insertBlankDisk(diskName, 'SaveDisk', true);
+  public insertBlankAdf(driveIdx: 0 | 1, name?: string, volumeName?: string): string {
+    const cleanVol = (volumeName ?? '').replace(/[:/]/g, '').trim().slice(0, 30) || 'SaveDisk';
+    const hasCustomVol = Boolean(volumeName && volumeName.replace(/[:/]/g, '').trim());
+    const diskName =
+      name ??
+      (hasCustomVol
+        ? `${cleanVol}.adf`
+        : driveIdx === 0
+          ? 'SaveDisk.adf'
+          : 'SaveDisk_DF1.adf');
+    this.floppy.drives[driveIdx].insertBlankDisk(diskName, cleanVol, true);
     this.saveStateInsertedDrives[driveIdx] = false;
     return diskName;
   }
@@ -541,21 +727,24 @@ export class AmigaMachine {
 
     const isPal = chipset.isPalTiming();
     const totalLines = (isPal ? PAL_LINES : NTSC_LINES) + (chipset.lof & 1);
-    const cpuCyclesPerLine = this.config.ecoCpuMode
-      ? 240
-      : (isPal ? PAL_CYCLES_PER_SCANLINE : NTSC_CYCLES_PER_SCANLINE);
+    const isAga = chipset.chipset === 'AGA';
+    const cpuCyclesPerLine = computeCpuCyclesPerScanline(
+      isAga,
+      isPal,
+      this.config.ecoCpuMode,
+      this.config.cpuOverclock
+    );
     const eFrac = isPal ? 4 : 5;
     let eAccum = this.eClockAccum;
     const spriteHeaderLine = isPal ? 25 : 20;
-    const diskDmaWords = this.config.turboFloppy ? 0x4000 : 4;
+    const diskDmaWords = this.config.turboFloppy ? 96 : 4;
 
     // Line 0: trigger VBlank interrupt & CIA-A TOD VSync
     cia.onVSync();
     chipset.requestIrq(INT_VERTB);
 
     for (let line = 0; line < totalLines; line++) {
-      chipset.vpos = line;
-      chipset.hpos = 0;
+      chipset.beginScanline(line, cpu.cycles, cpuCyclesPerLine);
 
       // Phase 1 Copper: execute visible-span Copper moves up to $DB before scanline display,
       // while deferring end-of-line modulo resets (e.g. $DC after DDFSTOP=$D8) and HBlank waits ($E0/$DF) to Phase 2
@@ -592,11 +781,32 @@ export class AmigaMachine {
 
     this.eClockAccum = eAccum;
     chipset.finishFrame();
+    if (this.config.videoStandard === 'auto') {
+      const palReason = chipset.checkNtscNeedsPal(!this.isOpenKick);
+      if (palReason !== null) {
+        this.activeVideoStandard = 'PAL';
+        chipset.setOverscanConfig(this.config.overscan, 'PAL');
+        this.onAutoVideoStandardChange?.('PAL', palReason);
+      } else {
+        const currentChipStd: ResolvedVideoStandard = chipset.isPalTiming() ? 'PAL' : 'NTSC';
+        if (currentChipStd !== this.activeVideoStandard) {
+          this.activeVideoStandard = currentChipStd;
+          chipset.setOverscanConfig(this.config.overscan, currentChipStd);
+          this.onAutoVideoStandardChange?.(currentChipStd, 'beamcon0');
+        }
+      }
+    } else if (this.config.videoStandard === 'NTSC' && chipset.checkNtscPalRasterDeadlock()) {
+      this.config = { ...this.config, videoStandard: 'PAL' };
+      this.activeVideoStandard = 'PAL';
+      chipset.setOverscanConfig(this.config.overscan, 'PAL');
+      this.onAutoVideoStandardChange?.('PAL', 'deadlock');
+    }
 
-    // Sync floppy motor audio & decay LED I/O pulse once per frame
+    // Sync floppy motor audio & decay LED I/O pulse and hot-swap eject hold once per frame
     for (let i = 0; i < 2; i++) {
       const d = this.floppy.drives[i];
       if (d.ioPulseFrames > 0) d.ioPulseFrames--;
+      if (d.ejectHoldFrames > 0) d.ejectHoldFrames--;
       const run = d.motorOn;
       if (run !== this.lastReportedMotor[i]) {
         this.lastReportedMotor[i] = run;
@@ -623,6 +833,62 @@ export class AmigaMachine {
 
     this.memory.advanceRtcMs(isPal ? 1000 / PAL_FPS : 1000 / NTSC_FPS);
     this.frameCount++;
+    this.pcHistory[this.pcHistoryIdx] = cpu.pc >>> 0;
+    this.pcHistoryIdx = this.pcHistoryIdx === 119 ? 0 : this.pcHistoryIdx + 1;
+    if (this.pcHistoryCount < 120) this.pcHistoryCount++;
+  }
+
+  private recordTriageEvent(kind: number, arg1: number, arg2: number): void {
+    if (this.evtCount > 0) {
+      const prevIdx = (this.evtWriteIdx - 1 + TRIAGE_EVENT_CAP) & (TRIAGE_EVENT_CAP - 1);
+      if (kind === TRIAGE_EVT_FLOPPY_STEP && this.evtKind[prevIdx] === kind && this.evtArg1[prevIdx] === arg1) {
+        if ((this.frameCount - this.evtFrame[prevIdx]) <= 2) {
+          this.evtFrame[prevIdx] = this.frameCount >>> 0;
+          this.evtArg2[prevIdx] = arg2 | 0;
+          return;
+        }
+      } else if (
+        this.evtKind[prevIdx] === kind &&
+        this.evtArg1[prevIdx] === (arg1 | 0) &&
+        this.evtArg2[prevIdx] === (arg2 | 0) &&
+        this.evtFrame[prevIdx] === (this.frameCount >>> 0)
+      ) {
+        return;
+      }
+    }
+    const idx = this.evtWriteIdx;
+    this.evtFrame[idx] = this.frameCount >>> 0;
+    this.evtKind[idx] = kind & 0xff;
+    this.evtArg1[idx] = arg1 | 0;
+    this.evtArg2[idx] = arg2 | 0;
+    this.evtWriteIdx = (idx + 1) & (TRIAGE_EVENT_CAP - 1);
+    if (this.evtCount < TRIAGE_EVENT_CAP) this.evtCount++;
+  }
+
+  public getRecentTriageEvents(): TriageEventEntry[] {
+    const count = this.evtCount;
+    const out: TriageEventEntry[] = new Array(count);
+    const start = count < TRIAGE_EVENT_CAP ? 0 : this.evtWriteIdx;
+    for (let i = 0; i < count; i++) {
+      const idx = (start + i) & (TRIAGE_EVENT_CAP - 1);
+      out[i] = {
+        frame: this.evtFrame[idx],
+        kind: this.evtKind[idx],
+        arg1: this.evtArg1[idx],
+        arg2: this.evtArg2[idx],
+      };
+    }
+    return out;
+  }
+
+  public getRecentPcHistory(): number[] {
+    const count = this.pcHistoryCount;
+    const out = new Array<number>(count);
+    const start = count < 120 ? 0 : this.pcHistoryIdx;
+    for (let i = 0; i < count; i++) {
+      out[i] = this.pcHistory[(start + i) % 120];
+    }
+    return out;
   }
 
   public getStatusSnapshot(): AmigaStatusSnapshot {
@@ -632,7 +898,7 @@ export class AmigaMachine {
       fps: this.measuredFps,
       cpuUsageHint: this.cpuUsageHint,
       chipset: this.config.chipset,
-      videoStandard: this.config.videoStandard,
+      videoStandard: this.activeVideoStandard,
       romName: this.romName,
       isOpenKick: this.isOpenKick,
       powerLed: this.powerLed,
@@ -661,6 +927,11 @@ export class AmigaMachine {
       df1Name: this.floppy.drives[1].name,
       df0State: this.floppy.drives[0].getDriveSnapshot(),
       df1State: this.floppy.drives[1].getDriveSnapshot(),
+      isOpenKick: this.isOpenKick,
+      activeVideoStandard: this.activeVideoStandard,
+      frameCount: this.frameCount,
+      ovl: this.memory.ovl,
+      eClockAccum: this.eClockAccum,
       cpuRegs,
       usp: this.cpu.usp,
       ssp: this.cpu.ssp,
@@ -669,7 +940,23 @@ export class AmigaMachine {
       stopped: this.cpu.stopped,
       chipRamBase64: uint8ToBase64(this.memory.chipRam),
       slowRamBase64: uint8ToBase64(this.memory.slowRam),
+      fastRamBase64: this.memory.fastRam.length > 0 ? uint8ToBase64(this.memory.fastRam) : '',
       customRegs: this.chipset.serializeRegs(),
+      bplPt: Array.from(this.chipset.bplPt.subarray(0, this.config.chipset === 'AGA' ? 8 : 6)),
+      sprPt: Array.from(this.chipset.sprPt),
+      beamCon0: this.chipset.beamCon0,
+      copPc: this.chipset.copPc,
+      copWaiting: this.chipset.copWaiting,
+      copWaitV: this.chipset.copWaitV,
+      copWaitH: this.chipset.copWaitH,
+      copMaskV: this.chipset.copMaskV,
+      copMaskH: this.chipset.copMaskH,
+      vbr: this.cpu.vbr,
+      cacr: this.cpu.cacr,
+      bplCon3: this.chipset.bplCon3,
+      bplCon4: this.chipset.bplCon4,
+      fmode: this.chipset.fmode,
+      agaColors24: this.config.chipset === 'AGA' ? Array.from(this.chipset.colorReg24) : undefined,
       ciaA: this.cia.serializeA(),
       ciaB: this.cia.serializeB(),
     };
@@ -686,11 +973,19 @@ export class AmigaMachine {
       },
       false
     );
+    if (state.activeVideoStandard === 'PAL' || state.activeVideoStandard === 'NTSC') {
+      this.activeVideoStandard = state.activeVideoStandard;
+      this.chipset.setOverscanConfig(this.config.overscan, this.activeVideoStandard, false);
+    }
     const chipBytes = base64ToUint8(state.chipRamBase64);
     this.memory.chipRam.set(chipBytes.subarray(0, this.memory.chipRam.length));
     if (state.slowRamBase64 && this.memory.slowRam.length > 0) {
       const slowBytes = base64ToUint8(state.slowRamBase64);
       this.memory.slowRam.set(slowBytes.subarray(0, this.memory.slowRam.length));
+    }
+    if (state.fastRamBase64 && this.memory.fastRam.length > 0) {
+      const fastBytes = base64ToUint8(state.fastRamBase64);
+      this.memory.fastRam.set(fastBytes.subarray(0, this.memory.fastRam.length));
     }
     for (let i = 0; i < 8; i++) {
       this.cpu.d[i] = state.cpuRegs[i] | 0;
@@ -701,9 +996,70 @@ export class AmigaMachine {
     this.cpu.pc = state.pc & 0x00ffffff;
     this.cpu.sr = state.sr & 0xa71f;
     this.cpu.stopped = Boolean(state.stopped);
+    if (typeof state.vbr === 'number') this.cpu.vbr = state.vbr | 0;
+    if (typeof state.cacr === 'number') this.cpu.cacr = state.cacr & 0x0003;
     this.chipset.deserializeRegs(state.customRegs);
+    if (typeof state.bplCon3 === 'number') this.chipset.bplCon3 = state.bplCon3 & 0xffff;
+    if (typeof state.bplCon4 === 'number') this.chipset.bplCon4 = state.bplCon4 & 0xffff;
+    if (typeof state.fmode === 'number') this.chipset.fmode = state.fmode & 0xffff;
+    if (Array.isArray(state.agaColors24)) {
+      const count = Math.min(256, state.agaColors24.length);
+      for (let i = 0; i < count; i++) {
+        const c24 = state.agaColors24[i] >>> 0;
+        this.chipset.colorReg24[i] = c24;
+        const r8 = (c24 >>> 16) & 0xff;
+        const g8 = (c24 >>> 8) & 0xff;
+        const b8 = c24 & 0xff;
+        this.chipset.colorAbgr[i] = (0xff000000 | (b8 << 16) | (g8 << 8) | r8) >>> 0;
+        if (i < 32) {
+          this.chipset.colorReg[i] = ((r8 >>> 4) << 8) | ((g8 >>> 4) << 4) | (b8 >>> 4);
+          this.chipset.colorEhbAbgr[i] =
+            (0xff000000 | ((b8 >>> 1) << 16) | ((g8 >>> 1) << 8) | (r8 >>> 1)) >>> 0;
+        }
+      }
+    }
+    if (Array.isArray(state.bplPt)) {
+      for (let i = 0; i < Math.min(this.chipset.bplPt.length, state.bplPt.length); i++) {
+        this.chipset.bplPt[i] = state.bplPt[i] & 0x00ffffff;
+      }
+    }
+    if (Array.isArray(state.sprPt)) {
+      for (let i = 0; i < Math.min(8, state.sprPt.length); i++) {
+        this.chipset.sprPt[i] = state.sprPt[i] & 0x00ffffff;
+      }
+    }
+    if (typeof state.beamCon0 === 'number') {
+      this.chipset.beamCon0 = state.beamCon0 & 0xffff;
+    }
+    if (typeof state.copPc === 'number') {
+      this.chipset.copPc = state.copPc & 0x00ffffff;
+    }
+    if (typeof state.copWaiting === 'boolean') {
+      this.chipset.copWaiting = state.copWaiting;
+    }
+    if (typeof state.copWaitV === 'number') {
+      this.chipset.copWaitV = state.copWaitV | 0;
+    }
+    if (typeof state.copWaitH === 'number') {
+      this.chipset.copWaitH = state.copWaitH | 0;
+    }
+    if (typeof state.copMaskV === 'number') {
+      this.chipset.copMaskV = state.copMaskV | 0;
+    }
+    if (typeof state.copMaskH === 'number') {
+      this.chipset.copMaskH = state.copMaskH | 0;
+    }
     this.cia.deserializeA(state.ciaA);
     this.cia.deserializeB(state.ciaB);
+    if (typeof state.ovl === 'boolean') {
+      this.memory.ovl = state.ovl;
+    }
+    if (typeof state.frameCount === 'number') {
+      this.frameCount = state.frameCount | 0;
+    }
+    if (typeof state.eClockAccum === 'number') {
+      this.eClockAccum = state.eClockAccum | 0;
+    }
     return true;
   }
 

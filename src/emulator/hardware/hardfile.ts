@@ -719,6 +719,10 @@ export class HardfileController {
     return 0x00;
   }
 
+  public peekRomByte(addr: number): number {
+    return this.read8(addr);
+  }
+
   public read16(addr: number): number {
     if (addr >= 0xe80000 && addr < 0xe90000) {
       const hi = this.readAutoconfigByte(addr - 0xe80000);

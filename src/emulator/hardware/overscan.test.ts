@@ -130,3 +130,110 @@ test('AutoOverscanTracker expands in 2 frames, ignores blank frames, and shrinks
   assert.equal(tracker.update(true, 0x81, 0x1c1, 44, 300, 'PAL'), true);
   assert.deepEqual(tracker.current, { hOriginLo: 0x81, width: 640, startLine: 44, height: 256 });
 });
+
+test('Numeric overscan levels (0..100) scale monotonically within physical Denise bounds for PAL and NTSC', async () => {
+  const { getOverscanViewport, overscanToLevel } = await import('./overscan');
+
+  assert.equal(isValidOverscanMode(0), true);
+  assert.equal(isValidOverscanMode(50), true);
+  assert.equal(isValidOverscanMode(100), true);
+  assert.equal(isValidOverscanMode(-1), false);
+  assert.equal(isValidOverscanMode(101), false);
+  assert.equal(isValidOverscanMode(Number.NaN), false);
+
+  assert.equal(overscanToLevel(0), 0);
+  assert.equal(overscanToLevel(42.6), 43);
+  assert.equal(overscanToLevel('none'), 0);
+  assert.equal(overscanToLevel('tv'), 56);
+  assert.equal(overscanToLevel('max'), 100);
+
+  assert.deepEqual(getOverscanViewport(0, 'PAL'), { hOriginLo: 0x81, width: 640, startLine: 44, height: 256 });
+  assert.deepEqual(getOverscanViewport(100, 'PAL'), { hOriginLo: 0x65, width: 752, startLine: 26, height: 286 });
+  assert.deepEqual(getOverscanViewport(0, 'NTSC'), { hOriginLo: 0x81, width: 640, startLine: 44, height: 200 });
+  assert.deepEqual(getOverscanViewport(100, 'NTSC'), { hOriginLo: 0x65, width: 752, startLine: 22, height: 240 });
+
+  for (const std of ['PAL', 'NTSC'] as const) {
+    let prevW = 0;
+    let prevH = 0;
+    for (let lvl = 0; lvl <= 100; lvl++) {
+      const vp = getOverscanViewport(lvl, std);
+      assert.ok(vp.width >= prevW, `${std} width must be monotonic at level ${lvl}`);
+      assert.ok(vp.height >= prevH, `${std} height must be monotonic at level ${lvl}`);
+      assert.equal(vp.width & 3, 0);
+      assert.equal(vp.height & 1, 0);
+      assert.ok(vp.width <= MAX_FB_WIDTH && vp.height <= MAX_FB_HEIGHT);
+      assert.ok(vp.hOriginLo >= DENISE_MIN_H_LO);
+      assert.ok(vp.hOriginLo + (vp.width >>> 1) <= DENISE_MAX_H_LO);
+      prevW = vp.width;
+      prevH = vp.height;
+    }
+  }
+});
+
+test('Pixel-exact WxH overscan dimensions resolve cleanly without allocations and clamp within Denise bounds', async () => {
+  const {
+    formatOverscanSetting,
+    getOverscanViewport,
+    parseOverscanDimensionsPacked,
+  } = await import('./overscan');
+
+  assert.equal(isValidOverscanMode('704x272'), true);
+  assert.equal(isValidOverscanMode('640x200'), true);
+  assert.equal(isValidOverscanMode('752x286'), true);
+  assert.equal(isValidOverscanMode('600x256'), false);
+  assert.equal(isValidOverscanMode('704x999'), false);
+  assert.equal(isValidOverscanMode('bad'), false);
+
+  assert.equal(parseOverscanDimensionsPacked('704x272'), (704 << 16) | 272);
+  assert.equal(formatOverscanSetting(640, 256, 'PAL'), 'none');
+  assert.equal(formatOverscanSetting(640, 200, 'NTSC'), 'none');
+  assert.equal(formatOverscanSetting(703, 271, 'PAL'), '704x272');
+
+  assert.deepEqual(getOverscanViewport('704x272', 'PAL'), {
+    hOriginLo: 0x71,
+    width: 704,
+    startLine: 36,
+    height: 272,
+  });
+  assert.deepEqual(getOverscanViewport('752x286', 'PAL'), {
+    hOriginLo: 0x65,
+    width: 752,
+    startLine: 26,
+    height: 286,
+  });
+  assert.deepEqual(getOverscanViewport('704x224', 'NTSC'), {
+    hOriginLo: 0x71,
+    width: 704,
+    startLine: 32,
+    height: 224,
+  });
+  assert.deepEqual(getOverscanViewport('752x240', 'NTSC'), {
+    hOriginLo: 0x65,
+    width: 752,
+    startLine: 22,
+    height: 240,
+  });
+
+  // PAL trimmed below 256 (e.g. 640x200 for Cadaver / NTSC-window PAL games)
+  const { computeOverscanDisplayAspect, getMinOverscanHeight } = await import('./overscan');
+  assert.equal(getMinOverscanHeight('PAL'), 200);
+  assert.equal(getMinOverscanHeight('NTSC'), 200);
+  assert.equal(formatOverscanSetting(640, 200, 'PAL'), '640x200');
+  assert.deepEqual(getOverscanViewport('640x200', 'PAL'), {
+    hOriginLo: 0x81,
+    width: 640,
+    startLine: 44,
+    height: 200,
+  });
+  assert.deepEqual(getOverscanViewport('704x224', 'PAL'), {
+    hOriginLo: 0x71,
+    width: 704,
+    startLine: 44,
+    height: 224,
+  });
+  // Manual PAL <256 uses V-SIZE 4:3 stretching when Auto-Crop is off, preserving Auto-Crop PAR when on
+  assert.ok(Math.abs(computeOverscanDisplayAspect(640, 200, 'PAL', false) - 4 / 3) < 1e-6);
+  assert.ok(computeOverscanDisplayAspect(640, 200, 'PAL', true) > 1.55);
+});
+
+

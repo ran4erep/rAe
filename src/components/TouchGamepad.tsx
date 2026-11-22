@@ -147,7 +147,7 @@ export const TouchGamepad: React.FC<TouchGamepadProps> = React.memo(
           aria-label="8-позиционный джойстик"
           className={`relative rounded-full flex items-center justify-center ${
             fullscreenOverlay
-              ? 'w-32 h-32 sm:w-36 sm:h-36 bg-[#191A1D]/45 border-2 border-white/25 backdrop-blur-[2px] shadow-[0_4px_14px_rgba(0,0,0,0.45)]'
+              ? 'w-32 h-32 sm:w-36 sm:h-36 bg-[#191A1D]/80 border-2 border-[#3C3B38] shadow-[inset_0_4px_12px_rgba(0,0,0,0.85)]'
               : 'w-40 h-40 bg-[#191A1D] border-2 border-[#3C3B38] shadow-[inset_0_4px_12px_rgba(0,0,0,0.85)]'
           }`}
         >
@@ -249,9 +249,7 @@ export const TouchGamepad: React.FC<TouchGamepadProps> = React.memo(
               onMouseButton(false, undefined);
             }}
             onContextMenu={(e) => e.preventDefault()}
-            className={`flex-1 h-full rounded-[4px] text-xs font-semibold ${
-              fullscreenOverlay ? 'amiga-key-grey' : 'amiga-key-ivory'
-            }`}
+            className="flex-1 h-full rounded-[4px] text-xs font-semibold amiga-key-ivory"
           >
             LMB
           </button>
@@ -275,9 +273,7 @@ export const TouchGamepad: React.FC<TouchGamepadProps> = React.memo(
               onMouseButton(undefined, false);
             }}
             onContextMenu={(e) => e.preventDefault()}
-            className={`flex-1 h-full rounded-[4px] text-xs font-semibold ${
-              fullscreenOverlay ? 'amiga-key-grey' : 'amiga-key-ivory'
-            }`}
+            className="flex-1 h-full rounded-[4px] text-xs font-semibold amiga-key-ivory"
           >
             RMB
           </button>
@@ -300,7 +296,7 @@ export const TouchGamepad: React.FC<TouchGamepadProps> = React.memo(
           <div className="flex flex-col items-end justify-end gap-2 h-full min-h-0 pointer-events-none">
             <div
               data-testid="gamepad-vertical-keys"
-              className="pointer-events-auto flex flex-col gap-1 w-[72px] sm:w-[80px] opacity-90"
+              className="pointer-events-auto flex flex-col gap-1 w-[72px] sm:w-[80px]"
               aria-label="Дополнительные клавиши клавиатуры"
             >
               {quickKeys.map((k) => renderQuickKeyButton(k, 'w-full h-6 sm:h-7'))}

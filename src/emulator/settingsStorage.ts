@@ -1,9 +1,11 @@
-import { isValidOverscanMode } from './hardware/overscan';
+import { sanitizeCpuOverclock } from './hardware/cpuOverclock';
+import { isValidOverscanMode, normalizeOverscanMode } from './hardware/overscan';
 import {
   AmigaConfig,
   ChipRamKB,
   ChipsetModel,
   DEFAULT_AMIGA_CONFIG,
+  FastRamKB,
   FrameSkipMode,
   OverscanMode,
   SlowRamKB,
@@ -32,11 +34,11 @@ function resolveStorage(storage?: StorageLike | null): StorageLike | null {
 }
 
 function isChipset(v: unknown): v is ChipsetModel {
-  return v === 'OCS' || v === 'ECS';
+  return v === 'OCS' || v === 'ECS' || v === 'AGA';
 }
 
 function isVideoStandard(v: unknown): v is VideoStandard {
-  return v === 'PAL' || v === 'NTSC';
+  return v === 'auto' || v === 'PAL' || v === 'NTSC';
 }
 
 function isChipRamKB(v: unknown): v is ChipRamKB {
@@ -47,8 +49,8 @@ function isSlowRamKB(v: unknown): v is SlowRamKB {
   return v === 0 || v === 512;
 }
 
-function isFastRamKB(v: unknown): v is 0 | 1024 | 2048 {
-  return v === 0 || v === 1024 || v === 2048;
+function isFastRamKB(v: unknown): v is FastRamKB {
+  return v === 0 || v === 1024 || v === 2048 || v === 4096 || v === 8192;
 }
 
 function isFrameSkipMode(v: unknown): v is FrameSkipMode {
@@ -80,10 +82,13 @@ export function sanitizeAmigaConfig(
       typeof obj.audioLedFilter === 'boolean' ? obj.audioLedFilter : fallback.audioLedFilter,
     crtScanlines:
       typeof obj.crtScanlines === 'boolean' ? obj.crtScanlines : fallback.crtScanlines,
-    overscan: isValidOverscanMode(obj.overscan) ? obj.overscan : fallback.overscan,
+    overscan: isValidOverscanMode(obj.overscan)
+      ? normalizeOverscanMode(obj.overscan)
+      : fallback.overscan,
     autoCrop: typeof obj.autoCrop === 'boolean' ? obj.autoCrop : fallback.autoCrop,
     frameSkip: isFrameSkipMode(obj.frameSkip) ? obj.frameSkip : fallback.frameSkip,
     ecoCpuMode: typeof obj.ecoCpuMode === 'boolean' ? obj.ecoCpuMode : fallback.ecoCpuMode,
+    cpuOverclock: sanitizeCpuOverclock(obj.cpuOverclock, fallback.cpuOverclock),
     hapticsEnabled:
       typeof obj.hapticsEnabled === 'boolean' ? obj.hapticsEnabled : fallback.hapticsEnabled,
     floppyAudioEnabled:
@@ -95,6 +100,8 @@ export function sanitizeAmigaConfig(
       typeof obj.joystickConnected === 'boolean'
         ? obj.joystickConnected
         : fallback.joystickConnected,
+    showEmuPerf:
+      typeof obj.showEmuPerf === 'boolean' ? obj.showEmuPerf : fallback.showEmuPerf,
   };
 }
 
