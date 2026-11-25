@@ -20,6 +20,12 @@ import {
   groupArchiveTosecRows,
   searchArchiveTosecRows,
 } from '../lib/archiveTosec.mjs';
+import {
+  ARCHIVE_WHDLOAD_SOURCE_URL,
+  fetchWhdloadLetterGroups,
+  groupWhdloadRows,
+  searchWhdloadRows,
+} from '../lib/archiveWhdload.mjs';
 
 export default async function handler(req, res) {
   if (req.method === 'OPTIONS') {
@@ -39,6 +45,39 @@ export default async function handler(req, res) {
   const query = (url.searchParams.get('q') || url.searchParams.get('search') || '').trim();
   const rawPage = Number.parseInt(url.searchParams.get('page') || '1', 10);
   const page = Number.isFinite(rawPage) && rawPage >= 1 ? rawPage : 1;
+
+  if (source === 'whdload' || source === 'archive-whdload') {
+    const letter = normalizePlanetemuLetter(url.searchParams.get('letter') || '0');
+    const rawPageSize = Number.parseInt(url.searchParams.get('pageSize') || '36', 10);
+
+    try {
+      const groups = query
+        ? groupWhdloadRows(await searchWhdloadRows(query, { signal: AbortSignal.timeout(15000) }))
+        : await fetchWhdloadLetterGroups(letter, { signal: AbortSignal.timeout(15000) });
+
+      const paginated = paginatePlanetemuGroups(groups, page, rawPageSize);
+
+      sendJson(
+        req,
+        res,
+        200,
+        {
+          ok: true,
+          source: ARCHIVE_WHDLOAD_SOURCE_URL,
+          category: query ? 'search' : letter,
+          query,
+          ...paginated,
+        },
+        'public, s-maxage=600, stale-while-revalidate=1800'
+      );
+    } catch (err) {
+      sendJson(req, res, 502, {
+        ok: false,
+        error: err instanceof Error ? err.message : 'Archive.org WHDLoad upstream fetch failed',
+      });
+    }
+    return;
+  }
 
   if (source === 'archive-tosec') {
     const letter = normalizePlanetemuLetter(url.searchParams.get('letter') || '0');

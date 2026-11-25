@@ -27,7 +27,7 @@ import { HardfileController } from './hardfile';
 import { computeCpuCyclesPerScanline } from './cpuOverclock';
 import { AmigaMemory } from './memory';
 import { PaulaAudioEngine } from './audio';
-import { createBlankFormattedHdf, resizeAmigaDosHdf } from '../archives/amigaDosFs';
+import { createBlankFormattedHdf, repairAmigaDosNulFilenames, resizeAmigaDosHdf } from '../archives/amigaDosFs';
 import { buildBuiltinAdf, buildOpenKickRom, BUILTIN_DISK_CATALOG, OpenKickRuntime } from '../roms/openKickKernel';
 
 function uint8ToBase64(bytes: Uint8Array): string {
@@ -177,7 +177,14 @@ export class AmigaMachine {
 
     let cpuRef: M68000 | null = null;
     this.chipset = new AmigaChipset(initialChipRam, this.floppy, (ipl) => {
-      if (cpuRef) cpuRef.pendingIpl = ipl;
+      if (cpuRef) {
+        if (ipl > cpuRef.pendingIpl) {
+          cpuRef.iplHoldoff = cpuRef.inExec;
+        } else if (ipl < cpuRef.pendingIpl) {
+          cpuRef.iplHoldoff = false;
+        }
+        cpuRef.pendingIpl = ipl;
+      }
     });
     this.chipset.onDiskDmaStart = (wordCount, isWrite) => {
       const idx = this.floppy.drives[1].selected ? 1 : 0;
@@ -245,6 +252,10 @@ export class AmigaMachine {
     this.memory.allowUnaligned = this.cpu.is68020;
     cpuRef = this.cpu;
     this.chipset.attachCycleSource(this.cpu);
+    this.cia.attachCycleSource(this.cpu);
+    this.chipset.setCiaIrqChecker(
+      () => (this.cia.hasIrqA() ? INT_PORTS : 0) | (this.cia.hasIrqB() ? INT_EXTER : 0)
+    );
 
     // Hook 68000 RESET instruction & Expansion/OpenKick Line-A kernel calls
     this.memory.onResetInstruction = () => {
@@ -584,10 +595,12 @@ export class AmigaMachine {
     bytes: Uint8Array,
     name: string,
     resetAfter = true,
-    unit: 0 | 1 = 0
+    unit: 0 | 1 = 0,
+    preserveAutoconfig = false
   ): { ok: boolean; warning?: string; error?: string } {
+    const cleanBytes = repairAmigaDosNulFilenames(bytes);
     try {
-      this.hardfile.mountUnit(unit, bytes, name, false);
+      this.hardfile.mountUnit(unit, cleanBytes, name, false, !resetAfter && preserveAutoconfig);
     } catch (err) {
       return {
         ok: false,
@@ -746,9 +759,9 @@ export class AmigaMachine {
     for (let line = 0; line < totalLines; line++) {
       chipset.beginScanline(line, cpu.cycles, cpuCyclesPerLine);
 
-      // Phase 1 Copper: execute visible-span Copper moves up to $DB before scanline display,
-      // while deferring end-of-line modulo resets (e.g. $DC after DDFSTOP=$D8) and HBlank waits ($E0/$DF) to Phase 2
-      chipset.runCopperLine(line, 0xdb);
+      // Phase 1 Copper: execute visible-span Copper moves up to $E1 (incl. $DC/$E0 right-border splits)
+      // before scanline display, while chipset.ts defers whole-line DMA/mod/pointer writes at H >= $D0 to Phase 2
+      chipset.runCopperLine(line, 0xe1);
 
       // Authentic Agnus sprite DMA header fetch after VBlank Copper loads SPRxPTH/L
       if (line === spriteHeaderLine) {
@@ -759,18 +772,19 @@ export class AmigaMachine {
       floppy.tickScanline();
       chipset.stepDiskDma(diskDmaWords);
 
-      // Run Motorola 68000 CPU slice for this scanline
-      cpu.runCycles(cpuCyclesPerLine);
-
-      // Step CIA-A & CIA-B fractional E-clock timers (45.4 PAL / 45.5 NTSC) and HSync TOD
+      // Compute fractional E-clocks for this scanline (45.4 PAL / 45.5 NTSC) and run CPU with live CIA timer sync
       eAccum += eFrac;
       let eTicks = 45;
       if (eAccum >= 10) {
         eAccum -= 10;
         eTicks = 46;
       }
-      cia.stepEClocks(eTicks);
+      cia.beginScanline(cpu.cycles, cpuCyclesPerLine, eTicks);
+      cpu.runCycles(cpuCyclesPerLine);
+      chipset.endScanlineBlitter(isPal ? 227 : (line & 1) === 0 ? 227 : 228);
+      cia.endScanline();
       cia.onHSync();
+      chipset.stepAudioScanline(isPal ? 227 : (line & 1) === 0 ? 227 : 228);
 
       // Render visible scanline via Denise OCS/ECS (advances BPLxPT even when skipping pixels)
       chipset.renderScanline(line, renderVideo);
@@ -826,9 +840,13 @@ export class AmigaMachine {
       cia.triggerDiskIndex();
     }
 
-    // Push 20ms Paula DMA audio frame (auto-skips if muted, idle, or turbo-warped -> 0% CPU)
-    if (pushAudio && this.config.audioEnabled) {
-      this.audio.pushFrame(chipset, this.memory.chipRam);
+    // Push Paula DMA audio frame (auto-skips mixing if muted/suspended/idle; scanlines already advanced DMA/IRQs)
+    const audioStepped =
+      pushAudio && this.config.audioEnabled
+        ? this.audio.pushFrame(chipset, this.memory.chipRam, isPal)
+        : false;
+    if (!audioStepped && !chipset.audioSteppedInFrame) {
+      chipset.advanceAudioDmaSilent(isPal);
     }
 
     this.memory.advanceRtcMs(isPal ? 1000 / PAL_FPS : 1000 / NTSC_FPS);
@@ -996,6 +1014,8 @@ export class AmigaMachine {
     this.cpu.pc = state.pc & 0x00ffffff;
     this.cpu.sr = state.sr & 0xa71f;
     this.cpu.stopped = Boolean(state.stopped);
+    this.cpu.iplHoldoff = false;
+    this.cpu.inExec = false;
     if (typeof state.vbr === 'number') this.cpu.vbr = state.vbr | 0;
     if (typeof state.cacr === 'number') this.cpu.cacr = state.cacr & 0x0003;
     this.chipset.deserializeRegs(state.customRegs);
@@ -1060,6 +1080,7 @@ export class AmigaMachine {
     if (typeof state.eClockAccum === 'number') {
       this.eClockAccum = state.eClockAccum | 0;
     }
+    this.audio.resetSchedule();
     return true;
   }
 

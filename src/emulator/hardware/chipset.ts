@@ -39,6 +39,8 @@ for (let c = 0; c < 4096; c++) {
 }
 // AGA BPLCON3 PF2OF playfield 2 color table offset LUT
 const PF2OF_TABLE = new Uint8Array([0, 2, 4, 8, 16, 32, 64, 128]);
+// PUAE blit_cycle_diagram CCKs per word indexed by (BLTCON0 >>> 8) & 0x0F (USEA,USEB,USEC,USED)
+const BLIT_CCK_TABLE = new Uint8Array([2, 2, 2, 3, 3, 3, 3, 4, 2, 2, 2, 3, 3, 3, 3, 4]);
 
 export interface PaulaAudioChannel {
   lc: number;
@@ -68,6 +70,13 @@ export const INT_RBF = 1 << 11;  // Serial receive (IPL 5)
 export const INT_DSKSYN = 1 << 12; // Disk sync (IPL 5)
 export const INT_EXTER = 1 << 13; // CIA-B (IPL 6)
 export const INT_INTEN = 1 << 14; // Master IRQ enable
+
+// Zero-allocation intra-frame audio event types (recorded for PaulaAudioEngine)
+export const AUD_EVT_START = 1;
+export const AUD_EVT_STOP = 2;
+export const AUD_EVT_PER = 3;
+export const AUD_EVT_VOL = 4;
+export const AUD_EVT_LCLEN = 5;
 
 // DMACON bits
 export const DMA_AUD0 = 1 << 0;
@@ -156,6 +165,12 @@ export class AmigaChipset {
   private vertbPollAssistFrames = 0;
   private vertbPollShadow = false;
 
+  // Zero-overhead rescue for WHDLoad slaves (e.g. ReunionAGA v1.1 with CUSTOM1=1 Skip Intro)
+  // that enter the game with DMACON display/master bits disabled after setting a display Copper list.
+  private missingVideoDmaFrames = 0;
+  private hadVideoDmaSinceCopWrite = false;
+  private rescuedMissingDmaCop1lc = 0;
+
   // Copper state
   public cop1lc = 0;
   public cop2lc = 0;
@@ -167,9 +182,10 @@ export class AmigaChipset {
   public copMaskH = 0;
   public copWaiting = false;
   public copSkipNext = false;
+  private copWaitBlit = false;
   public copHpos = 0;
 
-  // Blitter state
+  // Blitter state (both instantaneous unit-test mode and scanline-incremental DMA mode)
   public bltCon0 = 0;
   public bltCon1 = 0;
   public bltAfwm = 0xffff;
@@ -187,6 +203,50 @@ export class AmigaChipset {
   public bltCdat = 0;
   public bltSizV = 0;
   public bltZero = false;
+  public bltPending = false;
+  private bltDoneCycle = 0;
+  public bltActive = false;
+  private bltIsLine = false;
+  private bltFastMode = 0; // 0 = general, 1 = clear (LF=$00 D-only), 2 = copy A->D (LF=$F0 unshifted)
+  private bltWidthWords = 0;
+  private bltRowsLeft = 0;
+  private bltWordsLeftInRow = 0;
+  private bltStep = 2;
+  private bltAmodS = 0;
+  private bltBmodS = 0;
+  private bltCmodS = 0;
+  private bltDmodS = 0;
+  private bltAOld = 0;
+  private bltBOld = 0;
+  private bltBhold = 0;
+  private bltFillCarry = 0;
+  private bltUseMask = 0;
+  private bltLf = 0;
+  private bltAsh = 0;
+  private bltBsh = 0;
+  private bltDesc = false;
+  private bltFillMode = false;
+  private bltIncFill = false;
+  private bltAccumZero = true;
+  private bltPerWordCck = 2;
+  private bltCckAccum = 0;
+  private bltLastSyncHpos = 0;
+  private bltLineBplStartH = 0;
+  private bltLineBplEndH = 0;
+  private bltLineBplSlots = 0;
+  private bltLinePixelsLeft = 0;
+  private bltLineAptErr = 0;
+  private bltLineSingleDot = false;
+  private bltLineFirstPixel = true;
+  private bltLineSign = false;
+  private bltLineAsh = 0;
+  private bltLineBsh = 0;
+  private bltLineUseC = false;
+  private bltLineUseD = false;
+  private bltLineSud = false;
+  private bltLineSul = false;
+  private bltLineAul = false;
+  private bltLineOneDot = false;
 
   // Bitplane & Display window registers (8 pointers for AGA, 6 for OCS/ECS)
   public readonly bplPt = new Uint32Array(8);
@@ -230,6 +290,33 @@ export class AmigaChipset {
   private readonly sprDmaLineActive = new Uint8Array(8); // DMA fetched DATA/DATB on current scanline
   private sprHeadersFetchedThisFrame = false;
 
+  // Zero-allocation horizontal sprite multiplexer queue (PUAE decide_sprites_3)
+  private static readonly MAX_SPR_MUX_EVENTS = 128;
+  private sprSteppedLine = -1;
+  private sprBeamHalfH = 0;
+  private sprMuxCount = 0;
+  private readonly sprMuxNum = new Uint8Array(AmigaChipset.MAX_SPR_MUX_EVENTS);
+  private readonly sprMuxPos = new Uint16Array(AmigaChipset.MAX_SPR_MUX_EVENTS);
+  private readonly sprMuxCtl = new Uint16Array(AmigaChipset.MAX_SPR_MUX_EVENTS);
+  private readonly sprMuxData = new Uint16Array(AmigaChipset.MAX_SPR_MUX_EVENTS);
+  private readonly sprMuxDatb = new Uint16Array(AmigaChipset.MAX_SPR_MUX_EVENTS);
+  private readonly sprMuxDataLo = new Uint32Array(AmigaChipset.MAX_SPR_MUX_EVENTS);
+  private readonly sprMuxDataHi = new Uint32Array(AmigaChipset.MAX_SPR_MUX_EVENTS);
+  private readonly sprMuxDatbLo = new Uint32Array(AmigaChipset.MAX_SPR_MUX_EVENTS);
+  private readonly sprMuxDatbHi = new Uint32Array(AmigaChipset.MAX_SPR_MUX_EVENTS);
+  private readonly sprMuxConsumed = new Uint8Array(AmigaChipset.MAX_SPR_MUX_EVENTS);
+
+  // Denise/Lisa Collision Detection ($098 CLXCON, $10E CLXCON2, $00E CLXDAT) & POTGO ($034)
+  public clxCon = 0;
+  public clxCon2 = 0;
+  public clxDat = 0;
+  public potGo = 0;
+  private readonly sprColMask = new Uint8Array(MAX_FB_WIDTH);
+  private readonly clxBplLine = new Uint8Array(MAX_FB_WIDTH);
+  private sprColMinSx = 0;
+  private sprColMaxSx = 0;
+  private ciaIrqChecker: (() => number) | null = null;
+
   // Floppy DMA registers (asynchronous scanline-paced Paula Disk DMA)
   public dskPt = 0;
   public dskLen = 0;
@@ -258,6 +345,34 @@ export class AmigaChipset {
     active: false,
     lastSample: 0,
   }));
+  private readonly audRawPer = new Uint32Array([400, 400, 400, 400]);
+  private readonly audDatClocksLeft = new Int32Array(4);
+  public audDatPendingMask = 0;
+  public audStartPendingMask = 0;
+  private readonly audStartClocksLeft = new Int32Array(4);
+  public readonly audClockRem = new Int32Array(4);
+  public audioSteppedInFrame = false;
+  public frameAudClocks = 0;
+  public audSawActivityInFrame = false;
+
+  // Frame-start audio snapshot + zero-alloc event ring for exact scanline-synced mixing
+  public readonly audSnapActive = new Uint8Array(4);
+  public readonly audSnapCurAddr = new Uint32Array(4);
+  public readonly audSnapWordsLeft = new Int32Array(4);
+  public readonly audSnapLc = new Uint32Array(4);
+  public readonly audSnapLen = new Int32Array(4);
+  public readonly audSnapPer = new Uint16Array(4);
+  public readonly audSnapVol = new Uint8Array(4);
+  public readonly audSnapClockRem = new Int32Array(4);
+
+  public static readonly MAX_AUD_EVENTS = 1024;
+  public readonly audEvtClock = new Int32Array(AmigaChipset.MAX_AUD_EVENTS);
+  public readonly audEvtType = new Uint8Array(AmigaChipset.MAX_AUD_EVENTS);
+  public readonly audEvtCh = new Uint8Array(AmigaChipset.MAX_AUD_EVENTS);
+  public readonly audEvtArg1 = new Int32Array(AmigaChipset.MAX_AUD_EVENTS);
+  public readonly audEvtArg2 = new Int32Array(AmigaChipset.MAX_AUD_EVENTS);
+  public readonly audEvtArg3 = new Int32Array(AmigaChipset.MAX_AUD_EVENTS);
+  public audEvtCount = 0;
 
   // Input hardware state (Port 0 Mouse, Port 1 Joystick)
   public mouseX = 0;
@@ -282,8 +397,9 @@ export class AmigaChipset {
   public viewHOriginLo = 0x81;
   // Active viewport slice into fbStorage (updated without copy only when viewport changes)
   public framebuffer: Uint32Array = this.fbStorage.subarray(0, FB_WIDTH * FB_HEIGHT);
-  // Reusable scanline pixel index scratchpad (zero GC)
+  // Reusable scanline pixel index & Dual-Playfield source scratchpads (zero GC)
   private readonly lineIndices = new Uint8Array(MAX_FB_WIDTH);
+  private readonly lineDpfSrc = new Uint8Array(MAX_FB_WIDTH);
 
   // Preallocated mid-scanline Copper palette change buffers (zero GC, 0% cost on normal scanlines)
   private static readonly MAX_MIDLINE_COLOR_CHANGES = 256;
@@ -303,6 +419,34 @@ export class AmigaChipset {
   private midlineBplamCount = 0;
   private lineStartBplam = 0;
   private inCopperVisibleSpan = false;
+  private lineDisplayPhase = false;
+
+  // Preallocated mid-scanline display/bitplane split buffers (zero GC, 0% cost on normal scanlines)
+  private static readonly MAX_LINE_SPLITS = 256;
+  private readonly splitHpos = new Uint16Array(AmigaChipset.MAX_LINE_SPLITS);
+  private readonly splitReg = new Uint16Array(AmigaChipset.MAX_LINE_SPLITS);
+  private readonly splitVal = new Uint16Array(AmigaChipset.MAX_LINE_SPLITS);
+  private lineSplitCount = 0;
+  private lineSplitLine = -1;
+  private lineStartCaptured = false;
+  private readonly lineStartBplPt = new Uint32Array(8);
+  private readonly workBplPt = new Uint32Array(8);
+  private lineStartDmacon = 0;
+  private lineStartBplCon0 = 0;
+  private lineStartBplCon1 = 0;
+  private lineStartBplCon2 = 0;
+  private lineStartBplCon3 = 0;
+  private lineStartBpl1Mod = 0;
+  private lineStartBpl2Mod = 0;
+  private lineStartDdfStrt = 0x0038;
+  private lineStartDdfStop = 0x00d0;
+  private lineStartDiwHStart = 0x81;
+  private lineStartDiwHStop = 0x1c1;
+  private lineStartDiwVStart = 0x2c;
+  private lineStartDiwVStop = 0x12c;
+  private lineStartFmode = 0;
+  private readonly splitPf1Idx = new Uint8Array(MAX_FB_WIDTH);
+  private readonly splitPf2Idx = new Uint8Array(MAX_FB_WIDTH);
 
   // Overscan state (zero heap allocations per frame)
   private readonly autoOverscan = new AutoOverscanTracker();
@@ -343,6 +487,10 @@ export class AmigaChipset {
 
   public attachCycleSource(source: CpuProbeSource): void {
     this.cycleSource = source;
+  }
+
+  public setCiaIrqChecker(fn: (() => number) | null): void {
+    this.ciaIrqChecker = fn;
   }
 
   private resetNtscDeadlockFrame(resetStreak: boolean): void {
@@ -449,11 +597,30 @@ export class AmigaChipset {
     return null;
   }
 
+  private resetScanlineEvents(line: number): void {
+    this.midlineColorCount = 0;
+    this.midlinePaletteSaved = false;
+    this.midlineBplamCount = 0;
+    this.lineStartBplam = this.chipset === 'AGA' ? ((this.bplCon4 >>> 8) & 0xff) : 0;
+    this.lineSplitCount = 0;
+    this.lineStartCaptured = false;
+    this.lineSplitLine = line;
+    this.sprSteppedLine = -1;
+    this.sprBeamHalfH = 0;
+    this.sprMuxCount = 0;
+    this.lineDisplayPhase = true;
+  }
+
   public beginScanline(line: number, startCycles: number, cycleBudget: number): void {
     this.vpos = line;
     this.hpos = 0;
     this.scanlineStartCycles = startCycles;
     this.scanlineCycleBudget = cycleBudget;
+    this.bltLastSyncHpos = 0;
+    this.resetScanlineEvents(line);
+    if (this.bltActive) {
+      this.initScanlineBlitterWindow(line);
+    }
   }
 
   public getHpos(): number {
@@ -552,6 +719,9 @@ export class AmigaChipset {
     this.vertbRamPollStreak = 0;
     this.vertbPollAssistFrames = 0;
     this.vertbPollShadow = false;
+    this.missingVideoDmaFrames = 0;
+    this.hadVideoDmaSinceCopWrite = false;
+    this.rescuedMissingDmaCop1lc = 0;
     this.lof = 1;
     this.beamCon0 = this.videoStandard === 'PAL' ? 0x0020 : 0x0000;
     this.midlineColorCount = 0;
@@ -559,12 +729,17 @@ export class AmigaChipset {
     this.midlineBplamCount = 0;
     this.lineStartBplam = 0;
     this.inCopperVisibleSpan = false;
+    this.lineDisplayPhase = false;
+    this.lineSplitCount = 0;
+    this.lineStartCaptured = false;
+    this.lineSplitLine = -1;
     this.cop1lc = 0;
     this.cop2lc = 0;
     this.copPc = 0;
     this.copCon = 0;
     this.copWaiting = false;
     this.copSkipNext = false;
+    this.copWaitBlit = false;
     this.copHpos = 0;
 
     this.bplPt.fill(0);
@@ -608,6 +783,14 @@ export class AmigaChipset {
     this.sprDmaStreaming.fill(0);
     this.sprDmaLineActive.fill(0);
     this.sprHeadersFetchedThisFrame = false;
+    this.sprSteppedLine = -1;
+    this.sprBeamHalfH = 0;
+    this.sprMuxCount = 0;
+    this.clxCon = 0;
+    this.clxCon2 = 0;
+    this.clxDat = 0;
+    this.potGo = 0;
+    this.sprColMask.fill(0);
 
     this.dskPt = 0;
     this.dskLen = 0;
@@ -632,9 +815,250 @@ export class AmigaChipset {
       ch.phase = 0;
       ch.lastSample = 0;
     }
+    this.audRawPer.fill(400);
+    this.audDatClocksLeft.fill(0);
+    this.audDatPendingMask = 0;
+    this.audStartPendingMask = 0;
+    this.audStartClocksLeft.fill(0);
+    this.audClockRem.fill(0);
+    this.audioSteppedInFrame = false;
+    this.frameAudClocks = 0;
+    this.audSawActivityInFrame = false;
+    this.audSnapActive.fill(0);
+    this.audEvtCount = 0;
 
+    this.bltZero = false;
+    this.bltPending = false;
+    this.bltDoneCycle = 0;
+    this.bltActive = false;
+    this.bltAOld = 0;
+    this.bltBOld = 0;
+    this.bltBhold = 0;
+    this.bltCckAccum = 0;
+    this.bltLastSyncHpos = 0;
     this.framebuffer.fill(0xff000000);
     this.updateIpl();
+  }
+
+  /**
+   * Advances or completes any in-flight Blitter DMA up to current scanline HPos (or cycle threshold).
+   * Zero-cost fast path (`if (!this.bltPending) return;`) when idle.
+   */
+  public syncBlitter(): void {
+    if (!this.bltPending) return;
+    if (this.bltActive) {
+      const targetHpos = this.inCopperVisibleSpan
+        ? (this.copHpos > 227 ? 227 : this.copHpos)
+        : this.getHpos();
+      this.stepBlitterToHpos(targetHpos);
+      return;
+    }
+    if (this.cycleSource === null || this.cycleSource.cycles >= this.bltDoneCycle) {
+      this.bltPending = false;
+      this.requestIrq(INT_BLIT);
+    }
+  }
+
+  /**
+   * Advances incremental Blitter DMA for the remainder of the current scanline (called once per line).
+   */
+  public endScanlineBlitter(lineCcks = 227): void {
+    if (!this.bltActive) {
+      if (this.bltPending) this.syncBlitter();
+      return;
+    }
+    this.stepBlitterToHpos(lineCcks);
+  }
+
+  private maybeBlit(): void {
+    if (!this.bltActive) return;
+    this.syncBlitter();
+    if (
+      this.bltActive &&
+      (this.dmacon & (DMA_MASTER | DMA_BLITTER)) === (DMA_MASTER | DMA_BLITTER)
+    ) {
+      this.finishBlitterImmediate();
+    }
+  }
+
+  private getWriteHpos(): number {
+    if (this.inCopperVisibleSpan) {
+      return this.copHpos >= 2 ? this.copHpos - 2 : 0;
+    }
+    if (this.lineDisplayPhase && this.scanlineCycleBudget > 0) {
+      return this.getHpos();
+    }
+    return -1;
+  }
+
+  private captureLineStartDisplay(): void {
+    this.lineStartCaptured = true;
+    this.lineStartBplPt.set(this.bplPt);
+    this.lineStartDmacon = this.dmacon;
+    this.lineStartBplCon0 = this.bplCon0;
+    this.lineStartBplCon1 = this.bplCon1;
+    this.lineStartBplCon2 = this.bplCon2;
+    this.lineStartBplCon3 = this.bplCon3;
+    this.lineStartBpl1Mod = this.bpl1Mod;
+    this.lineStartBpl2Mod = this.bpl2Mod;
+    this.lineStartDdfStrt = this.ddfStrt;
+    this.lineStartDdfStop = this.ddfStop;
+    this.lineStartDiwHStart = this.diwHStart;
+    this.lineStartDiwHStop = this.diwHStop;
+    this.lineStartDiwVStart = this.diwVStart;
+    this.lineStartDiwVStop = this.diwVStop;
+    this.lineStartFmode = this.fmode;
+  }
+
+  private recordDisplaySplit(writeHpos: number, reg: number, v: number): boolean {
+    if (writeHpos < 0) return true;
+    const effStartH = this.ddfStrt < 0x18 ? 0x18 : this.ddfStrt;
+    if (this.lineSplitCount === 0) {
+      if (writeHpos < effStartH) return true;
+      const inVert =
+        (this.vpos >= this.diwVStart || reg === 0x08e || reg === 0x1e4) &&
+        (this.vpos < this.diwVStop || reg === 0x090 || reg === 0x1e4);
+      if (!inVert && reg !== 0x096) return true;
+      this.captureLineStartDisplay();
+    } else if (writeHpos < effStartH) {
+      // Pre-DDF CPU write on a line that already has Copper splits: update lineStart directly.
+      // Return whether a later split overrides `reg` (only mutate live `this.*` if not overridden).
+      let overridden = false;
+      const n = this.lineSplitCount;
+      for (let i = 0; i < n; i++) {
+        if (this.splitReg[i] === reg) {
+          overridden = true;
+          break;
+        }
+      }
+      return !overridden;
+    }
+
+    const count = this.lineSplitCount;
+    if (count >= AmigaChipset.MAX_LINE_SPLITS) return true;
+    let ins = count;
+    while (ins > 0 && this.splitHpos[ins - 1] > writeHpos) {
+      this.splitHpos[ins] = this.splitHpos[ins - 1];
+      this.splitReg[ins] = this.splitReg[ins - 1];
+      this.splitVal[ins] = this.splitVal[ins - 1];
+      ins--;
+    }
+    this.splitHpos[ins] = writeHpos;
+    this.splitReg[ins] = reg;
+    this.splitVal[ins] = v;
+    this.lineSplitCount = count + 1;
+
+    if (ins === count) return true;
+    for (let i = ins + 1; i <= count; i++) {
+      if (this.splitReg[i] === reg) return false;
+    }
+    return true;
+  }
+
+  private recordMidlineColor(writeHpos: number, idx: number, abgr: number, c12: number, has12: boolean): boolean {
+    const pxX = ((writeHpos << 1) - this.viewHOriginLo) << 1;
+    const isAga = this.chipset === 'AGA';
+    const count = this.midlineColorCount;
+    if (pxX <= 0) {
+      if (count > 0 && this.midlinePaletteSaved) {
+        this.lineStartColorAbgr[idx] = abgr;
+        if (has12 && idx < 32) {
+          this.lineStartColorEhb[idx] = RGB12_TO_EHB32[c12];
+        }
+        for (let i = 0; i < count; i++) {
+          if (this.midlineColorIdx[i] === idx) return false;
+        }
+      }
+      return true;
+    }
+    if (count >= AmigaChipset.MAX_MIDLINE_COLOR_CHANGES) return true;
+    if (!this.midlinePaletteSaved) {
+      if (isAga) {
+        this.lineStartColorAbgr.set(this.colorAbgr);
+        this.midlineSavedCount = 256;
+      } else {
+        this.lineStartColorAbgr.set(this.colorAbgr.subarray(0, 32));
+        this.midlineSavedCount = 32;
+      }
+      this.lineStartColorEhb.set(this.colorEhbAbgr);
+      this.midlinePaletteSaved = true;
+    }
+    let ins = count;
+    while (ins > 0 && this.midlineColorX[ins - 1] > pxX) {
+      this.midlineColorX[ins] = this.midlineColorX[ins - 1];
+      this.midlineColorIdx[ins] = this.midlineColorIdx[ins - 1];
+      this.midlineColorVal[ins] = this.midlineColorVal[ins - 1];
+      ins--;
+    }
+    this.midlineColorX[ins] = pxX;
+    this.midlineColorIdx[ins] = idx;
+    this.midlineColorVal[ins] = abgr;
+    this.midlineColorCount = count + 1;
+    if (ins === count) return true;
+    for (let i = ins + 1; i <= count; i++) {
+      if (this.midlineColorIdx[i] === idx) return false;
+    }
+    return true;
+  }
+
+  private decideSpritesUntil(targetHalfH: number): void {
+    const startH = this.sprBeamHalfH;
+    if (targetHalfH <= startH) return;
+    const dmaActive = this.sprDmaLineActive;
+    const manualArmed = this.sprArmed;
+    const activeAny =
+      dmaActive[0] | manualArmed[0] |
+      dmaActive[1] | manualArmed[1] |
+      dmaActive[2] | manualArmed[2] |
+      dmaActive[3] | manualArmed[3] |
+      dmaActive[4] | manualArmed[4] |
+      dmaActive[5] | manualArmed[5] |
+      dmaActive[6] | manualArmed[6] |
+      dmaActive[7] | manualArmed[7];
+    if (activeAny !== 0) {
+      for (let s = 0; s < 8; s++) {
+        if ((dmaActive[s] | manualArmed[s]) === 0) continue;
+        const pos = this.sprPos[s];
+        const ctl = this.sprCtl[s];
+        const hLo = ((pos & 0xff) << 1) | (ctl & 1);
+        if (pos === 0 && (ctl & 0x11) === 0) continue;
+        if (hLo >= startH && hLo < targetHalfH) {
+          const n = this.sprMuxCount;
+          if (n < AmigaChipset.MAX_SPR_MUX_EVENTS) {
+            this.sprMuxNum[n] = s;
+            this.sprMuxPos[n] = pos;
+            this.sprMuxCtl[n] = ctl;
+            this.sprMuxData[n] = this.sprData[s];
+            this.sprMuxDatb[n] = this.sprDatb[s];
+            this.sprMuxDataLo[n] = this.sprDataLo[s];
+            this.sprMuxDataHi[n] = this.sprDataHi[s];
+            this.sprMuxDatbLo[n] = this.sprDatbLo[s];
+            this.sprMuxDatbHi[n] = this.sprDatbHi[s];
+            this.sprMuxCount = n + 1;
+          }
+        }
+      }
+    }
+    this.sprBeamHalfH = targetHalfH;
+  }
+
+  private scheduleBlitDone(ccks: number): void {
+    const src = this.cycleSource;
+    if (src === null) {
+      this.bltPending = false;
+      this.requestIrq(INT_BLIT);
+      return;
+    }
+    const cyclesPerCck =
+      this.scanlineCycleBudget > 0
+        ? this.scanlineCycleBudget / 227
+        : this.chipset === 'AGA'
+          ? 4
+          : 2;
+    const rawCycles = Math.round(ccks * cyclesPerCck);
+    const delayCycles = rawCycles < 24 ? 24 : rawCycles;
+    this.bltPending = true;
+    this.bltDoneCycle = src.cycles + delayCycles;
   }
 
   private readChip16(addr: number): number {
@@ -696,6 +1120,13 @@ export class AmigaChipset {
 
   public clearIrq(bits: number): void {
     this.intreq &= ~(bits & 0x3fff);
+    if (this.ciaIrqChecker !== null) {
+      this.intreq |= this.ciaIrqChecker();
+    }
+    const audBits = (bits >>> 7) & 0x0f;
+    if (audBits !== 0) {
+      this.audStartPendingMask &= ~audBits;
+    }
     this.updateIpl();
   }
 
@@ -738,9 +1169,10 @@ export class AmigaChipset {
     const reg = offset & 0x1fe;
     switch (reg) {
       case 0x002: { // DMACONR
+        this.syncBlitter();
         let val = this.dmacon & 0x07ff;
         if (this.bltZero) val |= 0x2000; // BZERO
-        // BBUSY (bit 14) is 0 because synchronous Blitter completes cleanly
+        if (this.bltPending) val |= 0x4000; // BBUSY
         return val;
       }
       case 0x004: { // VPOSR (Agnus ID + V8)
@@ -779,13 +1211,18 @@ export class AmigaChipset {
       case 0x00c: // JOY1DAT (Joystick port 2)
         if (!this.isPalTiming()) this.noteNtscInputPoll();
         return this.encodeJoy1Dat();
-      case 0x00e: // CLXDAT
-        return 0;
+      case 0x00e: { // CLXDAT (read clears collision latch)
+        const val = this.clxDat & 0x7fff;
+        this.clxDat = 0;
+        return val;
+      }
       case 0x010: // ADKCONR
         return this.adkcon & 0x7fff;
-      case 0x016: { // POTGOR / POTINP (active-low secondary mouse/joy buttons)
+      case 0x016: { // POTGOR / POTINP (active-low secondary mouse/joy buttons + POTGO output pins)
         if (!this.isPalTiming()) this.noteNtscInputPoll();
-        let val = 0x5500;
+        const outMask = this.potGo & 0xaa00;
+        const drivenMask = outMask >>> 1;
+        let val = (0x5500 & ~drivenMask) | (this.potGo & drivenMask);
         if (this.mouseRight) val &= ~0x0400;  // Port 0 RMB (bit 10)
         if (this.mouseMiddle) val &= ~0x0100; // Port 0 MMB (bit 8)
         if (this.joy1Connected && this.joy1.fire2) val &= ~0x4000;  // Port 1 Fire 2 (bit 14)
@@ -806,6 +1243,7 @@ export class AmigaChipset {
       case 0x01c: // INTENAR
         return this.intena & 0x7fff;
       case 0x01e: { // INTREQR
+        this.syncBlitter();
         const src = this.cycleSource;
         if (src !== null) {
           const pc = src.pc >>> 0;
@@ -841,32 +1279,20 @@ export class AmigaChipset {
     // Color registers $180 - $1BE (fast hot path for OCS/ECS + 256-color 24-bit banked AGA)
     if (reg >= 0x180 && reg <= 0x1be) {
       const idx = (reg - 0x180) >>> 1;
+      const writeHpos = this.getWriteHpos();
       if (this.chipset !== 'AGA') {
         const c12 = v & 0x0fff;
         const abgr = RGB12_TO_ABGR32[c12];
-        if (this.inCopperVisibleSpan) {
-          const pxX = (((this.copHpos - 2) << 1) - this.viewHOriginLo) << 1;
-          if (pxX > 0 && this.midlineColorCount < AmigaChipset.MAX_MIDLINE_COLOR_CHANGES) {
-            if (!this.midlinePaletteSaved) {
-              this.lineStartColorAbgr.set(this.colorAbgr.subarray(0, 32));
-              if ((this.bplCon0 & 0x0c00) === 0 && ((this.bplCon0 >>> 12) & 7) === 6) {
-                this.lineStartColorEhb.set(this.colorEhbAbgr);
-              }
-              this.midlinePaletteSaved = true;
-              this.midlineSavedCount = 32;
-            }
-            const n = this.midlineColorCount++;
-            this.midlineColorX[n] = pxX;
-            this.midlineColorIdx[n] = idx;
-            this.midlineColorVal[n] = abgr;
-          }
+        const applyLive = writeHpos < 0 || this.recordMidlineColor(writeHpos, idx, abgr, c12, true);
+        if (applyLive) {
+          this.colorReg[idx] = c12;
+          this.colorAbgr[idx] = abgr;
+          this.colorEhbAbgr[idx] = RGB12_TO_EHB32[c12];
         }
-        this.colorReg[idx] = c12;
-        this.colorAbgr[idx] = abgr;
-        this.colorEhbAbgr[idx] = RGB12_TO_EHB32[c12];
         return;
       }
 
+      if ((this.bplCon2 & 0x0100) !== 0) return; // AGA RDRAM=1 disables palette register writes
       const bank = (this.bplCon3 >>> 13) & 7;
       const loct = (this.bplCon3 & 0x0200) !== 0;
       const bankIdx = (bank << 5) | idx;
@@ -885,49 +1311,52 @@ export class AmigaChipset {
         r8 = (r4 << 4) | r4;
         g8 = (g4 << 4) | g4;
         b8 = (b4 << 4) | b4;
-        if (bank === 0) {
+      }
+      const c24 = ((r8 << 16) | (g8 << 8) | b8) >>> 0;
+      const abgr = (0xff000000 | (b8 << 16) | (g8 << 8) | r8) >>> 0;
+      const applyLive = writeHpos < 0 || this.recordMidlineColor(writeHpos, bankIdx, abgr, v & 0x0fff, !loct && bank === 0);
+      if (applyLive) {
+        this.colorReg24[bankIdx] = c24;
+        if (!loct && bank === 0) {
           const c12 = v & 0x0fff;
           this.colorReg[idx] = c12;
           this.colorEhbAbgr[idx] = RGB12_TO_EHB32[c12];
         }
+        this.colorAbgr[bankIdx] = abgr;
       }
-      this.colorReg24[bankIdx] = ((r8 << 16) | (g8 << 8) | b8) >>> 0;
-      const abgr = (0xff000000 | (b8 << 16) | (g8 << 8) | r8) >>> 0;
-      if (this.inCopperVisibleSpan) {
-        const pxX = (((this.copHpos - 2) << 1) - this.viewHOriginLo) << 1;
-        if (pxX > 0 && this.midlineColorCount < AmigaChipset.MAX_MIDLINE_COLOR_CHANGES) {
-          if (!this.midlinePaletteSaved) {
-            this.lineStartColorAbgr.set(this.colorAbgr);
-            const bpuNow = ((this.bplCon0 >>> 12) & 7) | ((this.bplCon0 & 0x0010) !== 0 ? 8 : 0);
-            if ((this.bplCon0 & 0x0c00) === 0 && bpuNow === 6 && (this.bplCon2 & 0x0200) === 0) {
-              this.lineStartColorEhb.set(this.colorEhbAbgr);
-            }
-            this.midlinePaletteSaved = true;
-            this.midlineSavedCount = 256;
-          }
-          const n = this.midlineColorCount++;
-          this.midlineColorX[n] = pxX;
-          this.midlineColorIdx[n] = bankIdx;
-          this.midlineColorVal[n] = abgr;
-        }
-      }
-      this.colorAbgr[bankIdx] = abgr;
       return;
     }
 
     // Bitplane pointers $0E0 - $0FE (6 planes on OCS/ECS, 8 planes on AGA)
     if (reg >= 0x0e0 && reg <= (this.chipset === 'AGA' ? 0x0fe : 0x0f6)) {
       const idx = (reg - 0x0e0) >>> 2;
-      if ((reg & 2) === 0) {
-        this.bplPt[idx] = ((v & 0x1f) << 16) | (this.bplPt[idx] & 0xffff);
-      } else {
-        this.bplPt[idx] = (this.bplPt[idx] & 0x1f0000) | (v & 0xfffe);
+      const writeHpos = this.getWriteHpos();
+      const applyLive = writeHpos < 0 || this.recordDisplaySplit(writeHpos, reg, v);
+      const isBeforeDdf = writeHpos >= 0 && this.lineSplitCount > 0 && writeHpos < (this.ddfStrt < 0x18 ? 0x18 : this.ddfStrt);
+      if (isBeforeDdf) {
+        if ((reg & 2) === 0) {
+          this.lineStartBplPt[idx] = ((v & 0x1f) << 16) | (this.lineStartBplPt[idx] & 0xffff);
+        } else {
+          this.lineStartBplPt[idx] = (this.lineStartBplPt[idx] & 0x1f0000) | (v & 0xfffe);
+        }
+      }
+      if (applyLive) {
+        if ((reg & 2) === 0) {
+          this.bplPt[idx] = ((v & 0x1f) << 16) | (this.bplPt[idx] & 0xffff);
+        } else {
+          this.bplPt[idx] = (this.bplPt[idx] & 0x1f0000) | (v & 0xfffe);
+        }
       }
       return;
     }
 
     // Sprite pointers $120 - $13E
     if (reg >= 0x120 && reg <= 0x13e) {
+      const writeHpos = this.getWriteHpos();
+      if (writeHpos >= 0x18 && this.sprSteppedLine !== this.vpos) {
+        this.stepSpritesOnLine(this.vpos);
+        this.sprSteppedLine = this.vpos;
+      }
       const idx = (reg - 0x120) >>> 2;
       if ((reg & 2) === 0) {
         this.sprPt[idx] = ((v & 0x1f) << 16) | (this.sprPt[idx] & 0xffff);
@@ -946,6 +1375,23 @@ export class AmigaChipset {
     if (reg >= 0x140 && reg <= 0x17e) {
       const idx = (reg - 0x140) >>> 3;
       const sub = (reg >>> 1) & 3;
+      const writeHpos = this.getWriteHpos();
+      if (writeHpos >= 0) {
+        if (writeHpos >= 0x18 && this.sprSteppedLine !== this.vpos) {
+          this.stepSpritesOnLine(this.vpos);
+          this.sprSteppedLine = this.vpos;
+        }
+        const writeHalfH = writeHpos << 1;
+        let targetHalfH = writeHalfH;
+        if (sub <= 1) {
+          targetHalfH = writeHalfH + 2;
+        } else if ((this.sprCtl[idx] & 1) === 0) {
+          targetHalfH = writeHalfH + 1;
+        }
+        if (targetHalfH > this.sprBeamHalfH) {
+          this.decideSpritesUntil(targetHalfH);
+        }
+      }
       if (sub === 0) {
         this.sprPos[idx] = v;
       } else if (sub === 1) {
@@ -958,15 +1404,25 @@ export class AmigaChipset {
         }
       } else if (sub === 2) {
         this.sprData[idx] = v;
-        this.sprDataLo[idx] =
-          this.chipset === 'AGA' && ((this.fmode >>> 2) & 3) !== 0 ? (v << 16) >>> 0 : v;
-        this.sprDataHi[idx] = 0;
+        if (this.chipset === 'AGA') {
+          const rep = ((v << 16) | v) >>> 0;
+          this.sprDataLo[idx] = rep;
+          this.sprDataHi[idx] = rep;
+        } else {
+          this.sprDataLo[idx] = v;
+          this.sprDataHi[idx] = 0;
+        }
         this.sprArmed[idx] = 1;
       } else {
         this.sprDatb[idx] = v;
-        this.sprDatbLo[idx] =
-          this.chipset === 'AGA' && ((this.fmode >>> 2) & 3) !== 0 ? (v << 16) >>> 0 : v;
-        this.sprDatbHi[idx] = 0;
+        if (this.chipset === 'AGA') {
+          const rep = ((v << 16) | v) >>> 0;
+          this.sprDatbLo[idx] = rep;
+          this.sprDatbHi[idx] = rep;
+        } else {
+          this.sprDatbLo[idx] = v;
+          this.sprDatbHi[idx] = 0;
+        }
       }
       return;
     }
@@ -976,17 +1432,52 @@ export class AmigaChipset {
       const chIdx = (reg - 0x0a0) >>> 4;
       const sub = reg & 0x0e;
       const ch = this.audio[chIdx];
-      if (sub === 0x00) ch.lc = ((v & 0x1f) << 16) | (ch.lc & 0xffff);
-      else if (sub === 0x02) ch.lc = (ch.lc & 0x1f0000) | (v & 0xfffe);
-      else if (sub === 0x04) ch.len = v === 0 ? 0x10000 : v;
-      else if (sub === 0x06) ch.per = v < 124 ? 124 : v;
-      else if (sub === 0x08) {
+      const runningDma = ch.active && (this.audStartPendingMask & (1 << chIdx)) === 0;
+      if (sub === 0x00) {
+        ch.lc = ((v & 0x1f) << 16) | (ch.lc & 0xffff);
+        if (runningDma) {
+          this.pushAudioEvent(AUD_EVT_LCLEN, chIdx, this.getAudioEventClock(), ch.lc, ch.len, 0);
+        }
+      } else if (sub === 0x02) {
+        ch.lc = (ch.lc & 0x1f0000) | (v & 0xfffe);
+        if (runningDma) {
+          this.pushAudioEvent(AUD_EVT_LCLEN, chIdx, this.getAudioEventClock(), ch.lc, ch.len, 0);
+        }
+      } else if (sub === 0x04) {
+        ch.len = v === 0 ? 0x10000 : v;
+        if (runningDma) {
+          this.pushAudioEvent(AUD_EVT_LCLEN, chIdx, this.getAudioEventClock(), ch.lc, ch.len, 0);
+        }
+      } else if (sub === 0x06) {
+        this.audRawPer[chIdx] = v === 0 ? 65536 : v;
+        const nextPer = v < 124 ? 124 : v;
+        if (nextPer !== ch.per) {
+          ch.per = nextPer;
+          if (runningDma) {
+            this.pushAudioEvent(AUD_EVT_PER, chIdx, this.getAudioEventClock(), nextPer, 0, 0);
+          }
+        }
+      } else if (sub === 0x08) {
         const vol = v & 0x7f;
-        ch.vol = vol > 64 ? 64 : vol;
-      }
-      else if (sub === 0x0a) {
+        const nextVol = vol > 64 ? 64 : vol;
+        if (nextVol !== ch.vol) {
+          ch.vol = nextVol;
+          if (nextVol > 0 && runningDma) {
+            this.audSawActivityInFrame = true;
+          }
+          if (runningDma) {
+            this.pushAudioEvent(AUD_EVT_VOL, chIdx, this.getAudioEventClock(), nextVol, 0, 0);
+          }
+        }
+      } else if (sub === 0x0a) {
         // Direct AUDxDAT write
         ch.lastSample = ((v << 16) >> 24);
+        if (!ch.active) {
+          // Authentic Paula behavior: writing AUDxDAT with DMA off clocks out 1 word (2 * rawPer color clocks)
+          // and fires INT_AUDx (used by audio.device with AUDxPER=1 to enter its Level 4 ISR).
+          this.audDatClocksLeft[chIdx] = this.audRawPer[chIdx] << 1;
+          this.audDatPendingMask |= 1 << chIdx;
+        }
       }
       return;
     }
@@ -1025,18 +1516,19 @@ export class AmigaChipset {
         this.lof = (v >>> 15) & 1;
         break;
       case 0x02e: this.copCon = v & 0x0002; break;
-      case 0x040: this.bltCon0 = v; break;
-      case 0x042: this.bltCon1 = v; break;
-      case 0x044: this.bltAfwm = v; break;
-      case 0x046: this.bltAlwm = v; break;
-      case 0x048: this.bltCpt = ((v & 0x1f) << 16) | (this.bltCpt & 0xffff); break;
-      case 0x04a: this.bltCpt = (this.bltCpt & 0x1f0000) | (v & 0xfffe); break;
-      case 0x04c: this.bltBpt = ((v & 0x1f) << 16) | (this.bltBpt & 0xffff); break;
-      case 0x04e: this.bltBpt = (this.bltBpt & 0x1f0000) | (v & 0xfffe); break;
-      case 0x050: this.bltApt = ((v & 0x1f) << 16) | (this.bltApt & 0xffff); break;
-      case 0x052: this.bltApt = (this.bltApt & 0x1f0000) | (v & 0xfffe); break;
-      case 0x054: this.bltDpt = ((v & 0x1f) << 16) | (this.bltDpt & 0xffff); break;
-      case 0x056: this.bltDpt = (this.bltDpt & 0x1f0000) | (v & 0xfffe); break;
+      case 0x034: this.potGo = v & 0xff00; break;
+      case 0x040: this.maybeBlit(); this.bltCon0 = v; break;
+      case 0x042: this.maybeBlit(); this.bltCon1 = v; break;
+      case 0x044: this.maybeBlit(); this.bltAfwm = v; break;
+      case 0x046: this.maybeBlit(); this.bltAlwm = v; break;
+      case 0x048: this.maybeBlit(); this.bltCpt = ((v & 0x1f) << 16) | (this.bltCpt & 0xffff); break;
+      case 0x04a: this.maybeBlit(); this.bltCpt = (this.bltCpt & 0x1f0000) | (v & 0xfffe); break;
+      case 0x04c: this.maybeBlit(); this.bltBpt = ((v & 0x1f) << 16) | (this.bltBpt & 0xffff); break;
+      case 0x04e: this.maybeBlit(); this.bltBpt = (this.bltBpt & 0x1f0000) | (v & 0xfffe); break;
+      case 0x050: this.maybeBlit(); this.bltApt = ((v & 0x1f) << 16) | (this.bltApt & 0xffff); break;
+      case 0x052: this.maybeBlit(); this.bltApt = (this.bltApt & 0x1f0000) | (v & 0xfffe); break;
+      case 0x054: this.maybeBlit(); this.bltDpt = ((v & 0x1f) << 16) | (this.bltDpt & 0xffff); break;
+      case 0x056: this.maybeBlit(); this.bltDpt = (this.bltDpt & 0x1f0000) | (v & 0xfffe); break;
       case 0x058: { // BLTSIZE (starts OCS Blitter immediately)
         const height = (v >>> 6) & 0x3ff;
         const width = v & 0x3f;
@@ -1044,11 +1536,13 @@ export class AmigaChipset {
         break;
       }
       case 0x05a: // ECS/AGA BLTCON0L (updates low minterm byte without clobbering channel/shift bits)
+        this.maybeBlit();
         if (this.chipset !== 'OCS') {
           this.bltCon0 = (this.bltCon0 & 0xff00) | (v & 0xff);
         }
         break;
       case 0x05c: // ECS BLTSIZV
+        this.maybeBlit();
         this.bltSizV = v & 0x7fff;
         break;
       case 0x05e: { // ECS BLTSIZH (triggers ECS Blitter)
@@ -1057,18 +1551,38 @@ export class AmigaChipset {
         this.runBlitter(w === 0 ? 2048 : w, h === 0 ? 32768 : h);
         break;
       }
-      case 0x060: this.bltCmod = (v << 16) >> 16; break;
-      case 0x062: this.bltBmod = (v << 16) >> 16; break;
-      case 0x064: this.bltAmod = (v << 16) >> 16; break;
-      case 0x066: this.bltDmod = (v << 16) >> 16; break;
-      case 0x070: this.bltCdat = v; break;
-      case 0x072: this.bltBdat = v; break;
-      case 0x074: this.bltAdat = v; break;
+      case 0x060: this.maybeBlit(); this.bltCmod = ((v & 0xfffe) << 16) >> 16; break;
+      case 0x062: this.maybeBlit(); this.bltBmod = ((v & 0xfffe) << 16) >> 16; break;
+      case 0x064: this.maybeBlit(); this.bltAmod = ((v & 0xfffe) << 16) >> 16; break;
+      case 0x066: this.maybeBlit(); this.bltDmod = ((v & 0xfffe) << 16) >> 16; break;
+      case 0x070: this.maybeBlit(); this.bltCdat = v; break;
+      case 0x072: {
+        this.maybeBlit();
+        this.bltBdat = v;
+        const bsh = (this.bltCon1 >>> 12) & 0xf;
+        if (bsh === 0) this.bltBhold = v;
+        else if ((this.bltCon1 & 2) !== 0) this.bltBhold = (v << bsh) & 0xffff;
+        else this.bltBhold = (v >>> bsh) & 0xffff;
+        break;
+      }
+      case 0x074: this.maybeBlit(); this.bltAdat = v; break;
       case 0x07e: this.dskSync = v; break;
       case 0x080: this.cop1lc = ((v & 0x1f) << 16) | (this.cop1lc & 0xffff); break;
       case 0x082:
         this.cop1lc = (this.cop1lc & 0x1f0000) | (v & 0xfffe);
         this.lastCop1lcWritePc = this.cycleSource !== null ? this.cycleSource.pc & 0x00ffffff : 0;
+        if (
+          this.lastCop1lcWritePc > 0 &&
+          this.lastCop1lcWritePc < 0xf80000 &&
+          this.cop1lc >= 0x200 &&
+          this.cop1lc !== this.rescuedMissingDmaCop1lc
+        ) {
+          this.hadVideoDmaSinceCopWrite =
+            (this.dmacon & (DMA_MASTER | DMA_COPPER | DMA_BITPLANE)) !== 0;
+          if (this.hadVideoDmaSinceCopWrite) {
+            this.missingVideoDmaFrames = 0;
+          }
+        }
         break;
       case 0x084: this.cop2lc = ((v & 0x1f) << 16) | (this.cop2lc & 0xffff); break;
       case 0x086: this.cop2lc = (this.cop2lc & 0x1f0000) | (v & 0xfffe); break;
@@ -1076,31 +1590,99 @@ export class AmigaChipset {
         this.copPc = this.cop1lc;
         this.copWaiting = false;
         this.copSkipNext = false;
+        this.copWaitBlit = false;
         break;
       case 0x08a: // COPJMP2
         this.copPc = this.cop2lc;
         this.copWaiting = false;
         this.copSkipNext = false;
+        this.copWaitBlit = false;
         break;
-      case 0x08e:
-        this.diwStrt = v;
-        this.diwVStart = (v >>> 8) & 0xff;
-        this.diwHStart = v & 0xff;
-        break;
-      case 0x090: {
-        this.diwStop = v;
-        this.ntscDiwStopWritten = true;
-        const vs = (v >>> 8) & 0xff;
-        this.diwVStop = (vs & 0x80) === 0 ? (vs | 0x100) : vs;
-        this.diwHStop = (v & 0xff) | 0x100;
+      case 0x08e: {
+        if (this.bltActive) this.syncBlitter();
+        const wh = this.getWriteHpos();
+        const applyLive = wh < 0 || this.recordDisplaySplit(wh, 0x08e, v);
+        if (wh >= 0 && this.lineSplitCount > 0 && wh < (this.ddfStrt < 0x18 ? 0x18 : this.ddfStrt)) {
+          this.lineStartDiwVStart = (v >>> 8) & 0xff;
+          this.lineStartDiwHStart = v & 0xff;
+        }
+        if (applyLive) {
+          this.diwStrt = v;
+          this.diwVStart = (v >>> 8) & 0xff;
+          this.diwHStart = v & 0xff;
+          if (this.chipset !== 'OCS') {
+            this.diwHigh &= ~0x0027;
+            this.regs[0x1e4 >>> 1] = this.diwHigh;
+          }
+          if (this.bltActive) this.initScanlineBlitterWindow(this.vpos);
+        }
         break;
       }
-      case 0x092: this.ddfStrt = v & (this.chipset !== 'OCS' ? 0x01fc : 0x00fc); break;
-      case 0x094: this.ddfStop = v & (this.chipset !== 'OCS' ? 0x01fc : 0x00fc); break;
+      case 0x090: {
+        if (this.bltActive) this.syncBlitter();
+        this.ntscDiwStopWritten = true;
+        const wh = this.getWriteHpos();
+        const applyLive = wh < 0 || this.recordDisplaySplit(wh, 0x090, v);
+        const vs = (v >>> 8) & 0xff;
+        const v8 = (vs & 0x80) === 0 ? 0x100 : 0;
+        if (wh >= 0 && this.lineSplitCount > 0 && wh < (this.ddfStrt < 0x18 ? 0x18 : this.ddfStrt)) {
+          this.lineStartDiwVStop = vs | v8;
+          this.lineStartDiwHStop = (v & 0xff) | 0x100;
+        }
+        if (applyLive) {
+          this.diwStop = v;
+          this.diwVStop = vs | v8;
+          this.diwHStop = (v & 0xff) | 0x100;
+          if (this.chipset !== 'OCS') {
+            this.diwHigh = (this.diwHigh & ~0x2700) | 0x2000 | v8;
+            this.regs[0x1e4 >>> 1] = this.diwHigh;
+          }
+          if (this.bltActive) this.initScanlineBlitterWindow(this.vpos);
+        }
+        break;
+      }
+      case 0x092: {
+        if (this.bltActive) this.syncBlitter();
+        const masked = v & (this.chipset !== 'OCS' ? 0x01fe : 0x00fc);
+        const wh = this.getWriteHpos();
+        const applyLive = wh < 0 || this.recordDisplaySplit(wh, 0x092, masked);
+        if (wh >= 0 && this.lineSplitCount > 0 && wh < (this.ddfStrt < 0x18 ? 0x18 : this.ddfStrt)) {
+          this.lineStartDdfStrt = masked;
+        }
+        if (applyLive) {
+          this.ddfStrt = masked;
+          if (this.bltActive) this.initScanlineBlitterWindow(this.vpos);
+        }
+        break;
+      }
+      case 0x094: {
+        if (this.bltActive) this.syncBlitter();
+        const masked = v & (this.chipset !== 'OCS' ? 0x01fe : 0x00fc);
+        const wh = this.getWriteHpos();
+        const applyLive = wh < 0 || this.recordDisplaySplit(wh, 0x094, masked);
+        if (wh >= 0 && this.lineSplitCount > 0 && wh < (this.ddfStrt < 0x18 ? 0x18 : this.ddfStrt)) {
+          this.lineStartDdfStop = masked;
+        }
+        if (applyLive) {
+          this.ddfStop = masked;
+          if (this.bltActive) this.initScanlineBlitterWindow(this.vpos);
+        }
+        break;
+      }
       case 0x096: { // DMACON
+        if (this.bltActive) this.syncBlitter();
+        const wh = this.getWriteHpos();
+        if (wh >= 0) {
+          this.recordDisplaySplit(wh, 0x096, v);
+          if (this.lineSplitCount > 0 && wh < (this.ddfStrt < 0x18 ? 0x18 : this.ddfStrt)) {
+            if (v & 0x8000) this.lineStartDmacon |= v & 0x07ff;
+            else this.lineStartDmacon &= ~(v & 0x07ff);
+          }
+        }
         const prev = this.dmacon;
         if (v & 0x8000) this.dmacon |= v & 0x07ff;
         else this.dmacon &= ~(v & 0x07ff);
+        if (this.bltActive) this.initScanlineBlitterWindow(this.vpos);
         const wrPc = this.cycleSource !== null ? this.cycleSource.pc & 0x00ffffff : 0;
         this.lastDmaconWriteVal = v;
         this.lastDmaconWriteResult = this.dmacon;
@@ -1113,7 +1695,12 @@ export class AmigaChipset {
           this.ramDmaconHistIdx = (slot + 1) & (AmigaChipset.REG_HIST_CAP - 1);
           this.ramDmaconWriteCount++;
         }
-        // Trigger audio channel DMA reload on rising edge
+        if ((this.dmacon & (DMA_MASTER | DMA_COPPER | DMA_BITPLANE)) !== 0) {
+          this.hadVideoDmaSinceCopWrite = true;
+          this.missingVideoDmaFrames = 0;
+        }
+        // Trigger audio channel DMA reload on rising edge (startup INT_AUDx fires ~1 scanline later
+        // when Paula completes the first DMA fetch slot, so an immediate INTREQ clear after DMACON does not lose it).
         const master = (this.dmacon & DMA_MASTER) !== 0;
         for (let i = 0; i < 4; i++) {
           const bit = 1 << i;
@@ -1125,14 +1712,28 @@ export class AmigaChipset {
             ch.wordsLeft = ch.len;
             ch.phase = 0;
             ch.active = true;
-            this.requestIrq(INT_AUD0 << i);
+            this.audClockRem[i] = 0;
+            this.audDatPendingMask &= ~bit;
+            this.audStartPendingMask |= bit;
+            this.audStartClocksLeft[i] = 227 + this.getHpos();
           } else if (!nowOn) {
+            if (ch.active && (this.audStartPendingMask & bit) === 0) {
+              this.pushAudioEvent(AUD_EVT_STOP, i, this.getAudioEventClock(), 0, 0, 0);
+              // Authentic Paula 010/011 -> 000 exit: disabling active audio DMA finishes the current word
+              // (2 * rawPer color clocks) and asserts INT_AUDx (used by ProTracker/PS3M/Worms DC stop-wait loops).
+              this.audDatClocksLeft[i] = this.audRawPer[i] << 1;
+              this.audDatPendingMask |= bit;
+            }
             ch.active = false;
+            this.audStartPendingMask &= ~bit;
+            this.audStartClocksLeft[i] = 0;
           }
         }
         break;
       }
+      case 0x098: this.clxCon = v; break;
       case 0x09a: // INTENA
+        this.syncBlitter();
         if (v & 0x8000) this.intena |= v & 0x7fff;
         else this.intena &= ~(v & 0x7fff);
         {
@@ -1157,13 +1758,17 @@ export class AmigaChipset {
         this.updateIpl();
         break;
       case 0x09c: // INTREQ
+        this.syncBlitter();
         if (v & 0x8000) {
           this.intreq |= v & 0x3fff;
         } else {
           this.intreq &= ~(v & 0x3fff);
+          if (this.ciaIrqChecker !== null) {
+            this.intreq |= this.ciaIrqChecker();
+          }
           if (this.vertbPollShadow && (v & INT_VERTB) !== 0) {
-            const wrPc = this.cycleSource !== null ? this.cycleSource.pc >>> 0 : 0;
-            if (wrPc < 0xf80000) {
+            const src = this.cycleSource;
+            if (src !== null && (src.pc >>> 0) < 0xf80000 && (src.sr & 0x0700) < 0x0300) {
               this.vertbPollShadow = false;
               if (this.vertbPollAssistFrames > 0 && this.vertbPollAssistFrames < 16) {
                 this.vertbPollAssistFrames = 16;
@@ -1182,29 +1787,93 @@ export class AmigaChipset {
           this.dskDmaNeedSync = false;
         }
         break;
-      case 0x100: this.bplCon0 = v; break;
-      case 0x102: this.bplCon1 = v; break;
-      case 0x104: this.bplCon2 = v; break;
-      case 0x106: if (this.chipset !== 'OCS') this.bplCon3 = v; break;
-      case 0x108: this.bpl1Mod = (v << 16) >> 16; break;
-      case 0x10a: this.bpl2Mod = (v << 16) >> 16; break;
+      case 0x100: {
+        if (this.bltActive) this.syncBlitter();
+        const wh = this.getWriteHpos();
+        const applyLive = wh < 0 || this.recordDisplaySplit(wh, 0x100, v);
+        if (wh >= 0 && this.lineSplitCount > 0 && wh < (this.ddfStrt < 0x18 ? 0x18 : this.ddfStrt)) {
+          this.lineStartBplCon0 = v;
+        }
+        if (applyLive) {
+          this.bplCon0 = v;
+          if (this.bltActive) this.initScanlineBlitterWindow(this.vpos);
+        }
+        break;
+      }
+      case 0x102: {
+        const wh = this.getWriteHpos();
+        const applyLive = wh < 0 || this.recordDisplaySplit(wh, 0x102, v);
+        if (wh >= 0 && this.lineSplitCount > 0 && wh < (this.ddfStrt < 0x18 ? 0x18 : this.ddfStrt)) {
+          this.lineStartBplCon1 = v;
+        }
+        if (applyLive) this.bplCon1 = v;
+        break;
+      }
+      case 0x104: {
+        const wh = this.getWriteHpos();
+        const applyLive = wh < 0 || this.recordDisplaySplit(wh, 0x104, v);
+        if (wh >= 0 && this.lineSplitCount > 0 && wh < (this.ddfStrt < 0x18 ? 0x18 : this.ddfStrt)) {
+          this.lineStartBplCon2 = v;
+        }
+        if (applyLive) this.bplCon2 = v;
+        break;
+      }
+      case 0x106:
+        if (this.chipset !== 'OCS') {
+          const wh = this.getWriteHpos();
+          const applyLive = wh < 0 || this.recordDisplaySplit(wh, 0x106, v);
+          if (wh >= 0 && this.lineSplitCount > 0 && wh < (this.ddfStrt < 0x18 ? 0x18 : this.ddfStrt)) {
+            this.lineStartBplCon3 = v;
+          }
+          if (applyLive) this.bplCon3 = v;
+        }
+        break;
+      case 0x108: {
+        const mod = ((v & 0xfffe) << 16) >> 16;
+        const wh = this.getWriteHpos();
+        const applyLive = wh < 0 || this.recordDisplaySplit(wh, 0x108, v);
+        if (wh >= 0 && this.lineSplitCount > 0 && wh < (this.ddfStrt < 0x18 ? 0x18 : this.ddfStrt)) {
+          this.lineStartBpl1Mod = mod;
+        }
+        if (applyLive) this.bpl1Mod = mod;
+        break;
+      }
+      case 0x10a: {
+        const mod = ((v & 0xfffe) << 16) >> 16;
+        const wh = this.getWriteHpos();
+        const applyLive = wh < 0 || this.recordDisplaySplit(wh, 0x10a, v);
+        if (wh >= 0 && this.lineSplitCount > 0 && wh < (this.ddfStrt < 0x18 ? 0x18 : this.ddfStrt)) {
+          this.lineStartBpl2Mod = mod;
+        }
+        if (applyLive) this.bpl2Mod = mod;
+        break;
+      }
       case 0x10c:
         if (this.chipset === 'AGA') {
-          if (this.inCopperVisibleSpan) {
+          const wh = this.getWriteHpos();
+          if (wh >= 0) {
             const prevBplam = (this.bplCon4 >>> 8) & 0xff;
             const nextBplam = (v >>> 8) & 0xff;
             if (nextBplam !== prevBplam) {
-              const pxX = (((this.copHpos - 2) << 1) - this.viewHOriginLo) << 1;
+              const pxX = ((wh << 1) - this.viewHOriginLo) << 1;
               if (pxX > 0 && this.midlineBplamCount < AmigaChipset.MAX_MIDLINE_BPLAM_CHANGES) {
                 if (!this.midlinePaletteSaved) {
                   this.lineStartColorAbgr.set(this.colorAbgr);
+                  this.lineStartColorEhb.set(this.colorEhbAbgr);
                   this.midlinePaletteSaved = true;
                   this.midlineSavedCount = 256;
                 }
-                const n = this.midlineBplamCount++;
-                this.midlineBplamX[n] = pxX;
-                this.midlineBplamVal[n] = nextBplam;
-              } else if (pxX <= 0 && this.midlineBplamCount === 0) {
+                const cnt = this.midlineBplamCount;
+                let ins = cnt;
+                while (ins > 0 && this.midlineBplamX[ins - 1] > pxX) {
+                  this.midlineBplamX[ins] = this.midlineBplamX[ins - 1];
+                  this.midlineBplamVal[ins] = this.midlineBplamVal[ins - 1];
+                  ins--;
+                }
+                this.midlineBplamX[ins] = pxX;
+                this.midlineBplamVal[ins] = nextBplam;
+                this.midlineBplamCount = cnt + 1;
+              } else if (pxX <= 0) {
                 this.lineStartBplam = nextBplam;
               }
             }
@@ -1212,25 +1881,246 @@ export class AmigaChipset {
           this.bplCon4 = v;
         }
         break;
+      case 0x10e: // ECS/AGA CLXCON2
+        if (this.chipset !== 'OCS') this.clxCon2 = v;
+        break;
       case 0x1dc: // ECS/AGA BEAMCON0
         if (this.chipset !== 'OCS') {
           this.beamCon0 = v;
         }
         break;
-      case 0x1e4:
-        this.diwHigh = v;
-        if (this.chipset !== 'OCS') {
-          this.diwVStart = ((this.diwStrt >>> 8) & 0xff) | ((v & 0x07) << 8);
-          this.diwHStart = (this.diwStrt & 0xff) | ((v & 0x20) << 3);
-          this.diwVStop = ((this.diwStop >>> 8) & 0xff) | (v & 0x0700);
-          this.diwHStop = (this.diwStop & 0xff) | ((v & 0x2000) >>> 5);
+      case 0x1e4: {
+        if (this.bltActive) this.syncBlitter();
+        const wh = this.getWriteHpos();
+        const applyLive = wh < 0 || this.recordDisplaySplit(wh, 0x1e4, v);
+        if (wh >= 0 && this.chipset !== 'OCS' && this.lineSplitCount > 0 && wh < (this.ddfStrt < 0x18 ? 0x18 : this.ddfStrt)) {
+          this.lineStartDiwVStart = (this.lineStartDiwVStart & 0xff) | ((v & 0x07) << 8);
+          this.lineStartDiwHStart = (this.lineStartDiwHStart & 0xff) | ((v & 0x20) << 3);
+          this.lineStartDiwVStop = (this.lineStartDiwVStop & 0xff) | (v & 0x0700);
+          this.lineStartDiwHStop = (this.lineStartDiwHStop & 0xff) | ((v & 0x2000) >>> 5);
+        }
+        if (applyLive) {
+          this.diwHigh = v;
+          if (this.chipset !== 'OCS') {
+            this.diwVStart = ((this.diwStrt >>> 8) & 0xff) | ((v & 0x07) << 8);
+            this.diwHStart = (this.diwStrt & 0xff) | ((v & 0x20) << 3);
+            this.diwVStop = ((this.diwStop >>> 8) & 0xff) | (v & 0x0700);
+            this.diwHStop = (this.diwStop & 0xff) | ((v & 0x2000) >>> 5);
+          }
+          if (this.bltActive) this.initScanlineBlitterWindow(this.vpos);
         }
         break;
+      }
       case 0x1fc: // AGA FMODE
         if (this.chipset === 'AGA') {
-          this.fmode = v;
+          if (this.bltActive) this.syncBlitter();
+          const wh = this.getWriteHpos();
+          const applyLive = wh < 0 || this.recordDisplaySplit(wh, 0x1fc, v);
+          if (wh >= 0 && this.lineSplitCount > 0 && wh < (this.ddfStrt < 0x18 ? 0x18 : this.ddfStrt)) {
+            this.lineStartFmode = v;
+          }
+          if (applyLive) {
+            this.fmode = v;
+            if (this.bltActive) this.initScanlineBlitterWindow(this.vpos);
+          }
         }
         break;
+    }
+  }
+
+  public stepAudDatPending(clocksPerLine = 227): void {
+    let mask = this.audDatPendingMask;
+    if (mask === 0) return;
+    let irqBits = 0;
+    for (let i = 0; i < 4; i++) {
+      const bit = 1 << i;
+      if ((mask & bit) === 0) continue;
+      const rem = this.audDatClocksLeft[i] - clocksPerLine;
+      if (rem <= 0) {
+        this.audDatClocksLeft[i] = 0;
+        mask &= ~bit;
+        if (!this.audio[i].active) {
+          irqBits |= INT_AUD0 << i;
+        }
+      } else {
+        this.audDatClocksLeft[i] = rem;
+      }
+    }
+    this.audDatPendingMask = mask;
+    if (irqBits !== 0) {
+      this.requestIrq(irqBits);
+    }
+  }
+
+  private getAudioEventClock(): number {
+    return this.frameAudClocks + this.getHpos();
+  }
+
+  private pushAudioEvent(
+    type: number,
+    chIdx: number,
+    clock: number,
+    arg1: number,
+    arg2: number,
+    arg3: number
+  ): void {
+    let idx = this.audEvtCount;
+    if (idx >= AmigaChipset.MAX_AUD_EVENTS) return;
+    while (idx > 0 && this.audEvtClock[idx - 1] > clock) {
+      this.audEvtClock[idx] = this.audEvtClock[idx - 1];
+      this.audEvtType[idx] = this.audEvtType[idx - 1];
+      this.audEvtCh[idx] = this.audEvtCh[idx - 1];
+      this.audEvtArg1[idx] = this.audEvtArg1[idx - 1];
+      this.audEvtArg2[idx] = this.audEvtArg2[idx - 1];
+      this.audEvtArg3[idx] = this.audEvtArg3[idx - 1];
+      idx--;
+    }
+    this.audEvtClock[idx] = clock;
+    this.audEvtType[idx] = type;
+    this.audEvtCh[idx] = chIdx;
+    this.audEvtArg1[idx] = arg1;
+    this.audEvtArg2[idx] = arg2;
+    this.audEvtArg3[idx] = arg3;
+    this.audEvtCount++;
+  }
+
+  /**
+   * Scanline-level Paula audio & DMA step (zero heap allocations, ~1ns fast exit when idle).
+   * Delivers DMACON startup INT_AUDx after ~1 scanline, advances curAddr/wordsLeft on exact
+   * scanlines so mid-frame wraparounds, short buffers, and re-triggers fire INT_AUDx on time.
+   */
+  public stepAudioScanline(clocksPerLine = 227): void {
+    this.audioSteppedInFrame = true;
+    const lineStartClock = this.frameAudClocks;
+    const lineEndClock = lineStartClock + clocksPerLine;
+    this.frameAudClocks = lineEndClock;
+
+    const dmaAudioOn = (this.dmacon & (DMA_MASTER | 0x0f)) > DMA_MASTER;
+    if ((this.audDatPendingMask | this.audStartPendingMask) === 0 && !dmaAudioOn) {
+      return;
+    }
+
+    if (this.audDatPendingMask !== 0) {
+      this.stepAudDatPending(clocksPerLine);
+    }
+
+    let irqBits = 0;
+    let startMask = this.audStartPendingMask;
+    const mask = this.chipMask;
+
+    for (let i = 0; i < 4; i++) {
+      const bit = 1 << i;
+      const ch = this.audio[i];
+      if (!ch.active) continue;
+
+      let rem: number;
+      if ((startMask & bit) !== 0) {
+        const remStart = this.audStartClocksLeft[i] - clocksPerLine;
+        if (remStart > 0) {
+          this.audStartClocksLeft[i] = remStart;
+          continue;
+        }
+        this.audStartClocksLeft[i] = 0;
+        startMask &= ~bit;
+        irqBits |= INT_AUD0 << i;
+        const startClock = lineEndClock + remStart; // exact sub-line clock when startup completes
+        if (ch.vol > 0) this.audSawActivityInFrame = true;
+        this.pushAudioEvent(
+          AUD_EVT_START,
+          i,
+          startClock,
+          ch.curAddr,
+          ch.wordsLeft,
+          ((ch.per & 0xffff) << 7) | (ch.vol & 0x7f)
+        );
+        if (ch.lc !== ch.curAddr || ch.len !== ch.wordsLeft) {
+          this.pushAudioEvent(AUD_EVT_LCLEN, i, startClock, ch.lc, ch.len, 0);
+        }
+        rem = -remStart;
+      } else {
+        rem = this.audClockRem[i] + clocksPerLine;
+      }
+
+      const effPer = ch.per < 124 ? 124 : ch.per;
+      if (rem >= effPer) {
+        let samples = 1;
+        rem -= effPer;
+        if (rem >= effPer) {
+          const extra = (rem / effPer) | 0;
+          samples += extra;
+          rem -= extra * effPer;
+        }
+        const prevOdd = ch.curAddr & 1;
+        const wordsDone = (prevOdd + samples) >>> 1;
+        const newOdd = (prevOdd + samples) & 1;
+        if (wordsDone < ch.wordsLeft) {
+          ch.wordsLeft -= wordsDone;
+          ch.curAddr = (ch.curAddr + samples) & mask;
+        } else {
+          const afterFirst = wordsDone - ch.wordsLeft;
+          const len = ch.len > 0 ? ch.len : 1;
+          const intoLoop = afterFirst % len;
+          ch.wordsLeft = len - intoLoop;
+          ch.curAddr = (ch.lc + (intoLoop << 1) + newOdd) & mask;
+          irqBits |= INT_AUD0 << i;
+        }
+      }
+      this.audClockRem[i] = rem;
+    }
+
+    this.audStartPendingMask = startMask;
+    if (irqBits !== 0) {
+      this.requestIrq(irqBits);
+    }
+  }
+
+  /**
+   * Advances one active Paula DMA channel mathematically in O(1) without mixing PCM samples.
+   * Keeps INT_AUDx buffer-completion interrupts running when WebAudio is muted/suspended or channel vol === 0.
+   */
+  public advanceAudioChannelSilent(chIdx: number, isPal = true): void {
+    const ch = this.audio[chIdx];
+    if (!ch.active) return;
+    const clocksPerFrame = isPal ? 3546895 / 50 : 3579545 / 59.94006;
+    const effPer = ch.per < 124 ? 124 : ch.per;
+    const totalPhase = ch.phase + clocksPerFrame / effPer;
+    const samples = totalPhase | 0;
+    ch.phase = totalPhase - samples;
+    if (samples <= 0) return;
+
+    const wordsDone = ((ch.curAddr & 1) + samples) >>> 1;
+    const newOdd = (ch.curAddr + samples) & 1;
+    const mask = this.chipMask;
+    if (wordsDone < ch.wordsLeft) {
+      ch.wordsLeft -= wordsDone;
+      ch.curAddr = (ch.curAddr + samples) & mask;
+    } else {
+      const afterFirstWrap = wordsDone - ch.wordsLeft;
+      const len = ch.len > 0 ? ch.len : 1;
+      const intoLoop = afterFirstWrap % len;
+      ch.wordsLeft = len - intoLoop;
+      ch.curAddr = (ch.lc + (intoLoop << 1) + newOdd) & mask;
+      this.requestIrq(INT_AUD0 << chIdx);
+    }
+  }
+
+  public advanceAudioDmaSilent(isPal = true): void {
+    if ((this.dmacon & (DMA_MASTER | 0x0f)) <= DMA_MASTER && this.audStartPendingMask === 0) return;
+    if (this.audStartPendingMask !== 0) {
+      let irqBits = 0;
+      for (let i = 0; i < 4; i++) {
+        if ((this.audStartPendingMask & (1 << i)) !== 0) {
+          this.audStartClocksLeft[i] = 0;
+          irqBits |= INT_AUD0 << i;
+        }
+      }
+      this.audStartPendingMask = 0;
+      if (irqBits !== 0) this.requestIrq(irqBits);
+    }
+    for (let c = 0; c < 4; c++) {
+      if (this.audio[c].active) {
+        this.advanceAudioChannelSilent(c, isPal);
+      }
     }
   }
 
@@ -1295,38 +2185,366 @@ export class AmigaChipset {
     }
   }
 
-  /**
-   * OCS/ECS Blitter Line-Draw Mode (BLTCON1 bit 0 = 1).
-   * Used by Kickstart graphics.library Draw()/AreaDraw() (Workbench hand logo) and vector games.
-   */
-  private runBlitterLine(lengthPixels: number): void {
-    const con0 = this.bltCon0;
-    const con1 = this.bltCon1;
-    const useC = (con0 & 0x0200) !== 0;
-    const useD = (con0 & 0x0100) !== 0;
-    const lf = con0 & 0xff;
+  private initScanlineBlitterWindow(line: number): void {
+    if (
+      (this.dmacon & (DMA_MASTER | DMA_BITPLANE)) !== (DMA_MASTER | DMA_BITPLANE) ||
+      line < this.diwVStart ||
+      line >= this.diwVStop
+    ) {
+      this.bltLineBplStartH = 0;
+      this.bltLineBplEndH = 0;
+      this.bltLineBplSlots = 0;
+      return;
+    }
+    const isAga = this.chipset === 'AGA';
+    const bpuRaw = ((this.bplCon0 >>> 12) & 7) | (isAga && (this.bplCon0 & 0x0010) !== 0 ? 8 : 0);
+    const bpu = bpuRaw > 8 ? 8 : bpuRaw;
+    if (bpu === 0) {
+      this.bltLineBplStartH = 0;
+      this.bltLineBplEndH = 0;
+      this.bltLineBplSlots = 0;
+      return;
+    }
+    const hires = (this.bplCon0 & 0x8000) !== 0;
+    const shres = isAga && (this.bplCon0 & 0x0040) !== 0;
+    const bplFmode = isAga ? (this.fmode & 3) : 0;
+    const fShift = bplFmode === 3 ? 2 : bplFmode !== 0 ? 1 : 0;
+    const effDdfStop = this.ddfStop > 0x00d8 ? 0x00d8 : this.ddfStop;
+    if (effDdfStop < this.ddfStrt) {
+      this.bltLineBplStartH = 0;
+      this.bltLineBplEndH = 0;
+      this.bltLineBplSlots = 0;
+      return;
+    }
+    const ddfSpan = effDdfStop - this.ddfStrt;
+    let numBytes: number;
+    let unitCcks: number;
+    let fetchUnits: number;
+    if (bplFmode === 0) {
+      unitCcks = 8;
+      fetchUnits = ((ddfSpan + 7) >>> 3) + 1;
+      const maxU = 28;
+      if (fetchUnits > maxU) fetchUnits = maxU;
+      const wordsPerLine = shres
+        ? Math.min(104, fetchUnits << 2)
+        : hires
+          ? Math.min(52, fetchUnits << 1)
+          : Math.min(28, fetchUnits);
+      numBytes = wordsPerLine << 1;
+    } else if (bplFmode === 3) {
+      unitCcks = shres ? 8 : hires ? 16 : 32;
+      fetchUnits = shres
+        ? ((ddfSpan + 7) >>> 3) + 1
+        : hires
+          ? ((ddfSpan + 15) >>> 4) + 1
+          : ((ddfSpan + 31) >>> 5) + 1;
+      const maxBytes = shres ? 224 : hires ? 112 : 56;
+      const b = fetchUnits << 3;
+      numBytes = b > maxBytes ? maxBytes : b;
+      fetchUnits = numBytes >>> 3;
+    } else {
+      unitCcks = shres ? 8 : hires ? 8 : 16;
+      fetchUnits = shres
+        ? ((ddfSpan + 7) >>> 3) + 1
+        : hires
+          ? ((ddfSpan + 7) >>> 3) + 1
+          : ((ddfSpan + 15) >>> 4) + 1;
+      const maxBytes = shres ? 224 : hires ? 112 : 56;
+      const b = shres ? (fetchUnits << 3) : (fetchUnits << 2);
+      numBytes = b > maxBytes ? maxBytes : b;
+      fetchUnits = shres ? (numBytes >>> 3) : (numBytes >>> 2);
+    }
+    let slots = (numBytes >>> (1 + fShift)) * bpu;
+    if (slots > 220) slots = 220;
+    this.bltLineBplStartH = this.ddfStrt;
+    const endH = this.ddfStrt + fetchUnits * unitCcks;
+    this.bltLineBplEndH = endH > 0xe2 ? 0xe2 : endH;
+    this.bltLineBplSlots = slots;
+  }
 
-    let ash = (con0 >>> 12) & 0xf;
-    let bsh = (con1 >>> 12) & 0xf;
-    let sign = (con1 & 0x0040) !== 0;
-    const sud = (con1 & 0x0010) !== 0; // 1 = X major, 0 = Y major
-    const sul = (con1 & 0x0008) !== 0; // Minor axis sign (1 = negative)
-    const aul = (con1 & 0x0004) !== 0; // Major axis sign (1 = negative)
-    const oneDot = (con1 & 0x0002) !== 0; // SING: one dot per scanline for Area Fill
+  private stepBlitterToHpos(targetHpos: number): void {
+    if (!this.bltActive) return;
+    const deltaH = targetHpos - this.bltLastSyncHpos;
+    if (deltaH <= 0) return;
+    const prevH = this.bltLastSyncHpos;
+    this.bltLastSyncHpos = targetHpos;
+    if ((this.dmacon & (DMA_MASTER | DMA_BLITTER)) !== (DMA_MASTER | DMA_BLITTER)) return;
 
-    let apt = (this.bltApt << 16) >> 16; // 16-bit signed Bresenham error term
-    const amod = this.bltAmod; // 4*dy - 4*dx (diagonal step)
-    const bmod = this.bltBmod; // 4*dy (straight step)
-    const cmod = this.bltCmod; // Bitplane row width in bytes
-    let cpt = this.bltCpt & this.chipMask;
-    let dpt = this.bltDpt & this.chipMask;
+    let freeCcks = deltaH;
+    if (this.bltLineBplSlots > 0 && this.bltLineBplEndH > this.bltLineBplStartH) {
+      const o0 = prevH > this.bltLineBplStartH ? prevH : this.bltLineBplStartH;
+      const o1 = targetHpos < this.bltLineBplEndH ? targetHpos : this.bltLineBplEndH;
+      if (o1 > o0) {
+        const span = this.bltLineBplEndH - this.bltLineBplStartH;
+        let bplUsed = Math.floor(((o1 - o0) * this.bltLineBplSlots) / span);
+        if (bplUsed > o1 - o0) bplUsed = o1 - o0;
+        freeCcks -= bplUsed;
+      }
+    }
+    let sysCcks = 10;
+    if (this.dskDmaActive) sysCcks += 3;
+    if ((this.dmacon & (DMA_MASTER | DMA_SPRITE)) === (DMA_MASTER | DMA_SPRITE)) sysCcks += 8;
+    freeCcks -= ((deltaH * sysCcks) / 227) | 0;
+    if ((this.dmacon & 0x0400) === 0 && freeCcks > 1) {
+      // BLTPRI=0 yields a small share of free Chip bus slots to CPU
+      freeCcks = ((freeCcks * 4) / 5) | 0;
+    }
+    if (freeCcks <= 0) return;
+
+    this.bltCckAccum += freeCcks;
+    this.advanceBlitterCcks();
+  }
+
+  private advanceBlitterCcks(): void {
+    if (!this.bltActive) return;
+    if (this.bltIsLine) {
+      const pixels = (this.bltCckAccum / 4) | 0;
+      if (pixels <= 0) return;
+      const runPx = pixels < this.bltLinePixelsLeft ? pixels : this.bltLinePixelsLeft;
+      this.bltCckAccum -= runPx * 4;
+      this.stepBlitterLinePixels(runPx);
+      if (this.bltLinePixelsLeft <= 0) {
+        this.bltApt = this.bltLineAptErr & 0xffff;
+        this.bltDpt = this.bltCpt;
+        this.bltCon0 = (this.bltCon0 & 0x0fff) | (this.bltLineAsh << 12);
+        this.bltCon1 = (this.bltCon1 & 0x0fbf) | (this.bltLineBsh << 12) | (this.bltLineSign ? 0x0040 : 0);
+        this.bltZero = this.bltAccumZero;
+        this.bltActive = false;
+        this.bltPending = false;
+        this.bltCckAccum = 0;
+        this.requestIrq(INT_BLIT);
+      }
+      return;
+    }
+
+    const perWord = this.bltPerWordCck;
+    let wordsBudget = (this.bltCckAccum / perWord) | 0;
+    if (wordsBudget <= 0) return;
+
+    const mask = this.chipMask;
+    const step = this.bltStep;
+    let wordsDone = 0;
+
+    if (this.bltFastMode === 1) {
+      let dpt = this.bltDpt;
+      const dmod = this.bltDmodS;
+      while (wordsBudget > 0 && this.bltRowsLeft > 0) {
+        const take = wordsBudget < this.bltWordsLeftInRow ? wordsBudget : this.bltWordsLeftInRow;
+        for (let i = 0; i < take; i++) {
+          this.writeChip16(dpt, 0);
+          dpt = (dpt + step) & mask;
+        }
+        wordsDone += take;
+        wordsBudget -= take;
+        this.bltWordsLeftInRow -= take;
+        if (this.bltWordsLeftInRow === 0) {
+          dpt = (dpt + dmod) & mask;
+          this.bltRowsLeft--;
+          this.bltWordsLeftInRow = this.bltWidthWords;
+        }
+      }
+      this.bltDpt = dpt;
+    } else if (this.bltFastMode === 2) {
+      let apt = this.bltApt;
+      let dpt = this.bltDpt;
+      const amod = this.bltAmodS;
+      const dmod = this.bltDmodS;
+      let allZero = this.bltAccumZero;
+      while (wordsBudget > 0 && this.bltRowsLeft > 0) {
+        const take = wordsBudget < this.bltWordsLeftInRow ? wordsBudget : this.bltWordsLeftInRow;
+        for (let i = 0; i < take; i++) {
+          const w = this.readChip16(apt);
+          if (w !== 0) allZero = false;
+          this.writeChip16(dpt, w);
+          apt = (apt + step) & mask;
+          dpt = (dpt + step) & mask;
+        }
+        wordsDone += take;
+        wordsBudget -= take;
+        this.bltWordsLeftInRow -= take;
+        if (this.bltWordsLeftInRow === 0) {
+          apt = (apt + amod) & mask;
+          dpt = (dpt + dmod) & mask;
+          this.bltRowsLeft--;
+          this.bltWordsLeftInRow = this.bltWidthWords;
+        }
+      }
+      this.bltApt = apt;
+      this.bltDpt = dpt;
+      this.bltAccumZero = allZero;
+    } else {
+      const useA = (this.bltUseMask & 8) !== 0;
+      const useB = (this.bltUseMask & 4) !== 0;
+      const useC = (this.bltUseMask & 2) !== 0;
+      const useD = (this.bltUseMask & 1) !== 0;
+      const lf = this.bltLf;
+      const ash = this.bltAsh;
+      const bsh = this.bltBsh;
+      const desc = this.bltDesc;
+      const fillMode = this.bltFillMode;
+      const incFill = this.bltIncFill;
+      const afwm = this.bltAfwm;
+      const alwm = this.bltAlwm;
+      const amod = this.bltAmodS;
+      const bmod = this.bltBmodS;
+      const cmod = this.bltCmodS;
+      const dmod = this.bltDmodS;
+      let apt = this.bltApt;
+      let bpt = this.bltBpt;
+      let cpt = this.bltCpt;
+      let dpt = this.bltDpt;
+      let aOld = this.bltAOld;
+      let bOld = this.bltBOld;
+      let fillCarry = this.bltFillCarry;
+      let allZero = this.bltAccumZero;
+
+      while (wordsBudget > 0 && this.bltRowsLeft > 0) {
+        const take = wordsBudget < this.bltWordsLeftInRow ? wordsBudget : this.bltWordsLeftInRow;
+        for (let i = 0; i < take; i++) {
+          const isFirst = this.bltWordsLeftInRow === this.bltWidthWords;
+          const isLast = this.bltWordsLeftInRow === 1;
+          let aRaw = this.bltAdat;
+          if (useA) {
+            aRaw = this.readChip16(apt);
+            apt = (apt + step) & mask;
+          }
+          if (isFirst) aRaw &= afwm;
+          if (isLast) aRaw &= alwm;
+
+          let aVal: number;
+          if (ash === 0) {
+            aVal = aRaw;
+          } else if (desc) {
+            aVal = ((aRaw << ash) | (aOld >>> (16 - ash))) & 0xffff;
+          } else {
+            aVal = ((aRaw >>> ash) | (aOld << (16 - ash))) & 0xffff;
+          }
+          aOld = aRaw;
+
+          let bVal: number;
+          if (useB) {
+            const bRaw = this.readChip16(bpt);
+            bpt = (bpt + step) & mask;
+            if (bsh === 0) {
+              bVal = bRaw;
+            } else if (desc) {
+              bVal = ((bRaw << bsh) | (bOld >>> (16 - bsh))) & 0xffff;
+            } else {
+              bVal = ((bRaw >>> bsh) | (bOld << (16 - bsh))) & 0xffff;
+            }
+            bOld = bRaw;
+            this.bltBhold = bVal;
+          } else {
+            bVal = this.bltBhold;
+          }
+
+          let cVal = this.bltCdat;
+          if (useC) {
+            cVal = this.readChip16(cpt);
+            cpt = (cpt + step) & mask;
+          }
+
+          let dVal = 0;
+          if (lf === 0xca) {
+            dVal = (aVal & bVal) | (~aVal & cVal);
+          } else if (lf === 0xfc) {
+            dVal = aVal | bVal;
+          } else if (lf === 0xf0) {
+            dVal = aVal;
+          } else if (lf === 0xcc) {
+            dVal = bVal;
+          } else if (lf === 0xaa) {
+            dVal = cVal;
+          } else if (lf === 0xfa) {
+            dVal = aVal | cVal;
+          } else {
+            if (lf & 0x01) dVal |= ~aVal & ~bVal & ~cVal;
+            if (lf & 0x02) dVal |= ~aVal & ~bVal & cVal;
+            if (lf & 0x04) dVal |= ~aVal & bVal & ~cVal;
+            if (lf & 0x08) dVal |= ~aVal & bVal & cVal;
+            if (lf & 0x10) dVal |= aVal & ~bVal & ~cVal;
+            if (lf & 0x20) dVal |= aVal & ~bVal & cVal;
+            if (lf & 0x40) dVal |= aVal & bVal & ~cVal;
+            if (lf & 0x80) dVal |= aVal & bVal & cVal;
+          }
+          dVal &= 0xffff;
+
+          if (fillMode) {
+            let filled = 0;
+            for (let bit = 0; bit < 16; bit++) {
+              const b = (dVal >>> bit) & 1;
+              const outBit = incFill ? (fillCarry | b) : (fillCarry ^ b);
+              fillCarry ^= b;
+              if (outBit) filled |= 1 << bit;
+            }
+            dVal = filled;
+          }
+
+          if (dVal !== 0) allZero = false;
+          if (useD) {
+            this.writeChip16(dpt, dVal);
+            dpt = (dpt + step) & mask;
+          }
+          this.bltWordsLeftInRow--;
+        }
+        wordsDone += take;
+        wordsBudget -= take;
+        if (this.bltWordsLeftInRow === 0) {
+          if (useA) apt = (apt + amod) & mask;
+          if (useB) bpt = (bpt + bmod) & mask;
+          if (useC) cpt = (cpt + cmod) & mask;
+          if (useD) dpt = (dpt + dmod) & mask;
+          this.bltRowsLeft--;
+          this.bltWordsLeftInRow = this.bltWidthWords;
+          fillCarry = (this.bltCon1 & 0x0004) !== 0 ? 1 : 0;
+        }
+      }
+      this.bltApt = apt;
+      this.bltBpt = bpt;
+      this.bltCpt = cpt;
+      this.bltDpt = dpt;
+      this.bltAOld = aOld;
+      this.bltBOld = bOld;
+      this.bltFillCarry = fillCarry;
+      this.bltAccumZero = allZero;
+    }
+
+    this.bltCckAccum -= wordsDone * perWord;
+    if (this.bltRowsLeft <= 0) {
+      this.bltZero = this.bltAccumZero;
+      this.bltActive = false;
+      this.bltPending = false;
+      this.bltCckAccum = 0;
+      this.requestIrq(INT_BLIT);
+    }
+  }
+
+  private stepBlitterLinePixels(count: number): void {
+    const lf = this.bltLf;
+    const amod = this.bltAmod;
+    const bmod = this.bltBmod;
+    const cmod = this.bltCmod;
     const aMask = this.bltAdat & this.bltAfwm;
     const bTex = this.bltBdat;
+    const mask = this.chipMask;
+    const useC = this.bltLineUseC;
+    const useD = this.bltLineUseD;
+    const sud = this.bltLineSud;
+    const sul = this.bltLineSul;
+    const aul = this.bltLineAul;
+    const oneDot = this.bltLineOneDot;
 
-    let allZero = true;
-    let singleDotPlotted = false;
+    let ash = this.bltLineAsh;
+    let bsh = this.bltLineBsh;
+    let sign = this.bltLineSign;
+    let apt = this.bltLineAptErr;
+    let cpt = this.bltCpt;
+    let dpt = this.bltDpt;
+    let allZero = this.bltAccumZero;
+    let singleDotPlotted = this.bltLineSingleDot;
+    let firstPixel = this.bltLineFirstPixel;
 
-    for (let i = 0; i < lengthPixels; i++) {
+    for (let i = 0; i < count; i++) {
       const cVal = useC ? this.readChip16(cpt) : this.bltCdat;
       const aVal = oneDot && singleDotPlotted ? 0 : ((aMask >>> ash) & 0xffff);
       const bVal = ((bTex >>> bsh) & 1) !== 0 ? 0xffff : 0x0000;
@@ -1350,7 +2568,7 @@ export class AmigaChipset {
 
       if (dVal !== 0) allZero = false;
       if (useD) {
-        this.writeChip16(i === 0 ? dpt : cpt, dVal);
+        this.writeChip16(firstPixel ? dpt : cpt, dVal);
       }
       if (oneDot) singleDotPlotted = true;
 
@@ -1377,50 +2595,118 @@ export class AmigaChipset {
         ash++;
         if (ash >= 16) {
           ash = 0;
-          cpt = (cpt + 2) & this.chipMask;
+          cpt = (cpt + 2) & mask;
         }
       } else if (stepX < 0) {
         ash--;
         if (ash < 0) {
           ash = 15;
-          cpt = (cpt - 2) & this.chipMask;
+          cpt = (cpt - 2) & mask;
         }
       }
 
       if (stepY > 0) {
-        cpt = (cpt + cmod) & this.chipMask;
+        cpt = (cpt + cmod) & mask;
         singleDotPlotted = false;
       } else if (stepY < 0) {
-        cpt = (cpt - cmod) & this.chipMask;
+        cpt = (cpt - cmod) & mask;
         singleDotPlotted = false;
       }
-      if (i === 0) dpt = cpt;
+      if (firstPixel) {
+        dpt = cpt;
+        firstPixel = false;
+      }
     }
 
-    this.bltApt = apt & 0xffff;
+    this.bltLineAsh = ash;
+    this.bltLineBsh = bsh;
+    this.bltLineSign = sign;
+    this.bltLineAptErr = apt;
     this.bltCpt = cpt;
-    this.bltDpt = cpt;
-    this.bltCon0 = (con0 & 0x0fff) | (ash << 12);
-    this.bltCon1 = (con1 & 0x0fbf) | (bsh << 12) | (sign ? 0x0040 : 0);
-    this.bltZero = allZero;
-    this.requestIrq(INT_BLIT);
+    this.bltDpt = dpt;
+    this.bltAccumZero = allZero;
+    this.bltLineSingleDot = singleDotPlotted;
+    this.bltLineFirstPixel = firstPixel;
+    this.bltLinePixelsLeft -= count;
+  }
+
+  private finishBlitterImmediate(): void {
+    while (this.bltActive) {
+      this.bltCckAccum = 0x100000;
+      this.advanceBlitterCcks();
+    }
   }
 
   /**
-   * High-speed OCS/ECS Blitter (supports Line-Draw Mode, all 256 minterms, A/B barrel shifts,
-   * first/last word masks, descending mode, area fill, and fast common paths).
+   * OCS/ECS Blitter Line-Draw Mode (BLTCON1 bit 0 = 1).
+   * Used by Kickstart graphics.library Draw()/AreaDraw() (Workbench hand logo) and vector games.
+   */
+  private runBlitterLine(lengthPixels: number, incremental: boolean): void {
+    const con0 = this.bltCon0;
+    const con1 = this.bltCon1;
+    this.bltIsLine = true;
+    this.bltLf = con0 & 0xff;
+    this.bltLineUseC = (con0 & 0x0200) !== 0;
+    this.bltLineUseD = (con0 & 0x0100) !== 0;
+    this.bltLineAsh = (con0 >>> 12) & 0xf;
+    this.bltLineBsh = (con1 >>> 12) & 0xf;
+    this.bltLineSign = (con1 & 0x0040) !== 0;
+    this.bltLineSud = (con1 & 0x0010) !== 0;
+    this.bltLineSul = (con1 & 0x0008) !== 0;
+    this.bltLineAul = (con1 & 0x0004) !== 0;
+    this.bltLineOneDot = (con1 & 0x0002) !== 0;
+    this.bltLineAptErr = (this.bltApt << 16) >> 16;
+    this.bltCpt = this.bltCpt & this.chipMask;
+    this.bltDpt = this.bltDpt & this.chipMask;
+    this.bltAccumZero = true;
+    this.bltLineSingleDot = false;
+    this.bltLineFirstPixel = true;
+    this.bltLinePixelsLeft = lengthPixels;
+
+    if (incremental) {
+      this.bltActive = true;
+      this.bltPending = true;
+      this.bltCckAccum = 0;
+      this.bltLastSyncHpos = this.inCopperVisibleSpan
+        ? (this.copHpos > 227 ? 227 : this.copHpos)
+        : this.getHpos();
+      this.initScanlineBlitterWindow(this.vpos);
+      return;
+    }
+
+    this.stepBlitterLinePixels(lengthPixels);
+    this.bltApt = this.bltLineAptErr & 0xffff;
+    this.bltDpt = this.bltCpt;
+    this.bltCon0 = (con0 & 0x0fff) | (this.bltLineAsh << 12);
+    this.bltCon1 = (con1 & 0x0fbf) | (this.bltLineBsh << 12) | (this.bltLineSign ? 0x0040 : 0);
+    this.bltZero = this.bltAccumZero;
+    this.scheduleBlitDone(lengthPixels * 4);
+  }
+
+  /**
+   * High-speed OCS/ECS/AGA Blitter (supports Line-Draw Mode, all 256 minterms, A/B barrel shifts,
+   * first/last word masks, descending mode, area fill, and incremental DMA pacing during scanlines).
    */
   public runBlitter(widthWords: number, heightLines: number): void {
+    if (this.bltActive) {
+      this.finishBlitterImmediate();
+    } else {
+      this.syncBlitter();
+    }
+    this.bltPending = false;
+    const incremental = this.scanlineCycleBudget > 0;
     const con0 = this.bltCon0;
     const con1 = this.bltCon1;
     if ((con1 & 0x0001) !== 0) {
-      this.runBlitterLine(heightLines);
+      this.runBlitterLine(heightLines, incremental);
       return;
     }
-    const useA = (con0 & 0x0800) !== 0;
-    const useB = (con0 & 0x0400) !== 0;
-    const useC = (con0 & 0x0200) !== 0;
-    const useD = (con0 & 0x0100) !== 0;
+
+    const useMask = (con0 >>> 8) & 0x0f;
+    const useA = (useMask & 8) !== 0;
+    const useB = (useMask & 4) !== 0;
+    const useC = (useMask & 2) !== 0;
+    const useD = (useMask & 1) !== 0;
     const lf = con0 & 0xff;
     const ash = (con0 >>> 12) & 0xf;
     const bsh = (con1 >>> 12) & 0xf;
@@ -1428,18 +2714,57 @@ export class AmigaChipset {
     const fillMode = (con1 & 0x0018) !== 0;
     const step = desc ? -2 : 2;
     const modSign = desc ? -1 : 1;
+    const amod = this.bltAmod * modSign;
+    const bmod = this.bltBmod * modSign;
+    const cmod = this.bltCmod * modSign;
+    const dmod = this.bltDmod * modSign;
+    let perWord = BLIT_CCK_TABLE[useMask];
+    if (fillMode && useD && !useC) perWord++;
+
+    if (incremental) {
+      this.bltIsLine = false;
+      this.bltUseMask = useMask;
+      this.bltLf = lf;
+      this.bltAsh = ash;
+      this.bltBsh = bsh;
+      this.bltDesc = desc;
+      this.bltFillMode = fillMode;
+      this.bltIncFill = (con1 & 0x0008) !== 0;
+      this.bltStep = step;
+      this.bltAmodS = amod;
+      this.bltBmodS = bmod;
+      this.bltCmodS = cmod;
+      this.bltDmodS = dmod;
+      this.bltWidthWords = widthWords;
+      this.bltRowsLeft = heightLines;
+      this.bltWordsLeftInRow = widthWords;
+      this.bltAOld = 0;
+      this.bltBOld = 0;
+      this.bltFillCarry = (con1 & 0x0004) !== 0 ? 1 : 0;
+      this.bltAccumZero = true;
+      this.bltPerWordCck = perWord;
+      this.bltFastMode =
+        lf === 0x00 && useD && !useA && !useB && !useC && !fillMode
+          ? 1
+          : lf === 0xf0 && useA && useD && !useB && !useC && ash === 0 && !fillMode && this.bltAfwm === 0xffff && this.bltAlwm === 0xffff
+            ? 2
+            : 0;
+      this.bltActive = true;
+      this.bltPending = true;
+      this.bltCckAccum = 0;
+      this.bltLastSyncHpos = this.inCopperVisibleSpan
+        ? (this.copHpos > 227 ? 227 : this.copHpos)
+        : this.getHpos();
+      this.initScanlineBlitterWindow(this.vpos);
+      return;
+    }
 
     let apt = this.bltApt;
     let bpt = this.bltBpt;
     let cpt = this.bltCpt;
     let dpt = this.bltDpt;
-    const amod = this.bltAmod * modSign;
-    const bmod = this.bltBmod * modSign;
-    const cmod = this.bltCmod * modSign;
-    const dmod = this.bltDmod * modSign;
     const afwm = this.bltAfwm;
     const alwm = this.bltAlwm;
-
     let allZero = true;
 
     // Fast path 1: Clear memory (lf == 0x00, useD only)
@@ -1453,7 +2778,7 @@ export class AmigaChipset {
       }
       this.bltDpt = dpt;
       this.bltZero = true;
-      this.requestIrq(INT_BLIT);
+      this.scheduleBlitDone(widthWords * heightLines * perWord);
       return;
     }
 
@@ -1473,7 +2798,7 @@ export class AmigaChipset {
       this.bltApt = apt;
       this.bltDpt = dpt;
       this.bltZero = allZero;
-      this.requestIrq(INT_BLIT);
+      this.scheduleBlitDone(widthWords * heightLines * perWord);
       return;
     }
 
@@ -1503,20 +2828,22 @@ export class AmigaChipset {
         }
         aOld = aRaw;
 
-        let bRaw = this.bltBdat;
-        if (useB) {
-          bRaw = this.readChip16(bpt);
-          bpt = (bpt + step) & this.chipMask;
-        }
         let bVal: number;
-        if (bsh === 0) {
-          bVal = bRaw;
-        } else if (desc) {
-          bVal = (((bRaw << bsh) | (bOld >>> (16 - bsh))) & 0xffff);
+        if (useB) {
+          const bRaw = this.readChip16(bpt);
+          bpt = (bpt + step) & this.chipMask;
+          if (bsh === 0) {
+            bVal = bRaw;
+          } else if (desc) {
+            bVal = (((bRaw << bsh) | (bOld >>> (16 - bsh))) & 0xffff);
+          } else {
+            bVal = (((bRaw >>> bsh) | (bOld << (16 - bsh))) & 0xffff);
+          }
+          bOld = bRaw;
+          this.bltBhold = bVal;
         } else {
-          bVal = (((bRaw >>> bsh) | (bOld << (16 - bsh))) & 0xffff);
+          bVal = this.bltBhold;
         }
-        bOld = bRaw;
 
         let cVal = this.bltCdat;
         if (useC) {
@@ -1578,7 +2905,7 @@ export class AmigaChipset {
     this.bltCpt = cpt;
     this.bltDpt = dpt;
     this.bltZero = allZero;
-    this.requestIrq(INT_BLIT);
+    this.scheduleBlitDone(widthWords * heightLines * perWord);
   }
 
   /**
@@ -1620,6 +2947,7 @@ export class AmigaChipset {
     this.copPc = this.cop1lc;
     this.copWaiting = false;
     this.copSkipNext = false;
+    this.copWaitBlit = false;
     this.copHpos = 0;
     this.sprHeadersFetchedThisFrame = false;
     this.sprDmaOn.fill(0);
@@ -1630,6 +2958,28 @@ export class AmigaChipset {
     this.frameDiwMaxV = 0;
     this.frameDiwMinH = 0x3ff;
     this.frameDiwMaxH = 0;
+
+    // Capture frame-start audio state for exact scanline-synced mixing (zero allocations)
+    this.audioSteppedInFrame = false;
+    this.frameAudClocks = 0;
+    this.audEvtCount = 0;
+    let sawActive = false;
+    for (let i = 0; i < 4; i++) {
+      const ch = this.audio[i];
+      const running = ch.active && (this.audStartPendingMask & (1 << i)) === 0;
+      this.audSnapActive[i] = running ? 1 : 0;
+      if (running) {
+        this.audSnapCurAddr[i] = ch.curAddr;
+        this.audSnapWordsLeft[i] = ch.wordsLeft;
+        this.audSnapLc[i] = ch.lc;
+        this.audSnapLen[i] = ch.len;
+        this.audSnapPer[i] = ch.per < 124 ? 124 : ch.per;
+        this.audSnapVol[i] = ch.vol;
+        this.audSnapClockRem[i] = this.audClockRem[i];
+        if (ch.vol > 0) sawActive = true;
+      }
+    }
+    this.audSawActivityInFrame = sawActive;
   }
 
   /**
@@ -1657,6 +3007,32 @@ export class AmigaChipset {
     } else {
       this.vertbRamPollStreak = 0;
     }
+
+    if (
+      !this.hadVideoDmaSinceCopWrite &&
+      (this.dmacon & (DMA_MASTER | DMA_COPPER | DMA_BITPLANE)) === 0 &&
+      this.lastCop1lcWritePc > 0 &&
+      this.lastCop1lcWritePc < 0xf80000 &&
+      this.cop1lc >= 0x200 &&
+      this.cop1lc !== this.rescuedMissingDmaCop1lc &&
+      src !== null &&
+      (src.pc >>> 0) < 0xf80000 &&
+      ((this.dmacon & 0x000f) !== 0 || (this.intena & INT_INTEN) !== 0)
+    ) {
+      const frames = ++this.missingVideoDmaFrames;
+      const threshold = (this.dmacon & 0x000f) !== 0 ? 15 : 60;
+      if (frames >= threshold) {
+        if (this.hasValidDisplayCopperList(this.cop1lc)) {
+          this.rescuedMissingDmaCop1lc = this.cop1lc;
+          this.writeReg16(0x096, 0x83e0);
+        } else {
+          this.missingVideoDmaFrames = 0;
+        }
+      }
+    } else {
+      this.missingVideoDmaFrames = 0;
+    }
+
     if (this.overscanMode !== 'auto') return;
     if (
       this.autoOverscan.update(
@@ -1703,6 +3079,33 @@ export class AmigaChipset {
     } else {
       this.sprDmaOn.fill(0);
     }
+  }
+
+  private hasValidDisplayCopperList(addr: number): boolean {
+    if ((addr & 1) !== 0 || addr < 0x200 || addr >= this.chipMask - 8) return false;
+    let p = addr;
+    let displayMoves = 0;
+    for (let i = 0; i < 48; i++) {
+      const ir1 = this.readChip16(p);
+      const ir2 = this.readChip16(p + 2);
+      p = (p + 4) & this.chipMask;
+      if (ir1 === 0xffff && ir2 === 0xfffe) {
+        return i > 0 && displayMoves >= 3;
+      }
+      if ((ir1 & 1) === 0) {
+        const reg = ir1 & 0x01fe;
+        if (reg < 0x040) return false;
+        if (
+          (reg >= 0x08e && reg <= 0x10c) ||
+          (reg >= 0x120 && reg <= 0x13e) ||
+          (reg >= 0x180 && reg <= 0x1be) ||
+          reg === 0x1fc
+        ) {
+          displayMoves++;
+        }
+      }
+    }
+    return displayMoves >= 3;
   }
 
   private consumeDuplicatePalWrapWaits(): void {
@@ -1787,16 +3190,14 @@ export class AmigaChipset {
       }
       const ddfSpan = effDdfStop - this.ddfStrt;
       if (shres) {
-        const unitSize = 2 << fShift;
+        const unitSize = bplFmode === 0 ? 2 : bplFmode === 3 ? 8 : 8;
         bplUnitMask = unitSize - 1;
         bplBurstCCK = unitSize < 8 ? unitSize : 8;
         const nUnits =
-          bplFmode === 3
+          bplFmode !== 0
             ? ((ddfSpan + 7) >>> 3) + 1
-            : bplFmode !== 0
-              ? ((ddfSpan + 3) >>> 2) + 1
-              : ((ddfSpan + 1) >>> 1) + 1;
-        const maxU = bplFmode === 0 ? 104 : bplFmode === 3 ? 28 : 56;
+            : ((ddfSpan + 1) >>> 1) + 1;
+        const maxU = bplFmode === 0 ? 104 : 28;
         bplStartH = this.ddfStrt;
         bplEndH = bplStartH + (nUnits > maxU ? maxU : nUnits) * unitSize;
         if (bpu >= 2) {
@@ -1868,11 +3269,24 @@ export class AmigaChipset {
           this.inCopperVisibleSpan = false;
           return;
         }
+        if (this.copWaitBlit) {
+          this.syncBlitter();
+          if (this.bltPending) {
+            if (maxHpos >= 0xfe) this.copHpos = 0;
+            this.inCopperVisibleSpan = false;
+            return;
+          }
+          this.copWaitBlit = false;
+        }
         const isNextMove = (this.readChip16(this.copPc) & 1) === 0;
         const wasPalWrap =
           this.copWaitV === 0xff &&
           line === 255 &&
           (this.copWaitH >= 0xde || (this.copWaitH >= 0xd0 && !isNextMove));
+        if (wasPalWrap && visiblePass) {
+          this.inCopperVisibleSpan = false;
+          return;
+        }
         this.copWaiting = false;
         if (maskedVp === targetVp && waitHMasked > this.copHpos) {
           this.copHpos = waitHMasked;
@@ -1974,11 +3388,13 @@ export class AmigaChipset {
           if (waitV === 0xff && waitH === 0xfe) {
             this.copWaitV = 0xff;
             this.copWaitH = 0xfe;
+            this.copWaitBlit = false;
             this.copWaiting = true;
             if (maxHpos >= 0xfe) this.copHpos = 0;
             this.inCopperVisibleSpan = false;
             return;
           }
+          const waitForBlit = (ir2 & 0x8000) === 0;
           const maskedVp = vp & maskV;
           const targetVp = waitV & maskV;
           const waitHMasked = waitH & maskH;
@@ -1993,19 +3409,45 @@ export class AmigaChipset {
             this.copWaitH = waitH;
             this.copMaskV = maskV;
             this.copMaskH = maskH;
+            this.copWaitBlit = waitForBlit;
             this.copWaiting = true;
             if (maxHpos >= 0xfe) this.copHpos = 0;
+            this.inCopperVisibleSpan = false;
+            return;
+          }
+          if (waitForBlit) {
+            this.syncBlitter();
+            if (this.bltPending) {
+              this.copWaitV = waitV;
+              this.copWaitH = waitH;
+              this.copMaskV = maskV;
+              this.copMaskH = maskH;
+              this.copWaitBlit = true;
+              this.copWaiting = true;
+              if (maxHpos >= 0xfe) this.copHpos = 0;
+              this.inCopperVisibleSpan = false;
+              return;
+            }
+          }
+          const isNextMove = (this.readChip16(this.copPc) & 1) === 0;
+          const isPalWrapWait =
+            waitV === 0xff &&
+            line === 255 &&
+            (waitH >= 0xde || (waitH >= 0xd0 && !isNextMove));
+          if (isPalWrapWait && visiblePass) {
+            this.copWaitV = waitV;
+            this.copWaitH = waitH;
+            this.copMaskV = maskV;
+            this.copMaskH = maskH;
+            this.copWaitBlit = false;
+            this.copWaiting = true;
             this.inCopperVisibleSpan = false;
             return;
           }
           if (maskedVp === targetVp && waitHMasked > this.copHpos) {
             this.copHpos = waitHMasked;
           }
-          if (
-            waitV === 0xff &&
-            line === 255 &&
-            (waitH >= 0xde || (waitH >= 0xd0 && (this.readChip16(this.copPc) & 1) !== 0))
-          ) {
+          if (isPalWrapWait) {
             if (!this.isPalTiming()) this.ntscSawPalCopperWrap = true;
             this.consumeDuplicatePalWrapWaits();
             if (maxHpos >= 0xfe) this.copHpos = 0;
@@ -2013,7 +3455,7 @@ export class AmigaChipset {
             return;
           }
         } else {
-          // SKIP compares current beam (vp, copHpos) against masked (waitV, waitH)
+          // SKIP compares current beam (vp, copHpos) against masked (waitV, waitH) and BFD
           if (this.copSkipNext) {
             this.copSkipNext = false;
             this.copHpos += 4;
@@ -2021,9 +3463,15 @@ export class AmigaChipset {
           }
           const maskedVp = vp & maskV;
           const targetVp = waitV & maskV;
+          let blitBusy = false;
+          if ((ir2 & 0x8000) === 0) {
+            this.syncBlitter();
+            blitBusy = this.bltPending;
+          }
           const skip =
-            maskedVp > targetVp ||
-            (maskedVp === targetVp && (this.copHpos & maskH) >= (waitH & maskH));
+            !blitBusy &&
+            (maskedVp > targetVp ||
+              (maskedVp === targetVp && (this.copHpos & maskH) >= (waitH & maskH)));
           this.copSkipNext = skip;
           this.copHpos += 4;
         }
@@ -2060,22 +3508,23 @@ export class AmigaChipset {
     const hires = (this.bplCon0 & 0x8000) !== 0;
     const shres = isAga && (this.bplCon0 & 0x0040) !== 0;
     const homod = (this.bplCon0 & 0x0800) !== 0;
-    const ham8 = isAga && homod && (bpu === 8 || bpu === 7);
-    const ham6 = homod && bpu === 6;
+    const bypass = isAga && (this.bplCon0 & 0x0020) !== 0;
+    const ham8 = isAga && homod && bpu === 8 && !bypass;
+    const ham6 = homod && (isAga ? bpu === 6 : ((bpu === 5 || bpu === 6) && !hires && !shres)) && !bypass;
     const ham = ham8 || ham6;
     const dpf = (this.bplCon0 & 0x0400) !== 0;
-    const killEhb = isAga && (this.bplCon2 & 0x0200) !== 0;
-    const ehb = !ham && !dpf && bpu === 6 && !killEhb;
+    const killEhb = this.chipset !== 'OCS' && (this.bplCon2 & 0x0200) !== 0;
+    const ehb = !ham && !dpf && bpu === 6 && !killEhb && !bypass;
+    const bypassMask = bypass
+      ? (homod && bpu === 8 ? 0xfc : homod && bpu === 6 ? 0x0f : (!dpf && bpu === 6 && !killEhb ? 0x1f : 0xff))
+      : (!isAga && !ham && !dpf && bpu === 6 && killEhb ? 0x1f : 0xff);
 
     const vStart = this.diwVStart;
     const vStop = this.diwVStop;
 
-    const brdrBlnk =
-      (this.bplCon3 & 0x0020) !== 0 &&
-      (isAga || (this.chipset === 'ECS' && (this.bplCon0 & 0x0001) !== 0));
-    const brdrSprt =
-      (this.bplCon3 & 0x0002) !== 0 &&
-      (isAga || (this.chipset === 'ECS' && (this.bplCon0 & 0x0001) !== 0));
+    const ecsena = this.chipset !== 'OCS' && (this.bplCon0 & 0x0001) !== 0;
+    const brdrBlnk = ecsena && (this.bplCon3 & 0x0020) !== 0;
+    const brdrSprt = ecsena && (this.bplCon3 & 0x0002) !== 0;
 
     this.stepSpritesOnLine(line);
 
@@ -2084,21 +3533,23 @@ export class AmigaChipset {
         if (brdrBlnk) {
           fb.fill(0xff000000, rowOff, rowOff + fbW);
           if (brdrSprt) {
-            this.renderSpritesOnLine(rowOff, true);
+            this.renderSpritesOnLine(line, rowOff, true, true);
           }
         } else {
-        if (this.midlineColorCount === 0 && this.midlineBplamCount === 0) {
-          fb.fill(bg, rowOff, rowOff + fbW);
-        } else {
-          this.fillMidlineBgSpans(rowOff, fbW, bplam);
+          if (this.midlineColorCount === 0 && this.midlineBplamCount === 0) {
+            fb.fill(bg, rowOff, rowOff + fbW);
+          } else {
+            this.fillMidlineBgSpans(rowOff, fbW, bplam);
+          }
+          if (brdrSprt || !dmaOk || bpu === 0) {
+            this.renderSpritesOnLine(line, rowOff, true, brdrSprt);
+          }
         }
-        this.renderSpritesOnLine(rowOff, true);
       }
+      this.midlineColorCount = 0;
+      this.midlineBplamCount = 0;
+      return;
     }
-    this.midlineColorCount = 0;
-    this.midlineBplamCount = 0;
-    return;
-  }
 
     if (this.diwHStop > this.diwHStart) {
       this.frameDiwActive = true;
@@ -2137,22 +3588,19 @@ export class AmigaChipset {
       const b = fetchUnits << 3;
       numBytes = b > maxBytes ? maxBytes : b;
     } else {
-      // AGA 32-bit fetch mode (4 bytes/unit): hardware rounds span up to fetch block size
+      // AGA 32-bit fetch mode: PUAE fetchunits[] = {16, 8, 8} (SHRES fetches 8 bytes per 8-CCK block)
       const fetchUnits = shres
-        ? ((ddfSpan + 3) >>> 2) + 1
+        ? ((ddfSpan + 7) >>> 3) + 1
         : hires
           ? ((ddfSpan + 7) >>> 3) + 1
           : ((ddfSpan + 15) >>> 4) + 1;
       const maxBytes = shres ? 224 : hires ? 112 : 56;
-      const b = fetchUnits << 2;
+      const b = shres ? (fetchUnits << 3) : (fetchUnits << 2);
       numBytes = b > maxBytes ? maxBytes : b;
     }
 
     if (!visible) {
-      for (let p = 0; p < bpu; p++) {
-        const mod = (p & 1) === 0 ? this.bpl1Mod : this.bpl2Mod;
-        this.bplPt[p] = (this.bplPt[p] + numBytes + mod) & mask;
-      }
+      this.advanceBitplanePointers(line, bpu, numBytes, isAga, bplFmode, mask);
       this.midlineColorCount = 0;
       this.midlineBplamCount = 0;
       return;
@@ -2198,6 +3646,12 @@ export class AmigaChipset {
     const pf2Offset = isAga ? PF2OF_TABLE[(this.bplCon3 >>> 10) & 7] : 8;
     const minX = diwHStartLo << 1;
     const maxX = diwHStopLo << 1;
+    const en6 = (this.clxCon >>> 6) & 0x3f;
+    const mv6 = this.clxCon & 0x3f;
+    const clxEnMask = this.chipset !== 'OCS' ? ((this.clxCon2 & 0xc0) | en6) : en6;
+    const clxMvMask = this.chipset !== 'OCS' ? (((this.clxCon2 & 0x03) << 6) | mv6) : mv6;
+    const clxOddEn = clxEnMask & 0x55;
+    const clxEvenEn = clxEnMask & 0xaa;
     if (brdrBlnk) {
       if (minX > 0) fb.fill(0xff000000, rowOff, rowOff + minX);
       if (maxX > minX) fb.fill(bg, rowOff + minX, rowOff + maxX);
@@ -2207,7 +3661,7 @@ export class AmigaChipset {
     }
 
     if (ham8) {
-      // AGA HAM8 (262,144 colors): BPL1-6 = 6-bit value/RGB[7:2], BPL7-8 = control
+      // Authentic AGA Lisa HAM8 (262,144 colors): BPL1-2 = control, BPL3-8 = 6-bit value/RGB[7:2]
       const c24_0 = this.colorReg24[bplam];
       let holdR = (c24_0 >>> 16) & 0xff;
       let holdG = (c24_0 >>> 8) & 0xff;
@@ -2228,26 +3682,28 @@ export class AmigaChipset {
           const b4 = chip[(p4 + byteIdx) & mask];
           const b5 = chip[(p5 + byteIdx) & mask];
           const b6 = chip[(p6 + byteIdx) & mask];
-          const b7 = bpu > 7 ? chip[(p7 + byteIdx) & mask] : 0;
+          const b7 = chip[(p7 + byteIdx) & mask];
 
           for (let bit = 7; bit >= 0; bit -= stepBit) {
+            const ctrl = ((b0 >>> bit) & 1) | (((b1 >>> bit) & 1) << 1);
             const data6 =
-              ((b0 >>> bit) & 1) |
-              (((b1 >>> bit) & 1) << 1) |
-              (((b2 >>> bit) & 1) << 2) |
-              (((b3 >>> bit) & 1) << 3) |
-              (((b4 >>> bit) & 1) << 4) |
-              (((b5 >>> bit) & 1) << 5);
-            const ctrl = ((b6 >>> bit) & 1) | (((b7 >>> bit) & 1) << 1);
+              ((b2 >>> bit) & 1) |
+              (((b3 >>> bit) & 1) << 1) |
+              (((b4 >>> bit) & 1) << 2) |
+              (((b5 >>> bit) & 1) << 3) |
+              (((b6 >>> bit) & 1) << 4) |
+              (((b7 >>> bit) & 1) << 5);
+            const pv = ((data6 << 2) | ctrl) ^ bplam;
+            const ctrlEff = pv & 3;
 
-            if (ctrl === 0) {
-              const c24 = this.colorReg24[data6 ^ bplam];
+            if (ctrlEff === 0) {
+              const c24 = this.colorReg24[pv >>> 2];
               holdR = (c24 >>> 16) & 0xff;
               holdG = (c24 >>> 8) & 0xff;
               holdB = c24 & 0xff;
-            } else if (ctrl === 1) {
+            } else if (ctrlEff === 1) {
               holdB = (holdB & 0x03) | (data6 << 2);
-            } else if (ctrl === 2) {
+            } else if (ctrlEff === 2) {
               holdR = (holdR & 0x03) | (data6 << 2);
             } else {
               holdG = (holdG & 0x03) | (data6 << 2);
@@ -2271,26 +3727,28 @@ export class AmigaChipset {
           const b4 = chip[(p4 + byteIdx) & mask];
           const b5 = chip[(p5 + byteIdx) & mask];
           const b6 = chip[(p6 + byteIdx) & mask];
-          const b7 = bpu > 7 ? chip[(p7 + byteIdx) & mask] : 0;
+          const b7 = chip[(p7 + byteIdx) & mask];
 
           for (let bit = 7; bit >= 0; bit--) {
+            const ctrl = ((b0 >>> bit) & 1) | (((b1 >>> bit) & 1) << 1);
             const data6 =
-              ((b0 >>> bit) & 1) |
-              (((b1 >>> bit) & 1) << 1) |
-              (((b2 >>> bit) & 1) << 2) |
-              (((b3 >>> bit) & 1) << 3) |
-              (((b4 >>> bit) & 1) << 4) |
-              (((b5 >>> bit) & 1) << 5);
-            const ctrl = ((b6 >>> bit) & 1) | (((b7 >>> bit) & 1) << 1);
+              ((b2 >>> bit) & 1) |
+              (((b3 >>> bit) & 1) << 1) |
+              (((b4 >>> bit) & 1) << 2) |
+              (((b5 >>> bit) & 1) << 3) |
+              (((b6 >>> bit) & 1) << 4) |
+              (((b7 >>> bit) & 1) << 5);
+            const pv = ((data6 << 2) | ctrl) ^ bplam;
+            const ctrlEff = pv & 3;
 
-            if (ctrl === 0) {
-              const c24 = this.colorReg24[data6 ^ bplam];
+            if (ctrlEff === 0) {
+              const c24 = this.colorReg24[pv >>> 2];
               holdR = (c24 >>> 16) & 0xff;
               holdG = (c24 >>> 8) & 0xff;
               holdB = c24 & 0xff;
-            } else if (ctrl === 1) {
+            } else if (ctrlEff === 1) {
               holdB = (holdB & 0x03) | (data6 << 2);
-            } else if (ctrl === 2) {
+            } else if (ctrlEff === 2) {
               holdR = (holdR & 0x03) | (data6 << 2);
             } else {
               holdG = (holdG & 0x03) | (data6 << 2);
@@ -2318,6 +3776,8 @@ export class AmigaChipset {
       const stepBit = shres ? 2 : 1;
 
       if (dpf) {
+        const dpfSrc = this.lineDpfSrc;
+        dpfSrc.fill(0, 0, fbW);
         const pf2Prio = (this.bplCon2 & 0x0040) !== 0;
         const scrollHi2 = (pf2ScrollLo << 1) | pf2Half;
         const startPx2 = fetchPxHires + ((scrollHi2 - fetchPxHires) & wrapMaskHi) + hShiftHi;
@@ -2345,10 +3805,30 @@ export class AmigaChipset {
                   (((b3 >>> bit) & 1) << 1) |
                   (((b5 >>> bit) & 1) << 2) |
                   (((b7 >>> bit) & 1) << 3);
-                const colIdx = pf2Prio
-                  ? (c2 !== 0 ? ((pf2Offset + c2) & 0xff) : c1)
-                  : (c1 !== 0 ? c1 : (c2 !== 0 ? ((pf2Offset + c2) & 0xff) : 0));
+                let colIdx = 0;
+                if (pf2Prio) {
+                  if (c2 !== 0) {
+                    colIdx = (pf2Offset + c2) & 0xff;
+                    dpfSrc[outX] = 2;
+                  } else if (c1 !== 0) {
+                    colIdx = c1;
+                    dpfSrc[outX] = 1;
+                  }
+                } else {
+                  if (c1 !== 0) {
+                    colIdx = c1;
+                    dpfSrc[outX] = 1;
+                  } else if (c2 !== 0) {
+                    colIdx = (pf2Offset + c2) & 0xff;
+                    dpfSrc[outX] = 2;
+                  }
+                }
                 indices[outX] = colIdx;
+                if (clxEnMask !== 0) {
+                  this.clxBplLine[outX] =
+                    (c1 & 1) | ((c1 & 2) << 1) | ((c1 & 4) << 2) | ((c1 & 8) << 3) |
+                    ((c2 & 1) << 1) | ((c2 & 2) << 2) | ((c2 & 4) << 3) | ((c2 & 8) << 4);
+                }
                 fb[rowOff + outX] = colors[colIdx ^ bplam];
               }
               outX++;
@@ -2380,10 +3860,30 @@ export class AmigaChipset {
                 (activeBpu > 5 ? (((chip[(p5 + bi) & mask] >>> bit) & 1) << 2) : 0) |
                 (activeBpu > 7 ? (((chip[(p7 + bi) & mask] >>> bit) & 1) << 3) : 0);
             }
-            const colIdx = pf2Prio
-              ? (c2 !== 0 ? ((pf2Offset + c2) & 0xff) : c1)
-              : (c1 !== 0 ? c1 : (c2 !== 0 ? ((pf2Offset + c2) & 0xff) : 0));
+            let colIdx = 0;
+            if (pf2Prio) {
+              if (c2 !== 0) {
+                colIdx = (pf2Offset + c2) & 0xff;
+                dpfSrc[outX] = 2;
+              } else if (c1 !== 0) {
+                colIdx = c1;
+                dpfSrc[outX] = 1;
+              }
+            } else {
+              if (c1 !== 0) {
+                colIdx = c1;
+                dpfSrc[outX] = 1;
+              } else if (c2 !== 0) {
+                colIdx = (pf2Offset + c2) & 0xff;
+                dpfSrc[outX] = 2;
+              }
+            }
             indices[outX] = colIdx;
+            if (clxEnMask !== 0) {
+              this.clxBplLine[outX] =
+                (c1 & 1) | ((c1 & 2) << 1) | ((c1 & 4) << 2) | ((c1 & 8) << 3) |
+                ((c2 & 1) << 1) | ((c2 & 2) << 2) | ((c2 & 4) << 3) | ((c2 & 8) << 4);
+            }
             fb[rowOff + outX] = colors[colIdx ^ bplam];
           }
         }
@@ -2398,10 +3898,10 @@ export class AmigaChipset {
           for (let bit = 7; bit >= 0; bit -= stepBit) {
             if (outX >= minX && outX < maxX) {
               const idx =
-                ((b0 >>> bit) & 1) |
-                (((b1 >>> bit) & 1) << 1) |
-                (((b2 >>> bit) & 1) << 2) |
-                (((b3 >>> bit) & 1) << 3);
+                (((b0 >>> bit) & 1) |
+                 (((b1 >>> bit) & 1) << 1) |
+                 (((b2 >>> bit) & 1) << 2) |
+                 (((b3 >>> bit) & 1) << 3)) & bypassMask;
               indices[outX] = idx;
               fb[rowOff + outX] = colors[idx ^ bplam];
             }
@@ -2424,14 +3924,14 @@ export class AmigaChipset {
           for (let bit = 7; bit >= 0; bit -= stepBit) {
             if (outX >= minX && outX < maxX) {
               const idx =
-                ((b0 >>> bit) & 1) |
-                (((b1 >>> bit) & 1) << 1) |
-                (((b2 >>> bit) & 1) << 2) |
-                (((b3 >>> bit) & 1) << 3) |
-                (((b4 >>> bit) & 1) << 4) |
-                (((b5 >>> bit) & 1) << 5) |
-                (((b6 >>> bit) & 1) << 6) |
-                (((b7 >>> bit) & 1) << 7);
+                (((b0 >>> bit) & 1) |
+                 (((b1 >>> bit) & 1) << 1) |
+                 (((b2 >>> bit) & 1) << 2) |
+                 (((b3 >>> bit) & 1) << 3) |
+                 (((b4 >>> bit) & 1) << 4) |
+                 (((b5 >>> bit) & 1) << 5) |
+                 (((b6 >>> bit) & 1) << 6) |
+                 (((b7 >>> bit) & 1) << 7)) & bypassMask;
               indices[outX] = idx;
               fb[rowOff + outX] = ehb && idx >= 32 ? ehbColors[idx & 31] : colors[idx ^ bplam];
             }
@@ -2440,7 +3940,7 @@ export class AmigaChipset {
         }
       }
     } else if (ham) {
-      // Authentic Amiga HAM6 (Hold-And-Modify, 6 bitplanes; 24-bit base palette on AGA, 12-bit on OCS/ECS)
+      // Authentic Amiga HAM6 (Hold-And-Modify, 5..6 bitplanes; 24-bit base palette on AGA, 12-bit on OCS/ECS)
       const fetchPx = (this.ddfStrt - 0x38) << 1;
       const startPx = fetchPx + ((pf1ScrollLo - fetchPx) & wrapMaskLo) + hShiftLo;
       let outPx = startPx;
@@ -2450,6 +3950,7 @@ export class AmigaChipset {
         let holdR = (c24_0 >>> 16) & 0xff;
         let holdG = (c24_0 >>> 8) & 0xff;
         let holdB = c24_0 & 0xff;
+        const hamXor = bplam & 0x3f;
 
         for (let byteIdx = 0; byteIdx < numBytes; byteIdx++) {
           const b0 = chip[(p0 + byteIdx) & mask];
@@ -2466,18 +3967,19 @@ export class AmigaChipset {
               (((b2 >>> bit) & 1) << 2) |
               (((b3 >>> bit) & 1) << 3);
             const ctrl = ((b4 >>> bit) & 1) | (((b5 >>> bit) & 1) << 1);
+            const pv = ((ctrl << 4) | data4) ^ hamXor;
+            const ctrlEff = (pv >>> 4) & 3;
 
-            if (ctrl === 0) {
-              const c24 = this.colorReg24[data4 ^ bplam];
+            if (ctrlEff === 0) {
+              const c24 = this.colorReg24[pv & 0x0f];
               holdR = (c24 >>> 16) & 0xff;
               holdG = (c24 >>> 8) & 0xff;
               holdB = c24 & 0xff;
-            } else if (ctrl === 1) {
-              holdB = (holdB & 0x0f) | (data4 << 4);
-            } else if (ctrl === 2) {
-              holdR = (holdR & 0x0f) | (data4 << 4);
             } else {
-              holdG = (holdG & 0x0f) | (data4 << 4);
+              const c8 = (data4 << 4) | data4;
+              if (ctrlEff === 1) holdB = c8;
+              else if (ctrlEff === 2) holdR = c8;
+              else holdG = c8;
             }
 
             if (outPx >= diwHStartLo && outPx < diwHStopLo) {
@@ -2502,7 +4004,7 @@ export class AmigaChipset {
           const b2 = chip[(p2 + byteIdx) & mask];
           const b3 = chip[(p3 + byteIdx) & mask];
           const b4 = chip[(p4 + byteIdx) & mask];
-          const b5 = chip[(p5 + byteIdx) & mask];
+          const b5 = bpu > 5 ? chip[(p5 + byteIdx) & mask] : 0;
 
           for (let bit = 7; bit >= 0; bit--) {
             const data4 =
@@ -2539,52 +4041,200 @@ export class AmigaChipset {
       }
     } else if (dpf) {
       // Dual Playfield Mode (Odd planes = PF1, Even planes = PF2 offset by PF2OF on AGA or 8 on OCS/ECS)
+      const dpfSrc = this.lineDpfSrc;
+      dpfSrc.fill(0, 0, fbW);
       const pf2Prio = (this.bplCon2 & 0x0040) !== 0;
       const fetchPx = (this.ddfStrt - 0x38) << 1;
       const startPx1 = fetchPx + ((pf1ScrollLo - fetchPx) & wrapMaskLo) + hShiftLo;
       const startPx2 = fetchPx + ((pf2ScrollLo - fetchPx) & wrapMaskLo) + hShiftLo;
       const totalPx = numBytes << 3;
-      for (let outPx = diwHStartLo; outPx < diwHStopLo; outPx++) {
-        const s1 = outPx - startPx1;
-        const s2 = outPx - startPx2;
-        let c1 = 0;
-        let c2 = 0;
-        if (s1 >= 0 && s1 < totalPx) {
-          const bi = s1 >>> 3;
-          const bit = 7 - (s1 & 7);
-          c1 =
-            (bpu > 0 ? ((chip[(p0 + bi) & mask] >>> bit) & 1) : 0) |
-            (bpu > 2 ? (((chip[(p2 + bi) & mask] >>> bit) & 1) << 1) : 0) |
-            (bpu > 4 ? (((chip[(p4 + bi) & mask] >>> bit) & 1) << 2) : 0) |
-            (bpu > 6 ? (((chip[(p6 + bi) & mask] >>> bit) & 1) << 3) : 0);
+
+      if (pf1Half === 0 && pf2Half === 0) {
+        for (let outPx = diwHStartLo; outPx < diwHStopLo; outPx++) {
+          const s1 = outPx - startPx1;
+          const s2 = outPx - startPx2;
+          let c1 = 0;
+          let c2 = 0;
+          if (s1 >= 0 && s1 < totalPx) {
+            const bi = s1 >>> 3;
+            const bit = 7 - (s1 & 7);
+            c1 =
+              (bpu > 0 ? ((chip[(p0 + bi) & mask] >>> bit) & 1) : 0) |
+              (bpu > 2 ? (((chip[(p2 + bi) & mask] >>> bit) & 1) << 1) : 0) |
+              (bpu > 4 ? (((chip[(p4 + bi) & mask] >>> bit) & 1) << 2) : 0) |
+              (bpu > 6 ? (((chip[(p6 + bi) & mask] >>> bit) & 1) << 3) : 0);
+          }
+          if (s2 >= 0 && s2 < totalPx) {
+            const bi = s2 >>> 3;
+            const bit = 7 - (s2 & 7);
+            c2 =
+              (bpu > 1 ? ((chip[(p1 + bi) & mask] >>> bit) & 1) : 0) |
+              (bpu > 3 ? (((chip[(p3 + bi) & mask] >>> bit) & 1) << 1) : 0) |
+              (bpu > 5 ? (((chip[(p5 + bi) & mask] >>> bit) & 1) << 2) : 0) |
+              (bpu > 7 ? (((chip[(p7 + bi) & mask] >>> bit) & 1) << 3) : 0);
+          }
+          let colIdx = 0;
+          let srcPf = 0;
+          if (pf2Prio) {
+            if (c2 !== 0) {
+              colIdx = (pf2Offset + c2) & 0xff;
+              srcPf = 2;
+            } else if (c1 !== 0) {
+              colIdx = c1;
+              srcPf = 1;
+            }
+          } else {
+            if (c1 !== 0) {
+              colIdx = c1;
+              srcPf = 1;
+            } else if (c2 !== 0) {
+              colIdx = (pf2Offset + c2) & 0xff;
+              srcPf = 2;
+            }
+          }
+          const abgr = colors[colIdx ^ bplam];
+          const x2 = outPx << 1;
+          fb[rowOff + x2] = abgr;
+          fb[rowOff + x2 + 1] = abgr;
+          indices[x2] = colIdx;
+          indices[x2 + 1] = colIdx;
+          if (srcPf !== 0) {
+            dpfSrc[x2] = srcPf;
+            dpfSrc[x2 + 1] = srcPf;
+          }
+          if (clxEnMask !== 0) {
+            const rawB =
+              (c1 & 1) | ((c1 & 2) << 1) | ((c1 & 4) << 2) | ((c1 & 8) << 3) |
+              ((c2 & 1) << 1) | ((c2 & 2) << 2) | ((c2 & 4) << 3) | ((c2 & 8) << 4);
+            this.clxBplLine[x2] = rawB;
+            this.clxBplLine[x2 + 1] = rawB;
+          }
         }
-        if (s2 >= 0 && s2 < totalPx) {
-          const bi = s2 >>> 3;
-          const bit = 7 - (s2 & 7);
-          c2 =
-            (bpu > 1 ? ((chip[(p1 + bi) & mask] >>> bit) & 1) : 0) |
-            (bpu > 3 ? (((chip[(p3 + bi) & mask] >>> bit) & 1) << 1) : 0) |
-            (bpu > 5 ? (((chip[(p5 + bi) & mask] >>> bit) & 1) << 2) : 0) |
-            (bpu > 7 ? (((chip[(p7 + bi) & mask] >>> bit) & 1) << 3) : 0);
+      } else {
+        const startHi1 = (startPx1 << 1) + pf1Half;
+        const startHi2 = (startPx2 << 1) + pf2Half;
+        const totalHi = totalPx << 1;
+        for (let outX = minX; outX < maxX; outX++) {
+          const d1 = outX - startHi1;
+          const d2 = outX - startHi2;
+          let c1 = 0;
+          let c2 = 0;
+          if (d1 >= 0 && d1 < totalHi) {
+            const s1 = d1 >>> 1;
+            const bi = s1 >>> 3;
+            const bit = 7 - (s1 & 7);
+            c1 =
+              (bpu > 0 ? ((chip[(p0 + bi) & mask] >>> bit) & 1) : 0) |
+              (bpu > 2 ? (((chip[(p2 + bi) & mask] >>> bit) & 1) << 1) : 0) |
+              (bpu > 4 ? (((chip[(p4 + bi) & mask] >>> bit) & 1) << 2) : 0) |
+              (bpu > 6 ? (((chip[(p6 + bi) & mask] >>> bit) & 1) << 3) : 0);
+          }
+          if (d2 >= 0 && d2 < totalHi) {
+            const s2 = d2 >>> 1;
+            const bi = s2 >>> 3;
+            const bit = 7 - (s2 & 7);
+            c2 =
+              (bpu > 1 ? ((chip[(p1 + bi) & mask] >>> bit) & 1) : 0) |
+              (bpu > 3 ? (((chip[(p3 + bi) & mask] >>> bit) & 1) << 1) : 0) |
+              (bpu > 5 ? (((chip[(p5 + bi) & mask] >>> bit) & 1) << 2) : 0) |
+              (bpu > 7 ? (((chip[(p7 + bi) & mask] >>> bit) & 1) << 3) : 0);
+          }
+          let colIdx = 0;
+          let srcPf = 0;
+          if (pf2Prio) {
+            if (c2 !== 0) {
+              colIdx = (pf2Offset + c2) & 0xff;
+              srcPf = 2;
+            } else if (c1 !== 0) {
+              colIdx = c1;
+              srcPf = 1;
+            }
+          } else {
+            if (c1 !== 0) {
+              colIdx = c1;
+              srcPf = 1;
+            } else if (c2 !== 0) {
+              colIdx = (pf2Offset + c2) & 0xff;
+              srcPf = 2;
+            }
+          }
+          indices[outX] = colIdx;
+          if (srcPf !== 0) dpfSrc[outX] = srcPf;
+          fb[rowOff + outX] = colors[colIdx ^ bplam];
+          if (clxEnMask !== 0) {
+            this.clxBplLine[outX] =
+              (c1 & 1) | ((c1 & 2) << 1) | ((c1 & 4) << 2) | ((c1 & 8) << 3) |
+              ((c2 & 1) << 1) | ((c2 & 2) << 2) | ((c2 & 4) << 3) | ((c2 & 8) << 4);
+          }
         }
-        const colIdx = pf2Prio
-          ? (c2 !== 0 ? ((pf2Offset + c2) & 0xff) : c1)
-          : (c1 !== 0 ? c1 : (c2 !== 0 ? ((pf2Offset + c2) & 0xff) : 0));
-        const abgr = colors[colIdx ^ bplam];
-        const x2 = outPx << 1;
-        fb[rowOff + x2] = abgr;
-        fb[rowOff + x2 + 1] = abgr;
-        indices[x2] = colIdx;
-        indices[x2 + 1] = colIdx;
       }
     } else if (!isAga || bpu <= 6) {
-      // Standard Lo-Res 1..6 bitplanes (zero-overhead OCS/ECS hot loop + AGA EHB/KILLEHB/BPLAM)
+      // Standard Lo-Res 1..6 bitplanes (zero-overhead OCS/ECS hot loop + AGA EHB/KILLEHB/BPLAM/70ns subpixel)
       const fetchPx = (this.ddfStrt - 0x38) << 1;
       const startPx1 = fetchPx + ((pf1ScrollLo - fetchPx) & wrapMaskLo) + hShiftLo;
       const startPx2 = fetchPx + ((pf2ScrollLo - fetchPx) & wrapMaskLo) + hShiftLo;
 
-      if (startPx1 === startPx2) {
-        let outPx = startPx1;
+      if (pf1Half === 0 && pf2Half === 0) {
+        if (startPx1 === startPx2) {
+          let outPx = startPx1;
+          for (let byteIdx = 0; byteIdx < numBytes; byteIdx++) {
+            const b0 = bpu > 0 ? chip[(p0 + byteIdx) & mask] : 0;
+            const b1 = bpu > 1 ? chip[(p1 + byteIdx) & mask] : 0;
+            const b2 = bpu > 2 ? chip[(p2 + byteIdx) & mask] : 0;
+            const b3 = bpu > 3 ? chip[(p3 + byteIdx) & mask] : 0;
+            const b4 = bpu > 4 ? chip[(p4 + byteIdx) & mask] : 0;
+            const b5 = bpu > 5 ? chip[(p5 + byteIdx) & mask] : 0;
+
+            for (let bit = 7; bit >= 0; bit--) {
+              if (outPx >= diwHStartLo && outPx < diwHStopLo) {
+                const idx =
+                  (((b0 >>> bit) & 1) |
+                   (((b1 >>> bit) & 1) << 1) |
+                   (((b2 >>> bit) & 1) << 2) |
+                   (((b3 >>> bit) & 1) << 3) |
+                   (((b4 >>> bit) & 1) << 4) |
+                   (((b5 >>> bit) & 1) << 5)) & bypassMask;
+                const abgr = ehb && idx >= 32 ? ehbColors[idx & 31] : colors[idx ^ bplam];
+                const x2 = outPx << 1;
+                fb[rowOff + x2] = abgr;
+                fb[rowOff + x2 + 1] = abgr;
+                indices[x2] = idx;
+                indices[x2 + 1] = idx;
+              }
+              outPx++;
+            }
+          }
+        } else {
+          const totalPx = numBytes << 3;
+          for (let outPx = diwHStartLo; outPx < diwHStopLo; outPx++) {
+            const s1 = outPx - startPx1;
+            const s2 = outPx - startPx2;
+            let idx = 0;
+            if (s1 >= 0 && s1 < totalPx) {
+              const bi = s1 >>> 3;
+              const bit = 7 - (s1 & 7);
+              if (bpu > 0) idx |= (chip[(p0 + bi) & mask] >>> bit) & 1;
+              if (bpu > 2) idx |= ((chip[(p2 + bi) & mask] >>> bit) & 1) << 2;
+              if (bpu > 4) idx |= ((chip[(p4 + bi) & mask] >>> bit) & 1) << 4;
+            }
+            if (s2 >= 0 && s2 < totalPx) {
+              const bi = s2 >>> 3;
+              const bit = 7 - (s2 & 7);
+              if (bpu > 1) idx |= ((chip[(p1 + bi) & mask] >>> bit) & 1) << 1;
+              if (bpu > 3) idx |= ((chip[(p3 + bi) & mask] >>> bit) & 1) << 3;
+              if (bpu > 5) idx |= ((chip[(p5 + bi) & mask] >>> bit) & 1) << 5;
+            }
+            idx &= bypassMask;
+            const abgr = ehb && idx >= 32 ? ehbColors[idx & 31] : colors[idx ^ bplam];
+            const x2 = outPx << 1;
+            fb[rowOff + x2] = abgr;
+            fb[rowOff + x2 + 1] = abgr;
+            indices[x2] = idx;
+            indices[x2 + 1] = idx;
+          }
+        }
+      } else if (startPx1 === startPx2 && pf1Half === pf2Half) {
+        let outX = (startPx1 << 1) + pf1Half;
         for (let byteIdx = 0; byteIdx < numBytes; byteIdx++) {
           const b0 = bpu > 0 ? chip[(p0 + byteIdx) & mask] : 0;
           const b1 = bpu > 1 ? chip[(p1 + byteIdx) & mask] : 0;
@@ -2594,50 +4244,54 @@ export class AmigaChipset {
           const b5 = bpu > 5 ? chip[(p5 + byteIdx) & mask] : 0;
 
           for (let bit = 7; bit >= 0; bit--) {
-            if (outPx >= diwHStartLo && outPx < diwHStopLo) {
-              const idx =
-                ((b0 >>> bit) & 1) |
-                (((b1 >>> bit) & 1) << 1) |
-                (((b2 >>> bit) & 1) << 2) |
-                (((b3 >>> bit) & 1) << 3) |
-                (((b4 >>> bit) & 1) << 4) |
-                (((b5 >>> bit) & 1) << 5);
-              const abgr = ehb && idx >= 32 ? ehbColors[idx & 31] : colors[idx ^ bplam];
-              const x2 = outPx << 1;
-              fb[rowOff + x2] = abgr;
-              fb[rowOff + x2 + 1] = abgr;
-              indices[x2] = idx;
-              indices[x2 + 1] = idx;
+            const idx =
+              (((b0 >>> bit) & 1) |
+               (((b1 >>> bit) & 1) << 1) |
+               (((b2 >>> bit) & 1) << 2) |
+               (((b3 >>> bit) & 1) << 3) |
+               (((b4 >>> bit) & 1) << 4) |
+               (((b5 >>> bit) & 1) << 5)) & bypassMask;
+            const abgr = ehb && idx >= 32 ? ehbColors[idx & 31] : colors[idx ^ bplam];
+            if (outX >= minX && outX < maxX) {
+              fb[rowOff + outX] = abgr;
+              indices[outX] = idx;
             }
-            outPx++;
+            const xNext = outX + 1;
+            if (xNext >= minX && xNext < maxX) {
+              fb[rowOff + xNext] = abgr;
+              indices[xNext] = idx;
+            }
+            outX += 2;
           }
         }
       } else {
-        const totalPx = numBytes << 3;
-        for (let outPx = diwHStartLo; outPx < diwHStopLo; outPx++) {
-          const s1 = outPx - startPx1;
-          const s2 = outPx - startPx2;
+        const startHi1 = (startPx1 << 1) + pf1Half;
+        const startHi2 = (startPx2 << 1) + pf2Half;
+        const totalHi = numBytes << 4;
+        for (let outX = minX; outX < maxX; outX++) {
+          const d1 = outX - startHi1;
+          const d2 = outX - startHi2;
           let idx = 0;
-          if (s1 >= 0 && s1 < totalPx) {
+          if (d1 >= 0 && d1 < totalHi) {
+            const s1 = d1 >>> 1;
             const bi = s1 >>> 3;
             const bit = 7 - (s1 & 7);
             if (bpu > 0) idx |= (chip[(p0 + bi) & mask] >>> bit) & 1;
             if (bpu > 2) idx |= ((chip[(p2 + bi) & mask] >>> bit) & 1) << 2;
             if (bpu > 4) idx |= ((chip[(p4 + bi) & mask] >>> bit) & 1) << 4;
           }
-          if (s2 >= 0 && s2 < totalPx) {
+          if (d2 >= 0 && d2 < totalHi) {
+            const s2 = d2 >>> 1;
             const bi = s2 >>> 3;
             const bit = 7 - (s2 & 7);
             if (bpu > 1) idx |= ((chip[(p1 + bi) & mask] >>> bit) & 1) << 1;
             if (bpu > 3) idx |= ((chip[(p3 + bi) & mask] >>> bit) & 1) << 3;
             if (bpu > 5) idx |= ((chip[(p5 + bi) & mask] >>> bit) & 1) << 5;
           }
+          idx &= bypassMask;
           const abgr = ehb && idx >= 32 ? ehbColors[idx & 31] : colors[idx ^ bplam];
-          const x2 = outPx << 1;
-          fb[rowOff + x2] = abgr;
-          fb[rowOff + x2 + 1] = abgr;
-          indices[x2] = idx;
-          indices[x2 + 1] = idx;
+          fb[rowOff + outX] = abgr;
+          indices[outX] = idx;
         }
       }
     } else {
@@ -2646,8 +4300,75 @@ export class AmigaChipset {
       const startPx1 = fetchPx + ((pf1ScrollLo - fetchPx) & wrapMaskLo) + hShiftLo;
       const startPx2 = fetchPx + ((pf2ScrollLo - fetchPx) & wrapMaskLo) + hShiftLo;
 
-      if (startPx1 === startPx2) {
-        let outPx = startPx1;
+      if (pf1Half === 0 && pf2Half === 0) {
+        if (startPx1 === startPx2) {
+          let outPx = startPx1;
+          for (let byteIdx = 0; byteIdx < numBytes; byteIdx++) {
+            const b0 = chip[(p0 + byteIdx) & mask];
+            const b1 = chip[(p1 + byteIdx) & mask];
+            const b2 = chip[(p2 + byteIdx) & mask];
+            const b3 = chip[(p3 + byteIdx) & mask];
+            const b4 = chip[(p4 + byteIdx) & mask];
+            const b5 = chip[(p5 + byteIdx) & mask];
+            const b6 = chip[(p6 + byteIdx) & mask];
+            const b7 = bpu > 7 ? chip[(p7 + byteIdx) & mask] : 0;
+
+            for (let bit = 7; bit >= 0; bit--) {
+              if (outPx >= diwHStartLo && outPx < diwHStopLo) {
+                const idx =
+                  (((b0 >>> bit) & 1) |
+                   (((b1 >>> bit) & 1) << 1) |
+                   (((b2 >>> bit) & 1) << 2) |
+                   (((b3 >>> bit) & 1) << 3) |
+                   (((b4 >>> bit) & 1) << 4) |
+                   (((b5 >>> bit) & 1) << 5) |
+                   (((b6 >>> bit) & 1) << 6) |
+                   (((b7 >>> bit) & 1) << 7)) & bypassMask;
+                const abgr = colors[idx ^ bplam];
+                const x2 = outPx << 1;
+                fb[rowOff + x2] = abgr;
+                fb[rowOff + x2 + 1] = abgr;
+                indices[x2] = idx;
+                indices[x2 + 1] = idx;
+              }
+              outPx++;
+            }
+          }
+        } else {
+          const totalPx = numBytes << 3;
+          for (let outPx = diwHStartLo; outPx < diwHStopLo; outPx++) {
+            const s1 = outPx - startPx1;
+            const s2 = outPx - startPx2;
+            let idx = 0;
+            if (s1 >= 0 && s1 < totalPx) {
+              const bi = s1 >>> 3;
+              const bit = 7 - (s1 & 7);
+              idx |=
+                ((chip[(p0 + bi) & mask] >>> bit) & 1) |
+                (((chip[(p2 + bi) & mask] >>> bit) & 1) << 2) |
+                (((chip[(p4 + bi) & mask] >>> bit) & 1) << 4) |
+                (((chip[(p6 + bi) & mask] >>> bit) & 1) << 6);
+            }
+            if (s2 >= 0 && s2 < totalPx) {
+              const bi = s2 >>> 3;
+              const bit = 7 - (s2 & 7);
+              idx |=
+                (((chip[(p1 + bi) & mask] >>> bit) & 1) << 1) |
+                (((chip[(p3 + bi) & mask] >>> bit) & 1) << 3) |
+                (((chip[(p5 + bi) & mask] >>> bit) & 1) << 5);
+              if (bpu > 7) idx |= ((chip[(p7 + bi) & mask] >>> bit) & 1) << 7;
+            }
+            idx &= bypassMask;
+            const abgr = colors[idx ^ bplam];
+            const x2 = outPx << 1;
+            fb[rowOff + x2] = abgr;
+            fb[rowOff + x2 + 1] = abgr;
+            indices[x2] = idx;
+            indices[x2 + 1] = idx;
+          }
+        }
+      } else if (startPx1 === startPx2 && pf1Half === pf2Half) {
+        let outX = (startPx1 << 1) + pf1Half;
         for (let byteIdx = 0; byteIdx < numBytes; byteIdx++) {
           const b0 = chip[(p0 + byteIdx) & mask];
           const b1 = chip[(p1 + byteIdx) & mask];
@@ -2659,33 +4380,38 @@ export class AmigaChipset {
           const b7 = bpu > 7 ? chip[(p7 + byteIdx) & mask] : 0;
 
           for (let bit = 7; bit >= 0; bit--) {
-            if (outPx >= diwHStartLo && outPx < diwHStopLo) {
-              const idx =
-                ((b0 >>> bit) & 1) |
-                (((b1 >>> bit) & 1) << 1) |
-                (((b2 >>> bit) & 1) << 2) |
-                (((b3 >>> bit) & 1) << 3) |
-                (((b4 >>> bit) & 1) << 4) |
-                (((b5 >>> bit) & 1) << 5) |
-                (((b6 >>> bit) & 1) << 6) |
-                (((b7 >>> bit) & 1) << 7);
-              const abgr = colors[idx ^ bplam];
-              const x2 = outPx << 1;
-              fb[rowOff + x2] = abgr;
-              fb[rowOff + x2 + 1] = abgr;
-              indices[x2] = idx;
-              indices[x2 + 1] = idx;
+            const idx =
+              (((b0 >>> bit) & 1) |
+               (((b1 >>> bit) & 1) << 1) |
+               (((b2 >>> bit) & 1) << 2) |
+               (((b3 >>> bit) & 1) << 3) |
+               (((b4 >>> bit) & 1) << 4) |
+               (((b5 >>> bit) & 1) << 5) |
+               (((b6 >>> bit) & 1) << 6) |
+               (((b7 >>> bit) & 1) << 7)) & bypassMask;
+            const abgr = colors[idx ^ bplam];
+            if (outX >= minX && outX < maxX) {
+              fb[rowOff + outX] = abgr;
+              indices[outX] = idx;
             }
-            outPx++;
+            const xNext = outX + 1;
+            if (xNext >= minX && xNext < maxX) {
+              fb[rowOff + xNext] = abgr;
+              indices[xNext] = idx;
+            }
+            outX += 2;
           }
         }
       } else {
-        const totalPx = numBytes << 3;
-        for (let outPx = diwHStartLo; outPx < diwHStopLo; outPx++) {
-          const s1 = outPx - startPx1;
-          const s2 = outPx - startPx2;
+        const startHi1 = (startPx1 << 1) + pf1Half;
+        const startHi2 = (startPx2 << 1) + pf2Half;
+        const totalHi = numBytes << 4;
+        for (let outX = minX; outX < maxX; outX++) {
+          const d1 = outX - startHi1;
+          const d2 = outX - startHi2;
           let idx = 0;
-          if (s1 >= 0 && s1 < totalPx) {
+          if (d1 >= 0 && d1 < totalHi) {
+            const s1 = d1 >>> 1;
             const bi = s1 >>> 3;
             const bit = 7 - (s1 & 7);
             idx |=
@@ -2694,7 +4420,8 @@ export class AmigaChipset {
               (((chip[(p4 + bi) & mask] >>> bit) & 1) << 4) |
               (((chip[(p6 + bi) & mask] >>> bit) & 1) << 6);
           }
-          if (s2 >= 0 && s2 < totalPx) {
+          if (d2 >= 0 && d2 < totalHi) {
+            const s2 = d2 >>> 1;
             const bi = s2 >>> 3;
             const bit = 7 - (s2 & 7);
             idx |=
@@ -2703,21 +4430,16 @@ export class AmigaChipset {
               (((chip[(p5 + bi) & mask] >>> bit) & 1) << 5);
             if (bpu > 7) idx |= ((chip[(p7 + bi) & mask] >>> bit) & 1) << 7;
           }
+          idx &= bypassMask;
           const abgr = colors[idx ^ bplam];
-          const x2 = outPx << 1;
-          fb[rowOff + x2] = abgr;
-          fb[rowOff + x2 + 1] = abgr;
-          indices[x2] = idx;
-          indices[x2 + 1] = idx;
+          fb[rowOff + outX] = abgr;
+          indices[outX] = idx;
         }
       }
     }
 
-    // Advance bitplane pointers by fetched bytes + odd/even modulo
-    for (let p = 0; p < bpu; p++) {
-      const mod = (p & 1) === 0 ? this.bpl1Mod : this.bpl2Mod;
-      this.bplPt[p] = (this.bplPt[p] + numBytes + mod) & mask;
-    }
+    // Advance bitplane pointers by fetched bytes + odd/even modulo (with AGA BSCAN2 & unaligned carry quirk)
+    this.advanceBitplanePointers(line, bpu, numBytes, isAga, bplFmode, mask);
 
     // Apply mid-scanline Copper palette / BPLAM changes (zero overhead when both counts === 0)
     if ((this.midlineColorCount > 0 || this.midlineBplamCount > 0) && !ham) {
@@ -2726,8 +4448,52 @@ export class AmigaChipset {
     this.midlineColorCount = 0;
     this.midlineBplamCount = 0;
 
-    // Composite 8 Hardware Sprites on top
-    this.renderSpritesOnLine(rowOff, false);
+    // Hardware Playfield 1 vs Playfield 2 collision (CLXDAT bit 0)
+    if (clxOddEn !== 0 && clxEvenEn !== 0 && (this.clxDat & 1) === 0 && maxX > minX) {
+      const colPlanes = dpf ? this.clxBplLine : indices;
+      const xStep = hires || shres ? 1 : 2;
+      for (let x = minX; x < maxX; x += xStep) {
+        const pBits = colPlanes[x];
+        if (((pBits ^ clxMvMask) & clxOddEn) === 0 && ((pBits ^ clxMvMask) & clxEvenEn) === 0) {
+          this.clxDat |= 1;
+          break;
+        }
+      }
+    }
+
+    // Composite 8 Hardware Sprites on top (+ SPR vs SPR / SPR vs PF hardware collision)
+    this.renderSpritesOnLine(line, rowOff, false, brdrSprt);
+  }
+
+  private advanceBitplanePointers(
+    line: number,
+    bpu: number,
+    numBytes: number,
+    isAga: boolean,
+    bplFmode: number,
+    mask: number
+  ): void {
+    if (!isAga || (bplFmode === 0 && (this.fmode & 0x4000) === 0)) {
+      for (let p = 0; p < bpu; p++) {
+        const mod = (p & 1) === 0 ? this.bpl1Mod : this.bpl2Mod;
+        this.bplPt[p] = (this.bplPt[p] + numBytes + mod) & mask;
+      }
+      return;
+    }
+    const bscan2 = (this.fmode & 0x4000) !== 0;
+    const bscanMod = bscan2
+      ? ((((this.diwStrt >>> 8) ^ (line ^ 1)) & 1) !== 0 ? this.bpl2Mod : this.bpl1Mod)
+      : 0;
+    for (let p = 0; p < bpu; p++) {
+      const nextPt = (this.bplPt[p] + numBytes) & mask;
+      let mod = bscan2 ? bscanMod : ((p & 1) === 0 ? this.bpl1Mod : this.bpl2Mod);
+      if (bplFmode === 3) {
+        if ((nextPt & 6) + (mod & 6) >= 8) mod -= 8;
+      } else if (bplFmode !== 0) {
+        if ((nextPt & 2) !== 0 && (mod & 2) !== 0) mod -= 4;
+      }
+      this.bplPt[p] = (nextPt + mod) & mask;
+    }
   }
 
   private fillMidlineBgSpans(rowOff: number, fbW: number, startBplam: number): void {
@@ -2863,6 +4629,7 @@ export class AmigaChipset {
       this.sprDmaLineActive.fill(0);
       return;
     }
+    const isEcsOrAga = this.chipset !== 'OCS';
     const sprFmode = this.chipset === 'AGA' ? (this.fmode >>> 2) & 3 : 0;
     const mask = this.chipMask;
 
@@ -2874,8 +4641,8 @@ export class AmigaChipset {
       }
       const pos = this.sprPos[s];
       const ctl = this.sprCtl[s];
-      const vStart = ((pos >>> 8) & 0xff) | ((ctl & 0x04) << 6);
-      const vStop = ((ctl >>> 8) & 0xff) | ((ctl & 0x02) << 7);
+      const vStart = ((pos >>> 8) & 0xff) | ((ctl & 0x04) << 6) | (isEcsOrAga ? ((ctl & 0x40) << 3) : 0);
+      const vStop = ((ctl >>> 8) & 0xff) | ((ctl & 0x02) << 7) | (isEcsOrAga ? ((ctl & 0x20) << 4) : 0);
 
       if (this.sprDmaStreaming[s] === 0) {
         if (line === vStart && vStart !== vStop) {
@@ -2945,7 +4712,56 @@ export class AmigaChipset {
     }
   }
 
-  private renderSpritesOnLine(rowOff: number, emptyBg: boolean): void {
+  private recordSprCol(
+    sx: number,
+    k: number,
+    emptyBg: boolean,
+    diwHStartLo: number,
+    diwHStopLo: number,
+    colPlanes: Uint8Array,
+    clxEnMask: number,
+    clxMvMask: number,
+    clxOddEn: number,
+    clxEvenEn: number
+  ): void {
+    const pairBit = 1 << k;
+    const prev = this.sprColMask[sx];
+    if ((prev & pairBit) === 0) {
+      if (prev !== 0) {
+        if (k === 2) {
+          if ((prev & 8) !== 0) this.clxDat |= 0x4000;
+        } else if (k === 1) {
+          if ((prev & 4) !== 0) this.clxDat |= 0x1000;
+          if ((prev & 8) !== 0) this.clxDat |= 0x2000;
+        } else if (k === 0) {
+          if ((prev & 2) !== 0) this.clxDat |= 0x0200;
+          if ((prev & 4) !== 0) this.clxDat |= 0x0400;
+          if ((prev & 8) !== 0) this.clxDat |= 0x0800;
+        }
+      }
+      this.sprColMask[sx] = prev | pairBit;
+      if (sx < this.sprColMinSx) this.sprColMinSx = sx;
+      if (sx + 1 > this.sprColMaxSx) this.sprColMaxSx = sx + 1;
+      if (!emptyBg && clxEnMask !== 0 && sx >= diwHStartLo && sx < diwHStopLo) {
+        const x2 = sx << 1;
+        const p0 = colPlanes[x2];
+        const p1 = colPlanes[x2 + 1];
+        if (clxOddEn !== 0 && (((p0 ^ clxMvMask) & clxOddEn) === 0 || ((p1 ^ clxMvMask) & clxOddEn) === 0)) {
+          this.clxDat |= 1 << (1 + k);
+        }
+        if (clxEvenEn !== 0 && (((p0 ^ clxMvMask) & clxEvenEn) === 0 || ((p1 ^ clxMvMask) & clxEvenEn) === 0)) {
+          this.clxDat |= 1 << (5 + k);
+        }
+      }
+    }
+  }
+
+  private renderSpritesOnLine(
+    line: number,
+    rowOff: number,
+    emptyBg: boolean,
+    brdrSprt: boolean
+  ): void {
     const dmaActive = this.sprDmaLineActive;
     const manualArmed = this.sprArmed;
     if (
@@ -2962,35 +4778,57 @@ export class AmigaChipset {
     }
 
     const fb = this.framebuffer;
+    const fbW = this.fbWidth;
     const colors = this.colorAbgr;
     const indices = this.lineIndices;
+    const dpfSrc = this.lineDpfSrc;
     const hOriginLo = this.viewHOriginLo;
-    const viewLoWidth = this.fbWidth >>> 1;
+    const viewLoWidth = fbW >>> 1;
     const dpf = (this.bplCon0 & 0x0400) !== 0;
     const pf1P = this.bplCon2 & 0x07;
     const pf2P = (this.bplCon2 >>> 3) & 0x07;
     const isAga = this.chipset === 'AGA';
-    const brdrSprt =
-      (this.bplCon3 & 0x0002) !== 0 &&
-      (isAga || (this.chipset === 'ECS' && (this.bplCon0 & 0x0001) !== 0));
-    let clipMinLo = 0;
-    let clipMaxLo = viewLoWidth;
-    if (
-      !brdrSprt &&
-      (this.bplCon3 & 0x0020) !== 0 &&
-      (isAga || (this.chipset === 'ECS' && (this.bplCon0 & 0x0001) !== 0))
-    ) {
-      const d0 = this.diwHStart - hOriginLo;
-      const d1 = this.diwHStop - hOriginLo;
-      if (d0 > clipMinLo) clipMinLo = d0;
-      if (d1 < clipMaxLo) clipMaxLo = d1;
-      if (clipMaxLo <= clipMinLo) return;
+    const shresMode = (this.bplCon0 & 0x0040) !== 0;
+    const spres = isAga ? ((this.bplCon3 >>> 6) & 3) : 0;
+    // 0 = LORES (2 hires px), 1 = HIRES (1 hires px), 2 = SHRES (0.5 hires px -> step 2)
+    const sprPxRes = isAga
+      ? (spres === 0 ? (shresMode ? 1 : 0) : spres - 1)
+      : (this.chipset === 'ECS' && (this.bplCon0 & 0x0001) !== 0 && shresMode ? 1 : 0);
+
+    let clipMinHi = 0;
+    let clipMaxHi = fbW;
+    if (!brdrSprt && !emptyBg) {
+      const d0 = (this.diwHStart - hOriginLo) << 1;
+      const d1 = (this.diwHStop - hOriginLo) << 1;
+      if (d0 > clipMinHi) clipMinHi = d0;
+      if (d1 < clipMaxHi) clipMaxHi = d1;
+      if (clipMaxHi <= clipMinHi) return;
     }
+
     const sprFmode = isAga ? (this.fmode >>> 2) & 3 : 0;
     const sprWidth = sprFmode === 3 ? 64 : sprFmode !== 0 ? 32 : 16;
-    const dpfBound = isAga ? Math.max(8, PF2OF_TABLE[(this.bplCon3 >>> 10) & 7]) : 8;
     const evenPalBank = isAga ? (this.bplCon4 & 0x00f0) : 16;
     const oddPalBank = isAga ? ((this.bplCon4 & 0x000f) << 4) : 16;
+    const trackAutoBrdr = brdrSprt && this.overscanMode === 'auto';
+    let drawnMinLo = 0x3ff;
+    let drawnMaxLo = 0;
+
+    this.sprColMinSx = viewLoWidth;
+    this.sprColMaxSx = 0;
+    const colPlanes = dpf ? this.clxBplLine : indices;
+    const en6 = (this.clxCon >>> 6) & 0x3f;
+    const mv6 = this.clxCon & 0x3f;
+    const clxEnMask = this.chipset !== 'OCS' ? ((this.clxCon2 & 0xc0) | en6) : en6;
+    const clxMvMask = this.chipset !== 'OCS' ? (((this.clxCon2 & 0x03) << 6) | mv6) : mv6;
+    const clxOddEn = clxEnMask & 0x55;
+    const clxEvenEn = clxEnMask & 0xaa;
+    let diwHStartLo = this.diwHStart - hOriginLo;
+    let diwHStopLo = this.diwHStop - hOriginLo;
+    if (diwHStartLo < 0) diwHStartLo = 0;
+    if (diwHStopLo > viewLoWidth) diwHStopLo = viewLoWidth;
+
+    const dxStep = sprPxRes === 2 ? 2 : 1;
+    const pxWidthHi = sprPxRes === 0 ? 2 : 1;
 
     for (let k = 3; k >= 0; k--) {
       const e = k << 1;
@@ -3000,265 +4838,476 @@ export class AmigaChipset {
       if (!eOn && !oOn) continue;
 
       const attached = (this.sprCtl[o] & 0x0080) !== 0;
+      const oddEnSp = ((this.clxCon >>> (12 + k)) & 1) !== 0;
 
-      if (sprWidth === 16) {
-        if (attached) {
-          const posE = this.sprPos[e];
-          const ctlE = this.sprCtl[e];
-          const hE = (((posE & 0xff) << 1) | (ctlE & 1)) - hOriginLo;
-          const posO = this.sprPos[o];
-          const ctlO = this.sprCtl[o];
-          const hO = (((posO & 0xff) << 1) | (ctlO & 1)) - hOriginLo;
+      const posE = this.sprPos[e];
+      const ctlE = this.sprCtl[e];
+      const hLoE = ((posE & 0xff) << 1) | (ctlE & 1);
+      const subHiE = isAga ? ((ctlE >>> 4) & 1) : 0;
+      const hHiE = ((hLoE - hOriginLo) << 1) + subHiE;
 
-          const datAe = eOn ? this.sprData[e] : 0;
-          const datBe = eOn ? this.sprDatb[e] : 0;
-          const datAo = oOn ? this.sprData[o] : 0;
-          const datBo = oOn ? this.sprDatb[o] : 0;
+      const posO = this.sprPos[o];
+      const ctlO = this.sprCtl[o];
+      const hLoO = ((posO & 0xff) << 1) | (ctlO & 1);
+      const subHiO = isAga ? ((ctlO >>> 4) & 1) : 0;
+      const hHiO = ((hLoO - hOriginLo) << 1) + subHiO;
 
-          if (eOn && oOn && hE === hO) {
-            for (let bit = 15; bit >= 0; bit--) {
-              const col4 =
-                ((datAe >>> bit) & 1) |
-                (((datBe >>> bit) & 1) << 1) |
-                (((datAo >>> bit) & 1) << 2) |
-                (((datBo >>> bit) & 1) << 3);
-              if (col4 === 0) continue;
-              const sx = hE + (15 - bit);
-              if (sx < clipMinLo || sx >= clipMaxLo) continue;
-              const abgr = colors[evenPalBank + col4];
-              const x2 = sx << 1;
-              if (emptyBg) {
-                fb[rowOff + x2] = abgr;
-                fb[rowOff + x2 + 1] = abgr;
-              } else {
-                const i0 = indices[x2];
-                const i1 = indices[x2 + 1];
-                if (i0 === 0 || (!dpf ? k < pf2P : i0 < dpfBound ? k < pf1P : k < pf2P)) {
-                  fb[rowOff + x2] = abgr;
+      if (sprPxRes === 0 && subHiE === 0 && subHiO === 0) {
+        // Fast LoRes 2x path (99% of Amiga games, zero extra branches)
+        const hE = hLoE - hOriginLo;
+        const hO = hLoO - hOriginLo;
+        const clipMinLo = clipMinHi >>> 1;
+        const clipMaxLo = clipMaxHi >>> 1;
+
+        if (sprWidth === 16) {
+          if (attached) {
+            const datAe = eOn ? this.sprData[e] : 0;
+            const datBe = eOn ? this.sprDatb[e] : 0;
+            const datAo = oOn ? this.sprData[o] : 0;
+            const datBo = oOn ? this.sprDatb[o] : 0;
+
+            if (eOn && oOn && hE === hO) {
+              for (let bit = 15; bit >= 0; bit--) {
+                const col4 =
+                  ((datAe >>> bit) & 1) |
+                  (((datBe >>> bit) & 1) << 1) |
+                  (((datAo >>> bit) & 1) << 2) |
+                  (((datBo >>> bit) & 1) << 3);
+                if (col4 === 0) continue;
+                const sx = hE + (15 - bit);
+                if (trackAutoBrdr) {
+                  const absLo = hOriginLo + sx;
+                  if (absLo < drawnMinLo) drawnMinLo = absLo;
+                  if (absLo + 1 > drawnMaxLo) drawnMaxLo = absLo + 1;
                 }
-                if (i1 === 0 || (!dpf ? k < pf2P : i1 < dpfBound ? k < pf1P : k < pf2P)) {
+                if (sx < clipMinLo || sx >= clipMaxLo) continue;
+                if ((col4 & 3) !== 0 || (oddEnSp && (col4 & 12) !== 0)) {
+                  this.recordSprCol(sx, k, emptyBg, diwHStartLo, diwHStopLo, colPlanes, clxEnMask, clxMvMask, clxOddEn, clxEvenEn);
+                }
+                const abgr = colors[oddPalBank + col4];
+                const x2 = sx << 1;
+                if (emptyBg) {
+                  fb[rowOff + x2] = abgr;
                   fb[rowOff + x2 + 1] = abgr;
+                } else if (!dpf) {
+                  if (indices[x2] === 0 || k < pf2P) fb[rowOff + x2] = abgr;
+                  if (indices[x2 + 1] === 0 || k < pf2P) fb[rowOff + x2 + 1] = abgr;
+                } else {
+                  const d0 = dpfSrc[x2];
+                  if (d0 === 0 || (d0 === 1 ? k < pf1P : k < pf2P)) fb[rowOff + x2] = abgr;
+                  const d1 = dpfSrc[x2 + 1];
+                  if (d1 === 0 || (d1 === 1 ? k < pf1P : k < pf2P)) fb[rowOff + x2 + 1] = abgr;
+                }
+              }
+            } else {
+              let minSx = viewLoWidth;
+              let maxSx = -16;
+              if (eOn) {
+                if (hE < minSx) minSx = hE;
+                if (hE + 16 > maxSx) maxSx = hE + 16;
+              }
+              if (oOn) {
+                if (hO < minSx) minSx = hO;
+                if (hO + 16 > maxSx) maxSx = hO + 16;
+              }
+              if (!trackAutoBrdr) {
+                if (minSx < clipMinLo) minSx = clipMinLo;
+                if (maxSx > clipMaxLo) maxSx = clipMaxLo;
+              }
+              for (let sx = minSx; sx < maxSx; sx++) {
+                let col4 = 0;
+                if (eOn) {
+                  const de = sx - hE;
+                  if (de >= 0 && de < 16) {
+                    const bit = 15 - de;
+                    col4 |= ((datAe >>> bit) & 1) | (((datBe >>> bit) & 1) << 1);
+                  }
+                }
+                if (oOn) {
+                  const dOdd = sx - hO;
+                  if (dOdd >= 0 && dOdd < 16) {
+                    const bit = 15 - dOdd;
+                    col4 |= (((datAo >>> bit) & 1) << 2) | (((datBo >>> bit) & 1) << 3);
+                  }
+                }
+                if (col4 === 0) continue;
+                if (trackAutoBrdr) {
+                  const absLo = hOriginLo + sx;
+                  if (absLo < drawnMinLo) drawnMinLo = absLo;
+                  if (absLo + 1 > drawnMaxLo) drawnMaxLo = absLo + 1;
+                }
+                if (sx < clipMinLo || sx >= clipMaxLo) continue;
+                if ((col4 & 3) !== 0 || (oddEnSp && (col4 & 12) !== 0)) {
+                  this.recordSprCol(sx, k, emptyBg, diwHStartLo, diwHStopLo, colPlanes, clxEnMask, clxMvMask, clxOddEn, clxEvenEn);
+                }
+                const abgr = colors[oddPalBank + col4];
+                const x2 = sx << 1;
+                if (emptyBg) {
+                  fb[rowOff + x2] = abgr;
+                  fb[rowOff + x2 + 1] = abgr;
+                } else if (!dpf) {
+                  if (indices[x2] === 0 || k < pf2P) fb[rowOff + x2] = abgr;
+                  if (indices[x2 + 1] === 0 || k < pf2P) fb[rowOff + x2 + 1] = abgr;
+                } else {
+                  const d0 = dpfSrc[x2];
+                  if (d0 === 0 || (d0 === 1 ? k < pf1P : k < pf2P)) fb[rowOff + x2] = abgr;
+                  const d1 = dpfSrc[x2 + 1];
+                  if (d1 === 0 || (d1 === 1 ? k < pf1P : k < pf2P)) fb[rowOff + x2 + 1] = abgr;
                 }
               }
             }
           } else {
-            let minSx = clipMaxLo;
-            let maxSx = clipMinLo;
-            if (eOn) {
-              if (hE < minSx) minSx = hE;
-              if (hE + 16 > maxSx) maxSx = hE + 16;
-            }
+            const baseColorO = oddPalBank + (k << 2);
+            const baseColorE = evenPalBank + (k << 2);
             if (oOn) {
-              if (hO < minSx) minSx = hO;
-              if (hO + 16 > maxSx) maxSx = hO + 16;
-            }
-            if (minSx < clipMinLo) minSx = clipMinLo;
-            if (maxSx > clipMaxLo) maxSx = clipMaxLo;
-            for (let sx = minSx; sx < maxSx; sx++) {
-              let col4 = 0;
-              if (eOn) {
-                const de = sx - hE;
-                if (de >= 0 && de < 16) {
-                  const bit = 15 - de;
-                  col4 |= ((datAe >>> bit) & 1) | (((datBe >>> bit) & 1) << 1);
+              const datA = this.sprData[o];
+              const datB = this.sprDatb[o];
+              for (let bit = 15; bit >= 0; bit--) {
+                const pxCol = ((datA >>> bit) & 1) | (((datB >>> bit) & 1) << 1);
+                if (pxCol === 0) continue;
+                const sx = hO + (15 - bit);
+                if (trackAutoBrdr) {
+                  const absLo = hOriginLo + sx;
+                  if (absLo < drawnMinLo) drawnMinLo = absLo;
+                  if (absLo + 1 > drawnMaxLo) drawnMaxLo = absLo + 1;
                 }
-              }
-              if (oOn) {
-                const dOdd = sx - hO;
-                if (dOdd >= 0 && dOdd < 16) {
-                  const bit = 15 - dOdd;
-                  col4 |= (((datAo >>> bit) & 1) << 2) | (((datBo >>> bit) & 1) << 3);
+                if (sx < clipMinLo || sx >= clipMaxLo) continue;
+                if (oddEnSp) {
+                  this.recordSprCol(sx, k, emptyBg, diwHStartLo, diwHStopLo, colPlanes, clxEnMask, clxMvMask, clxOddEn, clxEvenEn);
                 }
-              }
-              if (col4 === 0) continue;
-              const abgr = colors[evenPalBank + col4];
-              const x2 = sx << 1;
-              if (emptyBg) {
-                fb[rowOff + x2] = abgr;
-                fb[rowOff + x2 + 1] = abgr;
-              } else {
-                const i0 = indices[x2];
-                const i1 = indices[x2 + 1];
-                if (i0 === 0 || (!dpf ? k < pf2P : i0 < dpfBound ? k < pf1P : k < pf2P)) {
+                const abgr = colors[baseColorO + pxCol];
+                const x2 = sx << 1;
+                if (emptyBg) {
                   fb[rowOff + x2] = abgr;
-                }
-                if (i1 === 0 || (!dpf ? k < pf2P : i1 < dpfBound ? k < pf1P : k < pf2P)) {
                   fb[rowOff + x2 + 1] = abgr;
+                } else if (!dpf) {
+                  if (indices[x2] === 0 || k < pf2P) fb[rowOff + x2] = abgr;
+                  if (indices[x2 + 1] === 0 || k < pf2P) fb[rowOff + x2 + 1] = abgr;
+                } else {
+                  const d0 = dpfSrc[x2];
+                  if (d0 === 0 || (d0 === 1 ? k < pf1P : k < pf2P)) fb[rowOff + x2] = abgr;
+                  const d1 = dpfSrc[x2 + 1];
+                  if (d1 === 0 || (d1 === 1 ? k < pf1P : k < pf2P)) fb[rowOff + x2 + 1] = abgr;
+                }
+              }
+            }
+            if (eOn) {
+              const datA = this.sprData[e];
+              const datB = this.sprDatb[e];
+              for (let bit = 15; bit >= 0; bit--) {
+                const pxCol = ((datA >>> bit) & 1) | (((datB >>> bit) & 1) << 1);
+                if (pxCol === 0) continue;
+                const sx = hE + (15 - bit);
+                if (trackAutoBrdr) {
+                  const absLo = hOriginLo + sx;
+                  if (absLo < drawnMinLo) drawnMinLo = absLo;
+                  if (absLo + 1 > drawnMaxLo) drawnMaxLo = absLo + 1;
+                }
+                if (sx < clipMinLo || sx >= clipMaxLo) continue;
+                this.recordSprCol(sx, k, emptyBg, diwHStartLo, diwHStopLo, colPlanes, clxEnMask, clxMvMask, clxOddEn, clxEvenEn);
+                const abgr = colors[baseColorE + pxCol];
+                const x2 = sx << 1;
+                if (emptyBg) {
+                  fb[rowOff + x2] = abgr;
+                  fb[rowOff + x2 + 1] = abgr;
+                } else if (!dpf) {
+                  if (indices[x2] === 0 || k < pf2P) fb[rowOff + x2] = abgr;
+                  if (indices[x2 + 1] === 0 || k < pf2P) fb[rowOff + x2 + 1] = abgr;
+                } else {
+                  const d0 = dpfSrc[x2];
+                  if (d0 === 0 || (d0 === 1 ? k < pf1P : k < pf2P)) fb[rowOff + x2] = abgr;
+                  const d1 = dpfSrc[x2 + 1];
+                  if (d1 === 0 || (d1 === 1 ? k < pf1P : k < pf2P)) fb[rowOff + x2 + 1] = abgr;
                 }
               }
             }
           }
         } else {
-          const baseColorO = oddPalBank + (k << 2);
-          const baseColorE = evenPalBank + (k << 2);
-          if (oOn) {
-            const datA = this.sprData[o];
-            const datB = this.sprDatb[o];
-            const pos = this.sprPos[o];
-            const ctl = this.sprCtl[o];
-            const hStart = (((pos & 0xff) << 1) | (ctl & 1)) - hOriginLo;
-            for (let bit = 15; bit >= 0; bit--) {
-              const pxCol = ((datA >>> bit) & 1) | (((datB >>> bit) & 1) << 1);
-              if (pxCol === 0) continue;
-              const sx = hStart + (15 - bit);
+          // AGA 32px / 64px wide LoRes sprites (FMODE sprite width 2x / 4x)
+          if (attached) {
+            let minSx = viewLoWidth;
+            let maxSx = -64;
+            if (eOn) {
+              if (hE < minSx) minSx = hE;
+              if (hE + sprWidth > maxSx) maxSx = hE + sprWidth;
+            }
+            if (oOn) {
+              if (hO < minSx) minSx = hO;
+              if (hO + sprWidth > maxSx) maxSx = hO + sprWidth;
+            }
+            if (!trackAutoBrdr) {
+              if (minSx < clipMinLo) minSx = clipMinLo;
+              if (maxSx > clipMaxLo) maxSx = clipMaxLo;
+            }
+            for (let sx = minSx; sx < maxSx; sx++) {
+              let col4 = 0;
+              if (eOn) {
+                const de = sx - hE;
+                if (de >= 0 && de < sprWidth) {
+                  const wA = de < 32 ? this.sprDataLo[e] : this.sprDataHi[e];
+                  const wB = de < 32 ? this.sprDatbLo[e] : this.sprDatbHi[e];
+                  const bit = 31 - (de & 31);
+                  col4 |= ((wA >>> bit) & 1) | (((wB >>> bit) & 1) << 1);
+                }
+              }
+              if (oOn) {
+                const dOdd = sx - hO;
+                if (dOdd >= 0 && dOdd < sprWidth) {
+                  const wA = dOdd < 32 ? this.sprDataLo[o] : this.sprDataHi[o];
+                  const wB = dOdd < 32 ? this.sprDatbLo[o] : this.sprDatbHi[o];
+                  const bit = 31 - (dOdd & 31);
+                  col4 |= (((wA >>> bit) & 1) << 2) | (((wB >>> bit) & 1) << 3);
+                }
+              }
+              if (col4 === 0) continue;
+              if (trackAutoBrdr) {
+                const absLo = hOriginLo + sx;
+                if (absLo < drawnMinLo) drawnMinLo = absLo;
+                if (absLo + 1 > drawnMaxLo) drawnMaxLo = absLo + 1;
+              }
               if (sx < clipMinLo || sx >= clipMaxLo) continue;
-              const abgr = colors[baseColorO + pxCol];
+              if ((col4 & 3) !== 0 || (oddEnSp && (col4 & 12) !== 0)) {
+                this.recordSprCol(sx, k, emptyBg, diwHStartLo, diwHStopLo, colPlanes, clxEnMask, clxMvMask, clxOddEn, clxEvenEn);
+              }
+              const abgr = colors[oddPalBank + col4];
               const x2 = sx << 1;
               if (emptyBg) {
                 fb[rowOff + x2] = abgr;
                 fb[rowOff + x2 + 1] = abgr;
+              } else if (!dpf) {
+                if (indices[x2] === 0 || k < pf2P) fb[rowOff + x2] = abgr;
+                if (indices[x2 + 1] === 0 || k < pf2P) fb[rowOff + x2 + 1] = abgr;
               } else {
-                const i0 = indices[x2];
-                const i1 = indices[x2 + 1];
-                if (i0 === 0 || (!dpf ? k < pf2P : i0 < dpfBound ? k < pf1P : k < pf2P)) {
-                  fb[rowOff + x2] = abgr;
+                const d0 = dpfSrc[x2];
+                if (d0 === 0 || (d0 === 1 ? k < pf1P : k < pf2P)) fb[rowOff + x2] = abgr;
+                const d1 = dpfSrc[x2 + 1];
+                if (d1 === 0 || (d1 === 1 ? k < pf1P : k < pf2P)) fb[rowOff + x2 + 1] = abgr;
+              }
+            }
+          } else {
+            if (oOn) {
+              const baseColorO = oddPalBank + (k << 2);
+              for (let dx = 0; dx < sprWidth; dx++) {
+                const sx = hO + dx;
+                const wA = dx < 32 ? this.sprDataLo[o] : this.sprDataHi[o];
+                const wB = dx < 32 ? this.sprDatbLo[o] : this.sprDatbHi[o];
+                const bit = 31 - (dx & 31);
+                const pxCol = ((wA >>> bit) & 1) | (((wB >>> bit) & 1) << 1);
+                if (pxCol === 0) continue;
+                if (trackAutoBrdr) {
+                  const absLo = hOriginLo + sx;
+                  if (absLo < drawnMinLo) drawnMinLo = absLo;
+                  if (absLo + 1 > drawnMaxLo) drawnMaxLo = absLo + 1;
                 }
-                if (i1 === 0 || (!dpf ? k < pf2P : i1 < dpfBound ? k < pf1P : k < pf2P)) {
+                if (sx < clipMinLo || sx >= clipMaxLo) continue;
+                if (oddEnSp) {
+                  this.recordSprCol(sx, k, emptyBg, diwHStartLo, diwHStopLo, colPlanes, clxEnMask, clxMvMask, clxOddEn, clxEvenEn);
+                }
+                const abgr = colors[baseColorO + pxCol];
+                const x2 = sx << 1;
+                if (emptyBg) {
+                  fb[rowOff + x2] = abgr;
                   fb[rowOff + x2 + 1] = abgr;
+                } else if (!dpf) {
+                  if (indices[x2] === 0 || k < pf2P) fb[rowOff + x2] = abgr;
+                  if (indices[x2 + 1] === 0 || k < pf2P) fb[rowOff + x2 + 1] = abgr;
+                } else {
+                  const d0 = dpfSrc[x2];
+                  if (d0 === 0 || (d0 === 1 ? k < pf1P : k < pf2P)) fb[rowOff + x2] = abgr;
+                  const d1 = dpfSrc[x2 + 1];
+                  if (d1 === 0 || (d1 === 1 ? k < pf1P : k < pf2P)) fb[rowOff + x2 + 1] = abgr;
                 }
               }
             }
-          }
-          if (eOn) {
-            const datA = this.sprData[e];
-            const datB = this.sprDatb[e];
-            const pos = this.sprPos[e];
-            const ctl = this.sprCtl[e];
-            const hStart = (((pos & 0xff) << 1) | (ctl & 1)) - hOriginLo;
-            for (let bit = 15; bit >= 0; bit--) {
-              const pxCol = ((datA >>> bit) & 1) | (((datB >>> bit) & 1) << 1);
-              if (pxCol === 0) continue;
-              const sx = hStart + (15 - bit);
-              if (sx < clipMinLo || sx >= clipMaxLo) continue;
-              const abgr = colors[baseColorE + pxCol];
-              const x2 = sx << 1;
-              if (emptyBg) {
-                fb[rowOff + x2] = abgr;
-                fb[rowOff + x2 + 1] = abgr;
-              } else {
-                const i0 = indices[x2];
-                const i1 = indices[x2 + 1];
-                if (i0 === 0 || (!dpf ? k < pf2P : i0 < dpfBound ? k < pf1P : k < pf2P)) {
-                  fb[rowOff + x2] = abgr;
+            if (eOn) {
+              const baseColorE = evenPalBank + (k << 2);
+              for (let dx = 0; dx < sprWidth; dx++) {
+                const sx = hE + dx;
+                const wA = dx < 32 ? this.sprDataLo[e] : this.sprDataHi[e];
+                const wB = dx < 32 ? this.sprDatbLo[e] : this.sprDatbHi[e];
+                const bit = 31 - (dx & 31);
+                const pxCol = ((wA >>> bit) & 1) | (((wB >>> bit) & 1) << 1);
+                if (pxCol === 0) continue;
+                if (trackAutoBrdr) {
+                  const absLo = hOriginLo + sx;
+                  if (absLo < drawnMinLo) drawnMinLo = absLo;
+                  if (absLo + 1 > drawnMaxLo) drawnMaxLo = absLo + 1;
                 }
-                if (i1 === 0 || (!dpf ? k < pf2P : i1 < dpfBound ? k < pf1P : k < pf2P)) {
+                if (sx < clipMinLo || sx >= clipMaxLo) continue;
+                this.recordSprCol(sx, k, emptyBg, diwHStartLo, diwHStopLo, colPlanes, clxEnMask, clxMvMask, clxOddEn, clxEvenEn);
+                const abgr = colors[baseColorE + pxCol];
+                const x2 = sx << 1;
+                if (emptyBg) {
+                  fb[rowOff + x2] = abgr;
                   fb[rowOff + x2 + 1] = abgr;
+                } else if (!dpf) {
+                  if (indices[x2] === 0 || k < pf2P) fb[rowOff + x2] = abgr;
+                  if (indices[x2 + 1] === 0 || k < pf2P) fb[rowOff + x2 + 1] = abgr;
+                } else {
+                  const d0 = dpfSrc[x2];
+                  if (d0 === 0 || (d0 === 1 ? k < pf1P : k < pf2P)) fb[rowOff + x2] = abgr;
+                  const d1 = dpfSrc[x2 + 1];
+                  if (d1 === 0 || (d1 === 1 ? k < pf1P : k < pf2P)) fb[rowOff + x2 + 1] = abgr;
                 }
               }
             }
           }
         }
       } else {
-        // AGA 32px / 64px wide sprites (FMODE sprite width 2x / 4x)
-        const hE = (((this.sprPos[e] & 0xff) << 1) | (this.sprCtl[e] & 1)) - hOriginLo;
-        const hO = (((this.sprPos[o] & 0xff) << 1) | (this.sprCtl[o] & 1)) - hOriginLo;
+        // ECS/AGA Hi-Res / SHRES / 70ns subpixel sprite path
+        const sprStepShift = sprPxRes === 2 ? 1 : 0;
+        const maxWordShift = sprWidth === 16 ? 15 : 31;
         if (attached) {
-          let minSx = clipMaxLo;
-          let maxSx = clipMinLo;
+          const spanHi = (sprWidth >> sprStepShift) * pxWidthHi;
+          let minXHi = clipMaxHi;
+          let maxXHi = clipMinHi;
           if (eOn) {
-            if (hE < minSx) minSx = hE;
-            if (hE + sprWidth > maxSx) maxSx = hE + sprWidth;
+            if (hHiE < minXHi) minXHi = hHiE;
+            if (hHiE + spanHi > maxXHi) maxXHi = hHiE + spanHi;
           }
           if (oOn) {
-            if (hO < minSx) minSx = hO;
-            if (hO + sprWidth > maxSx) maxSx = hO + sprWidth;
+            if (hHiO < minXHi) minXHi = hHiO;
+            if (hHiO + spanHi > maxXHi) maxXHi = hHiO + spanHi;
           }
-          if (minSx < clipMinLo) minSx = clipMinLo;
-          if (maxSx > clipMaxLo) maxSx = clipMaxLo;
-          for (let sx = minSx; sx < maxSx; sx++) {
+          if (!trackAutoBrdr) {
+            if (minXHi < clipMinHi) minXHi = clipMinHi;
+            if (maxXHi > clipMaxHi) maxXHi = clipMaxHi;
+          }
+          for (let hx = minXHi; hx < maxXHi; hx += pxWidthHi) {
             let col4 = 0;
             if (eOn) {
-              const de = sx - hE;
+              const de = pxWidthHi === 2 ? (hx - hHiE) >> 1 : ((hx - hHiE) << sprStepShift);
               if (de >= 0 && de < sprWidth) {
-                const wA = de < 32 ? this.sprDataLo[e] : this.sprDataHi[e];
-                const wB = de < 32 ? this.sprDatbLo[e] : this.sprDatbHi[e];
-                const bit = 31 - (de & 31);
+                const wA = sprWidth === 16 ? this.sprData[e] : de < 32 ? this.sprDataLo[e] : this.sprDataHi[e];
+                const wB = sprWidth === 16 ? this.sprDatb[e] : de < 32 ? this.sprDatbLo[e] : this.sprDatbHi[e];
+                const bit = maxWordShift - (de & maxWordShift);
                 col4 |= ((wA >>> bit) & 1) | (((wB >>> bit) & 1) << 1);
               }
             }
             if (oOn) {
-              const dOdd = sx - hO;
+              const dOdd = pxWidthHi === 2 ? (hx - hHiO) >> 1 : ((hx - hHiO) << sprStepShift);
               if (dOdd >= 0 && dOdd < sprWidth) {
-                const wA = dOdd < 32 ? this.sprDataLo[o] : this.sprDataHi[o];
-                const wB = dOdd < 32 ? this.sprDatbLo[o] : this.sprDatbHi[o];
-                const bit = 31 - (dOdd & 31);
+                const wA = sprWidth === 16 ? this.sprData[o] : dOdd < 32 ? this.sprDataLo[o] : this.sprDataHi[o];
+                const wB = sprWidth === 16 ? this.sprDatb[o] : dOdd < 32 ? this.sprDatbLo[o] : this.sprDatbHi[o];
+                const bit = maxWordShift - (dOdd & maxWordShift);
                 col4 |= (((wA >>> bit) & 1) << 2) | (((wB >>> bit) & 1) << 3);
               }
             }
             if (col4 === 0) continue;
-            const abgr = colors[evenPalBank + col4];
-            const x2 = sx << 1;
-            if (emptyBg) {
-              fb[rowOff + x2] = abgr;
-              fb[rowOff + x2 + 1] = abgr;
-            } else {
-              const i0 = indices[x2];
-              const i1 = indices[x2 + 1];
-              if (i0 === 0 || (!dpf ? k < pf2P : i0 < dpfBound ? k < pf1P : k < pf2P)) {
-                fb[rowOff + x2] = abgr;
-              }
-              if (i1 === 0 || (!dpf ? k < pf2P : i1 < dpfBound ? k < pf1P : k < pf2P)) {
-                fb[rowOff + x2 + 1] = abgr;
+            if (trackAutoBrdr) {
+              const abs0 = hOriginLo + (hx >> 1);
+              const abs1 = hOriginLo + ((hx + pxWidthHi + 1) >> 1);
+              if (abs0 < drawnMinLo) drawnMinLo = abs0;
+              if (abs1 > drawnMaxLo) drawnMaxLo = abs1;
+            }
+            if (hx + pxWidthHi <= clipMinHi || hx >= clipMaxHi) continue;
+            const sx = hx >> 1;
+            if (sx >= 0 && sx < viewLoWidth && ((col4 & 3) !== 0 || (oddEnSp && (col4 & 12) !== 0))) {
+              this.recordSprCol(sx, k, emptyBg, diwHStartLo, diwHStopLo, colPlanes, clxEnMask, clxMvMask, clxOddEn, clxEvenEn);
+            }
+            const abgr = colors[oddPalBank + col4];
+            for (let sub = 0; sub < pxWidthHi; sub++) {
+              const px = hx + sub;
+              if (px < clipMinHi || px >= clipMaxHi) continue;
+              if (emptyBg) {
+                fb[rowOff + px] = abgr;
+              } else if (!dpf) {
+                if (indices[px] === 0 || k < pf2P) fb[rowOff + px] = abgr;
+              } else {
+                const d = dpfSrc[px];
+                if (d === 0 || (d === 1 ? k < pf1P : k < pf2P)) fb[rowOff + px] = abgr;
               }
             }
           }
         } else {
           if (oOn) {
             const baseColorO = oddPalBank + (k << 2);
-            for (let dx = 0; dx < sprWidth; dx++) {
-              const sx = hO + dx;
-              if (sx < clipMinLo || sx >= clipMaxLo) continue;
-              const wA = dx < 32 ? this.sprDataLo[o] : this.sprDataHi[o];
-              const wB = dx < 32 ? this.sprDatbLo[o] : this.sprDatbHi[o];
-              const bit = 31 - (dx & 31);
+            for (let dx = 0; dx < sprWidth; dx += dxStep) {
+              const wA = sprWidth === 16 ? this.sprData[o] : dx < 32 ? this.sprDataLo[o] : this.sprDataHi[o];
+              const wB = sprWidth === 16 ? this.sprDatb[o] : dx < 32 ? this.sprDatbLo[o] : this.sprDatbHi[o];
+              const bit = maxWordShift - (dx & maxWordShift);
               const pxCol = ((wA >>> bit) & 1) | (((wB >>> bit) & 1) << 1);
               if (pxCol === 0) continue;
+              const hx = hHiO + (pxWidthHi === 2 ? dx << 1 : (dx >>> sprStepShift));
+              if (trackAutoBrdr) {
+                const abs0 = hOriginLo + (hx >> 1);
+                const abs1 = hOriginLo + ((hx + pxWidthHi + 1) >> 1);
+                if (abs0 < drawnMinLo) drawnMinLo = abs0;
+                if (abs1 > drawnMaxLo) drawnMaxLo = abs1;
+              }
+              if (hx + pxWidthHi <= clipMinHi || hx >= clipMaxHi) continue;
+              const sx = hx >> 1;
+              if (oddEnSp && sx >= 0 && sx < viewLoWidth) {
+                this.recordSprCol(sx, k, emptyBg, diwHStartLo, diwHStopLo, colPlanes, clxEnMask, clxMvMask, clxOddEn, clxEvenEn);
+              }
               const abgr = colors[baseColorO + pxCol];
-              const x2 = sx << 1;
-              if (emptyBg) {
-                fb[rowOff + x2] = abgr;
-                fb[rowOff + x2 + 1] = abgr;
-              } else {
-                const i0 = indices[x2];
-                const i1 = indices[x2 + 1];
-                if (i0 === 0 || (!dpf ? k < pf2P : i0 < dpfBound ? k < pf1P : k < pf2P)) {
-                  fb[rowOff + x2] = abgr;
-                }
-                if (i1 === 0 || (!dpf ? k < pf2P : i1 < dpfBound ? k < pf1P : k < pf2P)) {
-                  fb[rowOff + x2 + 1] = abgr;
+              for (let sub = 0; sub < pxWidthHi; sub++) {
+                const px = hx + sub;
+                if (px < clipMinHi || px >= clipMaxHi) continue;
+                if (emptyBg) {
+                  fb[rowOff + px] = abgr;
+                } else if (!dpf) {
+                  if (indices[px] === 0 || k < pf2P) fb[rowOff + px] = abgr;
+                } else {
+                  const d = dpfSrc[px];
+                  if (d === 0 || (d === 1 ? k < pf1P : k < pf2P)) fb[rowOff + px] = abgr;
                 }
               }
             }
           }
           if (eOn) {
             const baseColorE = evenPalBank + (k << 2);
-            for (let dx = 0; dx < sprWidth; dx++) {
-              const sx = hE + dx;
-              if (sx < clipMinLo || sx >= clipMaxLo) continue;
-              const wA = dx < 32 ? this.sprDataLo[e] : this.sprDataHi[e];
-              const wB = dx < 32 ? this.sprDatbLo[e] : this.sprDatbHi[e];
-              const bit = 31 - (dx & 31);
+            for (let dx = 0; dx < sprWidth; dx += dxStep) {
+              const wA = sprWidth === 16 ? this.sprData[e] : dx < 32 ? this.sprDataLo[e] : this.sprDataHi[e];
+              const wB = sprWidth === 16 ? this.sprDatb[e] : dx < 32 ? this.sprDatbLo[e] : this.sprDatbHi[e];
+              const bit = maxWordShift - (dx & maxWordShift);
               const pxCol = ((wA >>> bit) & 1) | (((wB >>> bit) & 1) << 1);
               if (pxCol === 0) continue;
+              const hx = hHiE + (pxWidthHi === 2 ? dx << 1 : (dx >>> sprStepShift));
+              if (trackAutoBrdr) {
+                const abs0 = hOriginLo + (hx >> 1);
+                const abs1 = hOriginLo + ((hx + pxWidthHi + 1) >> 1);
+                if (abs0 < drawnMinLo) drawnMinLo = abs0;
+                if (abs1 > drawnMaxLo) drawnMaxLo = abs1;
+              }
+              if (hx + pxWidthHi <= clipMinHi || hx >= clipMaxHi) continue;
+              const sx = hx >> 1;
+              if (sx >= 0 && sx < viewLoWidth) {
+                this.recordSprCol(sx, k, emptyBg, diwHStartLo, diwHStopLo, colPlanes, clxEnMask, clxMvMask, clxOddEn, clxEvenEn);
+              }
               const abgr = colors[baseColorE + pxCol];
-              const x2 = sx << 1;
-              if (emptyBg) {
-                fb[rowOff + x2] = abgr;
-                fb[rowOff + x2 + 1] = abgr;
-              } else {
-                const i0 = indices[x2];
-                const i1 = indices[x2 + 1];
-                if (i0 === 0 || (!dpf ? k < pf2P : i0 < dpfBound ? k < pf1P : k < pf2P)) {
-                  fb[rowOff + x2] = abgr;
-                }
-                if (i1 === 0 || (!dpf ? k < pf2P : i1 < dpfBound ? k < pf1P : k < pf2P)) {
-                  fb[rowOff + x2 + 1] = abgr;
+              for (let sub = 0; sub < pxWidthHi; sub++) {
+                const px = hx + sub;
+                if (px < clipMinHi || px >= clipMaxHi) continue;
+                if (emptyBg) {
+                  fb[rowOff + px] = abgr;
+                } else if (!dpf) {
+                  if (indices[px] === 0 || k < pf2P) fb[rowOff + px] = abgr;
+                } else {
+                  const d = dpfSrc[px];
+                  if (d === 0 || (d === 1 ? k < pf1P : k < pf2P)) fb[rowOff + px] = abgr;
                 }
               }
             }
           }
         }
       }
+    }
+
+    if (trackAutoBrdr && drawnMaxLo > drawnMinLo) {
+      this.frameDiwActive = true;
+      if (drawnMinLo < this.frameDiwMinH) this.frameDiwMinH = drawnMinLo;
+      if (drawnMaxLo > this.frameDiwMaxH) this.frameDiwMaxH = drawnMaxLo;
+      const minRas = this.isPalTiming() ? 26 : 22;
+      const maxRas = this.isPalTiming() ? 312 : 262;
+      if (line >= minRas && line < maxRas) {
+        if (line < this.frameDiwMinV) this.frameDiwMinV = line;
+        if (line + 1 > this.frameDiwMaxV) this.frameDiwMaxV = line + 1;
+      }
+    }
+
+    if (this.sprColMaxSx > this.sprColMinSx) {
+      this.sprColMask.fill(0, this.sprColMinSx, this.sprColMaxSx);
     }
   }
 
@@ -3314,14 +5363,19 @@ export class AmigaChipset {
       this.diwStop = data[base + 10];
       this.dskPt = data[base + 11];
     }
-    const ddfMask = this.chipset !== 'OCS' ? 0x01fc : 0x00fc;
+    const ddfMask = this.chipset !== 'OCS' ? 0x01fe : 0x00fc;
     this.ddfStrt = (this.regs[0x092 >>> 1] & ddfMask) || 0x0038;
     this.ddfStop = (this.regs[0x094 >>> 1] & ddfMask) || 0x00d0;
-    this.bpl1Mod = (this.regs[0x108 >>> 1] << 16) >> 16;
-    this.bpl2Mod = (this.regs[0x10a >>> 1] << 16) >> 16;
+    this.bpl1Mod = ((this.regs[0x108 >>> 1] & 0xfffe) << 16) >> 16;
+    this.bpl2Mod = ((this.regs[0x10a >>> 1] & 0xfffe) << 16) >> 16;
     this.bplCon3 = this.chipset !== 'OCS' ? this.regs[0x106 >>> 1] : 0x0c00;
     this.bplCon4 = this.chipset === 'AGA' ? this.regs[0x10c >>> 1] : 0x0011;
     this.fmode = this.chipset === 'AGA' ? this.regs[0x1fc >>> 1] : 0;
+    this.clxCon = this.regs[0x098 >>> 1];
+    this.clxCon2 = this.chipset !== 'OCS' ? this.regs[0x10e >>> 1] : 0;
+    this.clxDat = 0;
+    this.potGo = this.regs[0x034 >>> 1] & 0xff00;
+    this.sprColMask.fill(0);
     this.diwVStart = (this.diwStrt >>> 8) & 0xff;
     this.diwHStart = this.diwStrt & 0xff;
     const vs = (this.diwStop >>> 8) & 0xff;
@@ -3329,11 +5383,56 @@ export class AmigaChipset {
     this.diwHStop = (this.diwStop & 0xff) | 0x100;
     this.diwHigh = this.regs[0x1e4 >>> 1];
     if (this.chipset !== 'OCS' && this.diwHigh !== 0) {
-      this.diwVStart = ((this.diwStrt >>> 8) & 0xff) | ((this.diwHigh & 0x07) << 8);
-      this.diwHStart = (this.diwStrt & 0xff) | ((this.diwHigh & 0x20) << 3);
-      this.diwVStop = ((this.diwStop >>> 8) & 0xff) | (this.diwHigh & 0x0700);
-      this.diwHStop = (this.diwStop & 0xff) | ((this.diwHigh & 0x2000) >>> 5);
+      const hiVStart = ((this.diwStrt >>> 8) & 0xff) | ((this.diwHigh & 0x07) << 8);
+      const hiHStart = (this.diwStrt & 0xff) | ((this.diwHigh & 0x20) << 3);
+      const hiVStop = ((this.diwStop >>> 8) & 0xff) | (this.diwHigh & 0x0700);
+      const hiHStop = (this.diwStop & 0xff) | ((this.diwHigh & 0x2000) >>> 5);
+      this.diwVStart = hiVStart;
+      this.diwHStart = hiHStart;
+      if ((this.diwHigh & 0x0700) !== 0 || (vs & 0x80) !== 0 || hiVStop > hiVStart) {
+        this.diwVStop = hiVStop;
+      }
+      this.diwHStop = hiHStop;
     }
+    this.audDatClocksLeft.fill(0);
+    this.audDatPendingMask = 0;
+    this.audStartPendingMask = 0;
+    this.audStartClocksLeft.fill(0);
+    this.audClockRem.fill(0);
+    this.audioSteppedInFrame = false;
+    this.frameAudClocks = 0;
+    this.audSawActivityInFrame = false;
+    this.audSnapActive.fill(0);
+    this.audEvtCount = 0;
+    const audioMaster = (this.dmacon & DMA_MASTER) !== 0;
+    for (let i = 0; i < 4; i++) {
+      const regBase = (0x0a0 >>> 1) + (i << 3);
+      const lc = ((this.regs[regBase] & 0x1f) << 16) | (this.regs[regBase + 1] & 0xfffe);
+      const lenReg = this.regs[regBase + 2];
+      const perReg = this.regs[regBase + 3];
+      const volReg = this.regs[regBase + 4] & 0x7f;
+      const ch = this.audio[i];
+      ch.lc = lc;
+      ch.len = lenReg === 0 ? 0x10000 : lenReg;
+      this.audRawPer[i] = perReg === 0 ? 65536 : perReg;
+      ch.per = perReg < 124 ? 124 : perReg;
+      ch.vol = volReg > 64 ? 64 : volReg;
+      const nowOn = audioMaster && (this.dmacon & (1 << i)) !== 0;
+      ch.active = nowOn;
+      ch.curAddr = lc;
+      ch.wordsLeft = nowOn ? ch.len : 0;
+      ch.phase = 0;
+      ch.lastSample = 0;
+    }
+    this.bltPending = false;
+    this.bltDoneCycle = 0;
+    this.bltActive = false;
+    this.bltCckAccum = 0;
+    this.bltLastSyncHpos = 0;
+    this.copWaitBlit = false;
+    this.missingVideoDmaFrames = 0;
+    this.hadVideoDmaSinceCopWrite = (this.dmacon & (DMA_MASTER | DMA_COPPER | DMA_BITPLANE)) !== 0;
+    this.rescuedMissingDmaCop1lc = 0;
     this.updateIpl();
   }
 }

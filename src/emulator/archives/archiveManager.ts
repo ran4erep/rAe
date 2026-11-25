@@ -249,12 +249,42 @@ function resolveContainerEntries(
   // Sort media items naturally so Disk 1 / Disk A comes before Disk 2 / Disk B
   mediaItems.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
 
+  // Preserve explicit empty directories (e.g. WHDLoad Save/ or Data/ folders)
+  const dirCandidates = new Set<string>();
+  const nonEmptyPrefixes = new Set<string>();
+  for (const e of entries) {
+    const parts = e.path.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '').split('/').filter(Boolean);
+    for (let k = 1; k < parts.length; k++) {
+      nonEmptyPrefixes.add(parts.slice(0, k).join('/').toLowerCase());
+    }
+  }
+  for (const e of rawEntries) {
+    if (!e.isDirectory || isMacOrJunkFile(e.path)) continue;
+    const norm = e.path.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    if (!norm) continue;
+    if (!nonEmptyPrefixes.has(norm.toLowerCase())) {
+      dirCandidates.add(norm);
+    }
+  }
+  const emptyDirPaths = Array.from(dirCandidates);
+
   const extractAllAsFiles = (): VirtualAmigaFile[] =>
     allFiles.map((f) => ({
       path: f.path,
       bytes: f.kind === 'file' ? f.extractBytes() : (cachedExtractOrRaw(entries, f.path) ?? f.extractBytes()),
       protection: f.protection,
     }));
+
+  const extractAllForVolume = (): VirtualAmigaFile[] => {
+    const out = extractAllAsFiles();
+    if (emptyDirPaths.length > 0) {
+      const emptyBytes = new Uint8Array(0);
+      for (const dirPath of emptyDirPaths) {
+        out.push({ path: dirPath, bytes: emptyBytes, isDirectory: true });
+      }
+    }
+    return out;
+  };
 
   if (mediaItems.length === 1 && otherFileCount === 0) {
     const item = mediaItems[0];
@@ -263,7 +293,7 @@ function resolveContainerEntries(
   }
 
   const maxFloppyBlocks = ADF_TOTAL_SIZE / 512 - 4;
-  const fitsFloppy = estimateBlocksFromSizes(allFiles) <= maxFloppyBlocks;
+  const fitsFloppy = estimateBlocksFromSizes(allFiles) + emptyDirPaths.length <= maxFloppyBlocks;
   const volumeName = stripArchiveExtension(baseNameOf(archiveName));
 
   if (mediaItems.length >= 1) {
@@ -278,8 +308,8 @@ function resolveContainerEntries(
       otherFileCount,
       fitsFloppy,
       extractAllAsFiles,
-      buildAdf: () => createPopulatedBootableAdf(volumeName, extractAllAsFiles()),
-      buildHdf: (targetSizeMB?: number) => createPopulatedHdf(volumeName, extractAllAsFiles(), targetSizeMB),
+      buildAdf: () => createPopulatedBootableAdf(volumeName, extractAllForVolume()),
+      buildHdf: (targetSizeMB?: number) => createPopulatedHdf(volumeName, extractAllForVolume(), targetSizeMB),
     };
   }
 
@@ -292,8 +322,8 @@ function resolveContainerEntries(
     totalBytes,
     allFiles,
     fitsFloppy,
-    buildAdf: () => createPopulatedBootableAdf(volumeName, extractAllAsFiles()),
-    buildHdf: (targetSizeMB?: number) => createPopulatedHdf(volumeName, extractAllAsFiles(), targetSizeMB),
+    buildAdf: () => createPopulatedBootableAdf(volumeName, extractAllForVolume()),
+    buildHdf: (targetSizeMB?: number) => createPopulatedHdf(volumeName, extractAllForVolume(), targetSizeMB),
   };
 }
 

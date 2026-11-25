@@ -17,10 +17,13 @@ export default function handler(req, res) {
       '/api/catalog?source=planetemu&letter=0&page=1',
       '/api/catalog?source=planetemu&q=turrican&page=1',
       '/api/catalog?source=archive-tosec&letter=0&page=1',
+      '/api/catalog?source=whdload&letter=0&page=1',
+      '/api/catalog?source=whdload&q=dune&page=1',
       '/api/cover?path=files/_images/games/hyperion.png',
       '/api/download?id=KHJFEIKKME',
       '/api/download?source=planetemu&slug=commodore-amiga-games-adf/...',
       '/api/download?source=archive-tosec&file=...',
+      '/api/download?source=whdload&file=...',
     ],
     timestamp: new Date().toISOString(),
   });

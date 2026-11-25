@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Archive, ChevronLeft, ChevronRight, Loader2, RotateCw, Search, X } from 'lucide-react';
+import { Archive, ChevronLeft, ChevronRight, HardDrive, Loader2, RotateCw, Search, X } from 'lucide-react';
 import {
   CATALOG_CATEGORIES,
   CATALOG_SOURCES,
@@ -119,7 +119,7 @@ export const CatalogTab: React.FC<CatalogTabProps> = ({
 }) => {
   const { source, category, letter, searchInput, activeQuery, page, data, loadedKey } = catalogState;
   const [reloadNonce, setReloadNonce] = useState(0);
-  const categoryOrLetter = source === 'planetemu' ? letter : category;
+  const categoryOrLetter = source === 'planetemu' || source === 'whdload' ? letter : category;
   const requestKey = `${proxyBase}|${source}|${categoryOrLetter}|${activeQuery}|${page}`;
   const needsFetch = reloadNonce > 0 || loadedKey !== requestKey || data === null;
 
@@ -257,11 +257,30 @@ export const CatalogTab: React.FC<CatalogTabProps> = ({
   const items = data?.items ?? [];
   const totalPages = data?.totalPages ?? 1;
   const isPlanetemu = source === 'planetemu';
+  const isWhdload = source === 'whdload';
+  const isAlphabetList = isPlanetemu || isWhdload;
 
-  const planetemuItems = useMemo(
-    () => (isPlanetemu ? groupPlanetemuItemsByPlatform(items, activeQuery) : []),
-    [activeQuery, isPlanetemu, items]
-  );
+  const listItems = useMemo(() => {
+    if (isPlanetemu) {
+      return groupPlanetemuItemsByPlatform(items, activeQuery);
+    }
+    if (isWhdload) {
+      return items.map((item) => ({
+        ...item,
+        platform: item.platform ?? 'OCS/ECS',
+        isPrereleaseOnly: item.isPrereleaseOnly ?? false,
+      }));
+    }
+    return [];
+  }, [activeQuery, isPlanetemu, isWhdload, items]);
+
+  const sourceLabel = isWhdload
+    ? 'WHDLoad (Archive.org)'
+    : isPlanetemu
+      ? data?.fallbackFrom
+        ? 'Planetemu (зеркало TOSEC)'
+        : 'Planetemu'
+      : 'Amiga 500 Archive';
 
   return (
     <div ref={gridTopRef} className="space-y-3">
@@ -273,6 +292,7 @@ export const CatalogTab: React.FC<CatalogTabProps> = ({
       >
         {CATALOG_SOURCES.map((srcOpt) => {
           const active = source === srcOpt.id;
+          const widthClass = srcOpt.id === 'amiga500archive' ? 'flex-[1.35]' : 'flex-1';
           return (
             <button
               key={srcOpt.id}
@@ -280,7 +300,7 @@ export const CatalogTab: React.FC<CatalogTabProps> = ({
               role="tab"
               aria-selected={active}
               onClick={() => handleSelectSource(srcOpt.id)}
-              className={`flex-1 min-w-0 h-8 px-2.5 rounded-md text-xs font-semibold whitespace-nowrap truncate transition-colors ${
+              className={`${widthClass} min-w-0 h-8 px-1.5 sm:px-2.5 rounded-md text-[11px] sm:text-xs font-semibold whitespace-nowrap truncate transition-colors ${
                 active
                   ? 'bg-[#2A2D33] text-[#F2EFE9] border border-white/10'
                   : 'text-[#8D8980] hover:text-[#F2EFE9] hover:bg-white/5'
@@ -305,9 +325,11 @@ export const CatalogTab: React.FC<CatalogTabProps> = ({
                 onChangeCatalogState((prev) => ({ ...prev, searchInput: value }));
               }}
               placeholder={
-                isPlanetemu
-                  ? 'Поиск в Planetemu (Turrican, Aladdin, Lemmings...)'
-                  : 'Поиск игры или автора (Turrican, Lemmings...)'
+                isWhdload
+                  ? 'Поиск в WHDLoad'
+                  : isPlanetemu
+                    ? 'Поиск в Planetemu'
+                    : 'Поиск игры или автора'
               }
               aria-label="Поиск игр в каталоге"
               className="w-full h-9 pl-8 pr-8 rounded-lg bg-[#14161A] border border-white/10 text-xs text-[#F2EFE9] placeholder:text-[#78746B] focus:outline-none focus:border-[#E07A22]/60"
@@ -331,11 +353,11 @@ export const CatalogTab: React.FC<CatalogTabProps> = ({
           </button>
         </form>
 
-        {isPlanetemu ? (
+        {isAlphabetList ? (
           <div
             className="flex items-center flex-wrap gap-1"
             role="group"
-            aria-label="Алфавитный указатель Planetemu"
+            aria-label={isWhdload ? 'Алфавитный указатель WHDLoad' : 'Алфавитный указатель Planetemu'}
           >
             {PLANETEMU_LETTERS.map((lt) => {
               const isSelected = !activeQuery && letter === lt;
@@ -388,12 +410,12 @@ export const CatalogTab: React.FC<CatalogTabProps> = ({
       <div className="flex items-start justify-between gap-2 text-[11px] text-[#8D8980]">
         <span className="min-w-0 break-words [overflow-wrap:anywhere]">
           {activeQuery
-            ? `${isPlanetemu ? (data?.fallbackFrom ? 'Planetemu (зеркало TOSEC)' : 'Planetemu') : 'Amiga 500 Archive'} · Поиск: «${activeQuery}»`
-            : isPlanetemu
-              ? `${data?.fallbackFrom ? 'Planetemu (зеркало TOSEC)' : 'Planetemu'} · Раздел ${letter === '0' ? '0-9' : letter}${
+            ? `${sourceLabel} · Поиск: «${activeQuery}»`
+            : isAlphabetList
+              ? `${sourceLabel} · Раздел ${letter === '0' ? '0-9' : letter}${
                   data?.totalItems !== undefined ? ` · ${pluralRu(data.totalItems, 'игра', 'игры', 'игр')}` : ''
                 }`
-              : `Amiga 500 Archive · ${CATALOG_CATEGORIES.find((c) => c.id === category)?.label ?? 'Игры'}`}
+              : `${sourceLabel} · ${CATALOG_CATEGORIES.find((c) => c.id === category)?.label ?? 'Игры'}`}
         </span>
         {data && !loading && (
           <span className="font-mono tabular-nums shrink-0">
@@ -404,8 +426,11 @@ export const CatalogTab: React.FC<CatalogTabProps> = ({
 
       {/* Listing: Loading / Error / Empty / Cards or List */}
       {loading ? (
-        isPlanetemu ? (
-          <div className="space-y-1.5" aria-label="Загрузка списка игр Planetemu">
+        isAlphabetList ? (
+          <div
+            className="space-y-1.5"
+            aria-label={isWhdload ? 'Загрузка списка игр WHDLoad' : 'Загрузка списка игр Planetemu'}
+          >
             {Array.from({ length: 8 }).map((_, idx) => (
               <div
                 key={idx}
@@ -463,19 +488,20 @@ export const CatalogTab: React.FC<CatalogTabProps> = ({
             </button>
           )}
         </div>
-      ) : isPlanetemu ? (
-        <div className="space-y-1.5" data-testid="planetemu-list">
-          {planetemuItems.map((item) => {
+      ) : isAlphabetList ? (
+        <div className="space-y-1.5" data-testid={isWhdload ? 'whdload-list' : 'planetemu-list'}>
+          {listItems.map((item) => {
             const isDownloading = launchingItemId === item.id;
             const disableActions = launchingItemId !== null;
             const fileCount = item.files?.length ?? 1;
             const diskCount = item.diskCount ?? 1;
 
             const metaParts: string[] = [];
+            if (isWhdload) metaParts.push('WHDLoad');
             if (item.year) metaParts.push(item.year);
             if (item.firms.length > 0) metaParts.push(item.firms.join(' · '));
             if (item.tags && item.tags.length > 0) metaParts.push(item.tags.join(' · '));
-            if (diskCount > 1) {
+            if (!isWhdload && diskCount > 1) {
               metaParts.push(pluralRu(diskCount, 'дискета', 'дискеты', 'дискет'));
             }
             if (fileCount > 1) {
@@ -520,7 +546,7 @@ export const CatalogTab: React.FC<CatalogTabProps> = ({
                       <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
                       <span>Загрузка...</span>
                     </>
-                  ) : diskCount > 1 ? (
+                  ) : !isWhdload && diskCount > 1 ? (
                     <>
                       <Archive className="w-3.5 h-3.5 text-white/90 shrink-0" />
                       <span className="tabular-nums">Диски ({diskCount})</span>
@@ -529,6 +555,11 @@ export const CatalogTab: React.FC<CatalogTabProps> = ({
                     <>
                       <Archive className="w-3.5 h-3.5 text-white/90 shrink-0" />
                       <span className="tabular-nums">Варианты ({fileCount})</span>
+                    </>
+                  ) : isWhdload ? (
+                    <>
+                      <HardDrive className="w-3.5 h-3.5 shrink-0" />
+                      <span>Выбрать</span>
                     </>
                   ) : (
                     <>

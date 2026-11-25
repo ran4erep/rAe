@@ -33,6 +33,8 @@ export class M68000 {
   public sr = 0x2700;
   public stopped = false;
   public pendingIpl = 0;
+  public iplHoldoff = false;
+  public inExec = false;
   public cycles = 0;
 
   // Motorola 68EC020 (Amiga 1200) mode & control registers
@@ -77,6 +79,8 @@ export class M68000 {
     this.sr = 0x2700; // Supervisor mode, IPL 7
     this.stopped = false;
     this.pendingIpl = 0;
+    this.iplHoldoff = false;
+    this.inExec = false;
     this.cycles = 0;
     this.exceptionTaken = false;
     this.faultWriteIdx = 0;
@@ -191,8 +195,14 @@ export class M68000 {
         ? this.instrPc
         : this.pc;
     if (this.is68020) {
-      // 68010/68EC020 Format $0 stack frame word (vector offset in bits 11..0)
-      this.push16((vector << 2) & 0x0fff);
+      if (vector === 5 || vector === 6 || vector === 7 || vector === 9) {
+        // 68EC020 Format $2 (6-word frame): Instruction Address + format word ($2000 | voff)
+        this.push32(this.instrPc);
+        this.push16(0x2000 | ((vector << 2) & 0x0fff));
+      } else {
+        // 68010/68EC020 Format $0 stack frame word (vector offset in bits 11..0)
+        this.push16((vector << 2) & 0x0fff);
+      }
     }
     this.push32(pushedPc);
     this.push16(oldSr);
@@ -564,30 +574,42 @@ export class M68000 {
   public runCycles(targetCycles: number): number {
     const startCycles = this.cycles;
     const endCycles = startCycles + targetCycles;
+    this.inExec = true;
 
     while (this.cycles < endCycles) {
-      if (this.pendingIpl !== 0 && this.checkInterrupts()) {
+      if (this.iplHoldoff) {
+        this.iplHoldoff = false;
+      } else if (this.pendingIpl !== 0 && this.checkInterrupts()) {
         continue;
       }
       if (this.stopped) {
         this.cycles = endCycles;
         break;
       }
-      this.step();
+      this.execInstruction();
     }
+    this.inExec = false;
     return this.cycles - startCycles;
   }
 
   public step(): number {
     const startC = this.cycles;
-    if (this.pendingIpl !== 0 && this.checkInterrupts()) {
+    if (this.iplHoldoff) {
+      this.iplHoldoff = false;
+    } else if (this.pendingIpl !== 0 && this.checkInterrupts()) {
       return this.cycles - startC;
     }
     if (this.stopped) {
       this.cycles += 4;
       return 4;
     }
+    this.inExec = true;
+    this.execInstruction();
+    this.inExec = false;
+    return this.cycles - startC;
+  }
 
+  private execInstruction(): void {
     const traceBefore = (this.sr & SR_T) !== 0;
     if (traceBefore) {
       this.exceptionTaken = false;
@@ -660,8 +682,6 @@ export class M68000 {
     if (traceBefore && !this.exceptionTaken) {
       this.triggerException(9);
     }
-
-    return this.cycles - startC;
   }
 
   private execMove(op: number, size: number): void {
@@ -1230,7 +1250,7 @@ export class M68000 {
   private execMovemFromMem(mode: number, reg: number, size: number): void {
     const mask = this.fetch16();
     let count = 0;
-    let addr = mode === 3 ? (this.a[reg] & 0x00ffffff) : this.resolveEaAddr(mode, reg, size);
+    let addr = mode === 3 ? (this.a[reg] | 0) : this.resolveEaAddr(mode, reg, size);
     for (let i = 0; i < 16; i++) {
       if ((mask & (1 << i)) !== 0) {
         const raw = size === 2

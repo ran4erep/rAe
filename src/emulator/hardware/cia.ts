@@ -70,11 +70,54 @@ export class AmigaCIA {
   private keyHandshakePending = false;
   private keyCooldownTicks = 0;
 
+  // Zero-alloc intra-scanline E-clock timer synchronization
+  private cycleSource: { readonly cycles: number } | null = null;
+  private scanlineStartCycle = 0;
+  private scanlineCpuCycles = 0;
+  private scanlineTotalEClocks = 0;
+  private scanlineFlushedEClocks = 0;
+
   private cb: CiaCallbacks;
 
   constructor(callbacks: CiaCallbacks = {}) {
     this.cb = callbacks;
     this.reset();
+  }
+
+  public attachCycleSource(source: { readonly cycles: number }): void {
+    this.cycleSource = source;
+  }
+
+  public beginScanline(startCycle: number, cpuCycles: number, totalEClocks: number): void {
+    this.scanlineStartCycle = startCycle;
+    this.scanlineCpuCycles = cpuCycles;
+    this.scanlineTotalEClocks = totalEClocks;
+    this.scanlineFlushedEClocks = 0;
+  }
+
+  private syncEClocks(): void {
+    if (this.scanlineCpuCycles <= 0 || this.cycleSource === null) return;
+    const remaining = this.scanlineTotalEClocks - this.scanlineFlushedEClocks;
+    if (remaining <= 0) return;
+    const elapsed = this.cycleSource.cycles - this.scanlineStartCycle;
+    if (elapsed <= 0) return;
+    let target = ((elapsed * this.scanlineTotalEClocks) / this.scanlineCpuCycles) | 0;
+    if (target > this.scanlineTotalEClocks) target = this.scanlineTotalEClocks;
+    const delta = target - this.scanlineFlushedEClocks;
+    if (delta > 0) {
+      this.scanlineFlushedEClocks = target;
+      this.stepEClocks(delta);
+    }
+  }
+
+  public endScanline(): void {
+    const rem = this.scanlineTotalEClocks - this.scanlineFlushedEClocks;
+    this.scanlineCpuCycles = 0;
+    this.scanlineTotalEClocks = 0;
+    this.scanlineFlushedEClocks = 0;
+    if (rem > 0) {
+      this.stepEClocks(rem);
+    }
   }
 
   public reset(): void {
@@ -116,6 +159,10 @@ export class AmigaCIA {
     this.keyTail = 0;
     this.keyHandshakePending = false;
     this.keyCooldownTicks = 0;
+    this.scanlineStartCycle = 0;
+    this.scanlineCpuCycles = 0;
+    this.scanlineTotalEClocks = 0;
+    this.scanlineFlushedEClocks = 0;
 
     this.cb.onOvlChange?.(true);
     this.cb.onPowerLedChange?.(true);
@@ -174,12 +221,7 @@ export class AmigaCIA {
 
   /** Step CIA timers by E-clock ticks (approx 45 ticks per PAL scanline) */
   public stepEClocks(ticks: number): void {
-    if (this.keyCooldownTicks > 0) {
-      this.keyCooldownTicks--;
-      if (this.keyCooldownTicks === 0 && !this.keyHandshakePending) {
-        this.pumpKeyboardQueue();
-      }
-    }
+    if (ticks <= 0) return;
 
     // CIA-A Timer A
     if ((this.craA & 0x01) !== 0) {
@@ -189,17 +231,33 @@ export class AmigaCIA {
         if (this.craA & 0x08) {
           this.craA &= ~0x01; // One-shot
           this.taA = latch;
+          this.setIcrFlagA(0x01);
+          if ((this.crbA & 0x61) === 0x41) { // Timer B counts Timer A underflows
+            this.tbA--;
+            if (this.tbA <= 0) {
+              this.tbA = this.tbLatchA > 0 ? this.tbLatchA : 0xffff;
+              if (this.crbA & 0x08) this.crbA &= ~0x01;
+              this.setIcrFlagA(0x02);
+            }
+          }
         } else {
-          this.taA += latch;
+          const underflows = ((-this.taA) / latch | 0) + 1;
+          this.taA += underflows * latch;
           if (this.taA <= 0) this.taA = latch;
-        }
-        this.setIcrFlagA(0x01);
-        if ((this.crbA & 0x61) === 0x41) { // Timer B counts Timer A underflows
-          this.tbA--;
-          if (this.tbA <= 0) {
-            this.tbA = this.tbLatchA > 0 ? this.tbLatchA : 0xffff;
-            if (this.crbA & 0x08) this.crbA &= ~0x01;
-            this.setIcrFlagA(0x02);
+          this.setIcrFlagA(0x01);
+          if ((this.crbA & 0x61) === 0x41) { // Timer B counts Timer A underflows
+            this.tbA -= underflows;
+            if (this.tbA <= 0) {
+              const latchB = this.tbLatchA > 0 ? this.tbLatchA : 0xffff;
+              if (this.crbA & 0x08) {
+                this.crbA &= ~0x01;
+                this.tbA = latchB;
+              } else {
+                this.tbA += (((-this.tbA) / latchB) | 0) * latchB + latchB;
+                if (this.tbA <= 0) this.tbA = latchB;
+              }
+              this.setIcrFlagA(0x02);
+            }
           }
         }
       }
@@ -213,7 +271,7 @@ export class AmigaCIA {
           this.crbA &= ~0x01;
           this.tbA = latch;
         } else {
-          this.tbA += latch;
+          this.tbA += (((-this.tbA) / latch) | 0) * latch + latch;
           if (this.tbA <= 0) this.tbA = latch;
         }
         this.setIcrFlagA(0x02);
@@ -228,17 +286,33 @@ export class AmigaCIA {
         if (this.craB & 0x08) {
           this.craB &= ~0x01;
           this.taB = latch;
+          this.setIcrFlagB(0x01);
+          if ((this.crbB & 0x61) === 0x41) {
+            this.tbB--;
+            if (this.tbB <= 0) {
+              this.tbB = this.tbLatchB > 0 ? this.tbLatchB : 0xffff;
+              if (this.crbB & 0x08) this.crbB &= ~0x01;
+              this.setIcrFlagB(0x02);
+            }
+          }
         } else {
-          this.taB += latch;
+          const underflows = ((-this.taB) / latch | 0) + 1;
+          this.taB += underflows * latch;
           if (this.taB <= 0) this.taB = latch;
-        }
-        this.setIcrFlagB(0x01);
-        if ((this.crbB & 0x61) === 0x41) {
-          this.tbB--;
-          if (this.tbB <= 0) {
-            this.tbB = this.tbLatchB > 0 ? this.tbLatchB : 0xffff;
-            if (this.crbB & 0x08) this.crbB &= ~0x01;
-            this.setIcrFlagB(0x02);
+          this.setIcrFlagB(0x01);
+          if ((this.crbB & 0x61) === 0x41) {
+            this.tbB -= underflows;
+            if (this.tbB <= 0) {
+              const latchB = this.tbLatchB > 0 ? this.tbLatchB : 0xffff;
+              if (this.crbB & 0x08) {
+                this.crbB &= ~0x01;
+                this.tbB = latchB;
+              } else {
+                this.tbB += (((-this.tbB) / latchB) | 0) * latchB + latchB;
+                if (this.tbB <= 0) this.tbB = latchB;
+              }
+              this.setIcrFlagB(0x02);
+            }
           }
         }
       }
@@ -252,7 +326,7 @@ export class AmigaCIA {
           this.crbB &= ~0x01;
           this.tbB = latch;
         } else {
-          this.tbB += latch;
+          this.tbB += (((-this.tbB) / latch) | 0) * latch + latch;
           if (this.tbB <= 0) this.tbB = latch;
         }
         this.setIcrFlagB(0x02);
@@ -261,6 +335,12 @@ export class AmigaCIA {
   }
 
   public onHSync(): void {
+    if (this.keyCooldownTicks > 0) {
+      this.keyCooldownTicks--;
+      if (this.keyCooldownTicks === 0 && !this.keyHandshakePending) {
+        this.pumpKeyboardQueue();
+      }
+    }
     if (this.todRunningB) {
       this.todB = (this.todB + 1) & 0xffffff;
       if (this.todAlarmSetB && this.todB === this.todAlarmB) {
@@ -288,7 +368,11 @@ export class AmigaCIA {
   }
 
   public readA(reg: number): number {
-    switch (reg & 0xf) {
+    const r = reg & 0xf;
+    if ((r >= 0x4 && r <= 0x7) || r >= 0xd) {
+      this.syncEClocks();
+    }
+    switch (r) {
       case 0x0: { // PRA
         const floppyBits = this.cb.getFloppyStatus ? (this.cb.getFloppyStatus() & 0x3c) : 0x3c;
         const fireBits = this.cb.getFireButtons ? (this.cb.getFireButtons() & 0xc0) : 0xc0;
@@ -328,8 +412,12 @@ export class AmigaCIA {
   }
 
   public writeA(reg: number, val: number): void {
+    const r = reg & 0xf;
+    if ((r >= 0x4 && r <= 0x7) || r >= 0xd) {
+      this.syncEClocks();
+    }
     const v = val & 0xff;
-    switch (reg & 0xf) {
+    switch (r) {
       case 0x0: {
         const prev = this.praA;
         this.praA = v;
@@ -373,6 +461,9 @@ export class AmigaCIA {
         } else {
           this.todA = (this.todA & 0xffff00) | v;
           this.todRunningA = true;
+          if (this.todAlarmSetA && this.todA === this.todAlarmA) {
+            this.setIcrFlagA(0x04);
+          }
         }
         break;
       case 0x9:
@@ -422,7 +513,11 @@ export class AmigaCIA {
   }
 
   public readB(reg: number): number {
-    switch (reg & 0xf) {
+    const r = reg & 0xf;
+    if ((r >= 0x4 && r <= 0x7) || r >= 0xd) {
+      this.syncEClocks();
+    }
+    switch (r) {
       case 0x0: return (this.praB & this.ddraB) | (~this.ddraB & 0xff);
       case 0x1: return (this.prbB & this.ddrbB) | (~this.ddrbB & 0xff);
       case 0x2: return this.ddraB;
@@ -454,8 +549,12 @@ export class AmigaCIA {
   }
 
   public writeB(reg: number, val: number): void {
+    const r = reg & 0xf;
+    if ((r >= 0x4 && r <= 0x7) || r >= 0xd) {
+      this.syncEClocks();
+    }
     const v = val & 0xff;
-    switch (reg & 0xf) {
+    switch (r) {
       case 0x0: this.praB = v; break;
       case 0x1: {
         const prev = this.prbB;
@@ -492,6 +591,9 @@ export class AmigaCIA {
         } else {
           this.todB = (this.todB & 0xffff00) | v;
           this.todRunningB = true;
+          if (this.todAlarmSetB && this.todB === this.todAlarmB) {
+            this.setIcrFlagB(0x04);
+          }
         }
         break;
       case 0x9:
@@ -533,11 +635,16 @@ export class AmigaCIA {
   }
 
   public serializeA(): number[] {
+    const flags =
+      (this.todRunningA ? 1 : 0) |
+      (this.todAlarmSetA ? 2 : 0) |
+      (this.todLatchedA ? 4 : 0);
     return [
       this.praA, this.prbA, this.ddraA, this.ddrbA,
       this.taA, this.taLatchA, this.tbA, this.tbLatchA,
       this.todA, this.todAlarmA, this.sdrA, this.icrDataA,
       this.icrMaskA, this.craA, this.crbA,
+      flags, this.todLatchA,
     ];
   }
 
@@ -549,16 +656,34 @@ export class AmigaCIA {
       this.todA, this.todAlarmA, this.sdrA, this.icrDataA,
       this.icrMaskA, this.craA, this.crbA,
     ] = s;
+    if (s.length >= 16) {
+      const flags = s[15] | 0;
+      this.todRunningA = (flags & 1) !== 0;
+      this.todAlarmSetA = (flags & 2) !== 0;
+      this.todLatchedA = (flags & 4) !== 0;
+      this.todLatchA = s.length >= 17 ? (s[16] >>> 0) : this.todA;
+    } else {
+      // Legacy 15-element savestate compatibility: infer active TOD & armed alarm
+      this.todRunningA = true;
+      this.todAlarmSetA = this.todAlarmA !== 0 || (this.icrMaskA & 0x04) !== 0;
+      this.todLatchedA = false;
+      this.todLatchA = this.todA;
+    }
     this.cb.onOvlChange?.(this.isOvlActive());
     this.cb.onPowerLedChange?.(this.isPowerLedBright());
   }
 
   public serializeB(): number[] {
+    const flags =
+      (this.todRunningB ? 1 : 0) |
+      (this.todAlarmSetB ? 2 : 0) |
+      (this.todLatchedB ? 4 : 0);
     return [
       this.praB, this.prbB, this.ddraB, this.ddrbB,
       this.taB, this.taLatchB, this.tbB, this.tbLatchB,
       this.todB, this.todAlarmB, this.sdrB, this.icrDataB,
       this.icrMaskB, this.craB, this.crbB,
+      flags, this.todLatchB,
     ];
   }
 
@@ -570,5 +695,18 @@ export class AmigaCIA {
       this.todB, this.todAlarmB, this.sdrB, this.icrDataB,
       this.icrMaskB, this.craB, this.crbB,
     ] = s;
+    if (s.length >= 16) {
+      const flags = s[15] | 0;
+      this.todRunningB = (flags & 1) !== 0;
+      this.todAlarmSetB = (flags & 2) !== 0;
+      this.todLatchedB = (flags & 4) !== 0;
+      this.todLatchB = s.length >= 17 ? (s[16] >>> 0) : this.todB;
+    } else {
+      // Legacy 15-element savestate compatibility: infer active TOD & armed alarm
+      this.todRunningB = true;
+      this.todAlarmSetB = this.todAlarmB !== 0 || (this.icrMaskB & 0x04) !== 0;
+      this.todLatchedB = false;
+      this.todLatchB = this.todB;
+    }
   }
 }

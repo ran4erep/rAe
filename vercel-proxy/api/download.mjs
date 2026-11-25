@@ -18,6 +18,54 @@ import {
   findArchiveTosecFileByPlanetemuSlug,
   isValidArchiveTosecFilename,
 } from '../lib/archiveTosec.mjs';
+import {
+  buildArchiveWhdloadDownloadUrl,
+  isValidWhdloadFilename,
+} from '../lib/archiveWhdload.mjs';
+
+async function streamArchiveWhdloadFile(req, res, fileName) {
+  if (!isValidWhdloadFilename(fileName)) {
+    sendJson(req, res, 400, { ok: false, error: 'Invalid or missing Archive.org WHDLoad filename' });
+    return;
+  }
+
+  const upstreamUrl = buildArchiveWhdloadDownloadUrl(fileName);
+  const upstream = await fetch(upstreamUrl, {
+    headers: {
+      'User-Agent': 'Amiga500WebEmulator-Proxy/1.0',
+    },
+    redirect: 'follow',
+    signal: AbortSignal.timeout(25000),
+  });
+
+  if (!upstream.ok || !upstream.body) {
+    sendJson(req, res, 502, {
+      ok: false,
+      error: `Archive.org WHDLoad download failed with HTTP ${upstream.status}`,
+    });
+    return;
+  }
+
+  const cleanFilename = fileName.trim();
+  const isLha = cleanFilename.toLowerCase().endsWith('.lha');
+  const contentType = upstream.headers.get('content-type') || (isLha ? 'application/x-lha' : 'application/zip');
+  const contentLength = upstream.headers.get('content-length');
+
+  setCorsHeaders(req, res);
+  res.statusCode = 200;
+  res.setHeader('Content-Type', contentType);
+  res.setHeader(
+    'Content-Disposition',
+    `attachment; filename="${cleanFilename.replace(/["\r\n]/g, '')}"; filename*=UTF-8''${encodeURIComponent(cleanFilename)}`
+  );
+  res.setHeader('X-Archive-Filename', encodeURIComponent(cleanFilename));
+  if (contentLength && Number(contentLength) > 0) {
+    res.setHeader('Content-Length', contentLength);
+  }
+  res.setHeader('Cache-Control', 'public, s-maxage=86400, stale-while-revalidate=604800');
+
+  Readable.fromWeb(upstream.body).pipe(res);
+}
 
 async function streamArchiveTosecFile(req, res, fileName) {
   if (!isValidArchiveTosecFilename(fileName)) {
@@ -231,6 +279,19 @@ export default async function handler(req, res) {
 
   const url = new URL(req.url || '/', 'http://localhost');
   const source = (url.searchParams.get('source') || 'amiga500archive').toLowerCase();
+
+  if (source === 'whdload' || source === 'archive-whdload') {
+    const fileName = (url.searchParams.get('file') || '').trim();
+    try {
+      await streamArchiveWhdloadFile(req, res, fileName);
+    } catch (err) {
+      sendJson(req, res, 502, {
+        ok: false,
+        error: err instanceof Error ? err.message : 'Archive.org WHDLoad download stream error',
+      });
+    }
+    return;
+  }
 
   if (source === 'archive-tosec') {
     const fileName = (url.searchParams.get('file') || '').trim();

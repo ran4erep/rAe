@@ -75,6 +75,7 @@ import {
   PAL_FPS,
   SaveSlotIndex,
   SaveSlotSummary,
+  SerializedAmigaState,
 } from './emulator/types';
 import {
   createEmptyEmuPerf,
@@ -98,18 +99,17 @@ import { HardfileSizePanel } from './components/HardfileSizePanel';
 import { SettingsDrawer } from './components/SettingsDrawer';
 import { SaveSlotsList } from './components/SaveSlotsList';
 import { ToastContainer, ToastMessage } from './components/ToastContainer';
-import { getAppAssetUrl } from './utils/assetUrl';
 import {
+  AmigaModelKey,
+  getModelKeyForChipset,
+  getModelProfileByKey,
   getModelRomProfile,
   isModelRomSwitchNeeded,
+  ModelRomProfile,
 } from './emulator/roms/biosProfiles';
 
 type MobileDeckMode = 'qwerty' | 'numpad' | 'mouse' | 'gamepad' | 'custom';
 
-const DEFAULT_WORKBENCH_NAME = 'workbench.LHA';
-const DEFAULT_WORKBENCH_URL = getAppAssetUrl(`bios/${encodeURIComponent(DEFAULT_WORKBENCH_NAME)}`);
-const SYSTEM_DH0_STORAGE_KEY = 'system_dh0_hdf_v2';
-const DH0_SIZE_STORAGE_KEY = 'amiga_dh0_size_mb';
 const DH1_SIZE_STORAGE_KEY = 'amiga_dh1_size_mb';
 const DEFAULT_HDF_SIZE_MB = 4;
 
@@ -128,6 +128,62 @@ function loadSavedHdfSizeMB(key: string, fallbackKey?: string): number {
     // Ignore storage errors
   }
   return DEFAULT_HDF_SIZE_MB;
+}
+
+async function loadProfileWorkbenchHdf(
+  profile: ModelRomProfile,
+  targetSizeMB: number,
+  assetCache: Map<string, Uint8Array>
+): Promise<{ bytes: Uint8Array; name: string; fromCache: boolean } | null> {
+  const savedDh0 = await loadBinaryFromStorage(profile.workbenchStorageKey);
+  if (savedDh0) {
+    return {
+      bytes: savedDh0.bytes,
+      name: savedDh0.name || profile.workbenchHdfName,
+      fromCache: true,
+    };
+  }
+  if (profile.modelKey === 'a500') {
+    void deleteFromStorage('system_dh0_hdf');
+  } else {
+    void deleteFromStorage('system_dh0_hdf_a1200_v1');
+  }
+  let sourceBytes = assetCache.get(profile.workbenchSourceName);
+  if (!sourceBytes) {
+    try {
+      const resp = await fetch(profile.workbenchUrl);
+      if (!resp.ok) return null;
+      sourceBytes = new Uint8Array(await resp.arrayBuffer());
+      // Keep compact archive/ROM templates in memory cache; large raw .hdf images persist directly in IndexedDB
+      if (!profile.workbenchSourceName.toLowerCase().endsWith('.hdf')) {
+        assetCache.set(profile.workbenchSourceName, sourceBytes);
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  if (profile.workbenchSourceName.toLowerCase().endsWith('.hdf')) {
+    return {
+      bytes: sourceBytes,
+      name: profile.workbenchHdfName,
+      fromCache: false,
+    };
+  }
+
+  const resolved = await resolveUploadedFileAsync(profile.workbenchSourceName, sourceBytes);
+  let hdfBytes: Uint8Array | null = null;
+  if (resolved.kind === 'archive-files') {
+    hdfBytes = resolved.buildHdf(targetSizeMB);
+  } else if (resolved.kind === 'hdf') {
+    hdfBytes = resolved.bytes;
+  }
+  if (!hdfBytes) return null;
+  return {
+    bytes: hdfBytes,
+    name: profile.workbenchHdfName,
+    fromCache: false,
+  };
 }
 
 export default function App() {
@@ -165,11 +221,16 @@ export default function App() {
   const [debugUnlocked, setDebugUnlocked] = useState(false);
   const modelTapStateRef = useRef<SecretTapState>(createInitialSecretTapState());
   const modalOpenRef = useRef(false);
-  const [dh0SizeMB, setDh0SizeMB] = useState<number>(() =>
-    loadSavedHdfSizeMB(DH0_SIZE_STORAGE_KEY, 'amiga_hdf_size_mb')
-  );
+  const [dh0SizeMB, setDh0SizeMB] = useState<number>(() => {
+    const initialProfile = getModelRomProfile(config.chipset);
+    return loadSavedHdfSizeMB(
+      initialProfile.workbenchSizeStorageKey,
+      initialProfile.workbenchSizeFallbackKey
+    );
+  });
   const dh0SizeRef = useRef<number>(dh0SizeMB);
   dh0SizeRef.current = dh0SizeMB;
+  const dh0ProfileKeyRef = useRef<AmigaModelKey>(getModelKeyForChipset(config.chipset));
   const [dh1SizeMB, setDh1SizeMB] = useState<number>(() =>
     loadSavedHdfSizeMB(DH1_SIZE_STORAGE_KEY)
   );
@@ -199,8 +260,8 @@ export default function App() {
     paused: false,
     fps: 50,
     cpuUsageHint: 4,
-    chipset: DEFAULT_AMIGA_CONFIG.chipset,
-    videoStandard: DEFAULT_AMIGA_CONFIG.videoStandard === 'NTSC' ? 'NTSC' : 'PAL',
+    chipset: config.chipset,
+    videoStandard: config.videoStandard === 'NTSC' ? 'NTSC' : 'PAL',
     romName: getModelRomProfile(config.chipset).romName,
     isOpenKick: false,
     powerLed: true,
@@ -460,11 +521,12 @@ export default function App() {
       }
       const slot = machine.hardfile.units[0];
       if (!slot.data || slot.writeSeq === dh0SavedSeqRef.current) return;
+      const activeDh0Profile = getModelProfileByKey(dh0ProfileKeyRef.current);
       dh0SavedSeqRef.current = slot.writeSeq;
       lastScheduledDh0Seq = slot.writeSeq;
       void saveBinaryToStorage(
-        SYSTEM_DH0_STORAGE_KEY,
-        slot.name || 'workbench.hdf',
+        activeDh0Profile.workbenchStorageKey,
+        slot.name || activeDh0Profile.workbenchHdfName,
         new Uint8Array(slot.data)
       );
     };
@@ -500,18 +562,19 @@ export default function App() {
       // Clear legacy single-slot ROM key so A500/A1200 cleanly default to KS 1.3 / KS 3.1
       void deleteFromStorage('custom_kickstart_rom');
 
+      const startupProfile = getModelRomProfile(configRef.current.chipset);
+
       const loadStartupRom = async (): Promise<{ bytes: Uint8Array; name: string } | null> => {
-        const profile = getModelRomProfile(configRef.current.chipset);
-        const savedRom = await loadBinaryFromStorage(profile.customStorageKey);
+        const savedRom = await loadBinaryFromStorage(startupProfile.customStorageKey);
         if (savedRom) return savedRom;
-        const cached = biosCacheRef.current.get(profile.romName);
-        if (cached) return { bytes: cached, name: profile.romName };
+        const cached = biosCacheRef.current.get(startupProfile.romName);
+        if (cached) return { bytes: cached, name: startupProfile.romName };
         try {
-          const resp = await fetch(profile.romUrl);
+          const resp = await fetch(startupProfile.romUrl);
           if (resp.ok) {
             const bytes = new Uint8Array(await resp.arrayBuffer());
-            biosCacheRef.current.set(profile.romName, bytes);
-            return { bytes, name: profile.romName };
+            biosCacheRef.current.set(startupProfile.romName, bytes);
+            return { bytes, name: startupProfile.romName };
           }
         } catch {
           // Keep OpenKick fallback if /bios ROM is unavailable
@@ -519,32 +582,8 @@ export default function App() {
         return null;
       };
 
-      const loadStartupDh0 = async (): Promise<{ bytes: Uint8Array; name: string; fromCache: boolean } | null> => {
-        const savedDh0 = await loadBinaryFromStorage(SYSTEM_DH0_STORAGE_KEY);
-        if (savedDh0) {
-          return { bytes: savedDh0.bytes, name: savedDh0.name || 'workbench.hdf', fromCache: true };
-        }
-        void deleteFromStorage('system_dh0_hdf');
-        try {
-          const resp = await fetch(DEFAULT_WORKBENCH_URL);
-          if (resp.ok) {
-            const workbenchBytes = new Uint8Array(await resp.arrayBuffer());
-            const resolved = await resolveUploadedFileAsync(DEFAULT_WORKBENCH_NAME, workbenchBytes);
-            let hdfBytes: Uint8Array | null = null;
-            if (resolved.kind === 'archive-files') {
-              hdfBytes = resolved.buildHdf(dh0SizeRef.current);
-            } else if (resolved.kind === 'hdf') {
-              hdfBytes = resolved.bytes;
-            }
-            if (hdfBytes) {
-              return { bytes: hdfBytes, name: 'workbench.hdf', fromCache: false };
-            }
-          }
-        } catch {
-          // Ignore auto-mount failure if workbench archive is unavailable
-        }
-        return null;
-      };
+      const loadStartupDh0 = async () =>
+        loadProfileWorkbenchHdf(startupProfile, dh0SizeRef.current, biosCacheRef.current);
 
       const [romPayload, dh0Payload, slots] = await Promise.all([
         loadStartupRom(),
@@ -558,6 +597,7 @@ export default function App() {
       if (dh0Payload && !machine.hardfile.isMounted(0)) {
         const res = machine.mountHdf(dh0Payload.bytes, dh0Payload.name, false, 0);
         if (res.ok) {
+          dh0ProfileKeyRef.current = startupProfile.modelKey;
           dh0SavedSeqRef.current = machine.hardfile.units[0].writeSeq;
           lastScheduledDh0Seq = machine.hardfile.units[0].writeSeq;
           const actualMB = Math.max(
@@ -567,8 +607,8 @@ export default function App() {
           setDh0SizeMB(actualMB);
           if (!dh0Payload.fromCache) {
             void saveBinaryToStorage(
-              SYSTEM_DH0_STORAGE_KEY,
-              'workbench.hdf',
+              startupProfile.workbenchStorageKey,
+              dh0Payload.name,
               new Uint8Array(dh0Payload.bytes)
             );
           }
@@ -679,10 +719,12 @@ export default function App() {
         if (doRender) rendered = true;
         fpsFrames++;
         if (performance.now() - t0 > frameMs * 0.85) {
-          if (trackPerf && accumulator >= frameMs) {
-            perfCurDrops += Math.floor(accumulator / frameMs);
+          if (accumulator > frameMs) {
+            if (trackPerf) {
+              perfCurDrops += Math.floor((accumulator - frameMs) / frameMs);
+            }
+            accumulator = frameMs;
           }
-          accumulator = 0;
           break;
         }
       }
@@ -1015,27 +1057,55 @@ export default function App() {
         const switchSeq = ++romSwitchSeqRef.current;
         romSwitchPendingRef.current = true;
         const targetProfile = getModelRomProfile(nextCfg.chipset);
+        const targetDh0SizeMB = loadSavedHdfSizeMB(
+          targetProfile.workbenchSizeStorageKey,
+          targetProfile.workbenchSizeFallbackKey
+        );
+        setDh0SizeMB(targetDh0SizeMB);
+
+        const prevSlot = m.hardfile.units[0];
+        const hadDh0Mounted = prevSlot.data !== null;
+        if (prevSlot.data && prevSlot.writeSeq !== dh0SavedSeqRef.current) {
+          const outgoingProfile = getModelProfileByKey(dh0ProfileKeyRef.current);
+          dh0SavedSeqRef.current = prevSlot.writeSeq;
+          void saveBinaryToStorage(
+            outgoingProfile.workbenchStorageKey,
+            prevSlot.name || outgoingProfile.workbenchHdfName,
+            new Uint8Array(prevSlot.data)
+          );
+        }
+
         void (async () => {
           try {
-            let romPayload: { bytes: Uint8Array; name: string } | null =
-              await loadBinaryFromStorage(targetProfile.customStorageKey);
-            if (!romPayload) {
-              const cached = biosCacheRef.current.get(targetProfile.romName);
-              if (cached) {
-                romPayload = { bytes: cached, name: targetProfile.romName };
-              } else {
-                try {
-                  const resp = await fetch(targetProfile.romUrl);
-                  if (resp.ok) {
-                    const bytes = new Uint8Array(await resp.arrayBuffer());
-                    biosCacheRef.current.set(targetProfile.romName, bytes);
-                    romPayload = { bytes, name: targetProfile.romName };
+            const loadTargetRom = async (): Promise<{ bytes: Uint8Array; name: string } | null> => {
+              let romPayload: { bytes: Uint8Array; name: string } | null =
+                await loadBinaryFromStorage(targetProfile.customStorageKey);
+              if (!romPayload) {
+                const cached = biosCacheRef.current.get(targetProfile.romName);
+                if (cached) {
+                  romPayload = { bytes: cached, name: targetProfile.romName };
+                } else {
+                  try {
+                    const resp = await fetch(targetProfile.romUrl);
+                    if (resp.ok) {
+                      const bytes = new Uint8Array(await resp.arrayBuffer());
+                      biosCacheRef.current.set(targetProfile.romName, bytes);
+                      romPayload = { bytes, name: targetProfile.romName };
+                    }
+                  } catch {
+                    // Fall back to hardReset with current ROM if BIOS fetch fails
                   }
-                } catch {
-                  // Fall back to hardReset with current ROM if BIOS fetch fails
                 }
               }
-            }
+              return romPayload;
+            };
+
+            const loadTargetDh0 = hadDh0Mounted
+              ? loadProfileWorkbenchHdf(targetProfile, targetDh0SizeMB, biosCacheRef.current)
+              : Promise.resolve(null);
+
+            const [romPayload, dh0Payload] = await Promise.all([loadTargetRom(), loadTargetDh0]);
+
             if (
               romSwitchSeqRef.current !== switchSeq ||
               machineRef.current !== m ||
@@ -1043,6 +1113,27 @@ export default function App() {
             ) {
               return;
             }
+
+            if (dh0Payload) {
+              const dh0Res = m.mountHdf(dh0Payload.bytes, dh0Payload.name, false, 0);
+              if (dh0Res.ok) {
+                dh0ProfileKeyRef.current = targetProfile.modelKey;
+                dh0SavedSeqRef.current = m.hardfile.units[0].writeSeq;
+                const actualMB = Math.max(
+                  1,
+                  Math.min(64, Math.round(dh0Payload.bytes.length / (1024 * 1024)))
+                );
+                setDh0SizeMB(actualMB);
+                if (!dh0Payload.fromCache) {
+                  void saveBinaryToStorage(
+                    targetProfile.workbenchStorageKey,
+                    dh0Payload.name,
+                    new Uint8Array(dh0Payload.bytes)
+                  );
+                }
+              }
+            }
+
             if (romPayload) {
               m.loadCustomRom(romPayload.bytes, romPayload.name);
             } else {
@@ -1253,10 +1344,14 @@ export default function App() {
         return;
       }
 
-      // Grouped multi-disk / per-disk virtual archive (e.g. Planetemu):
-      // Open ArchiveModal immediately as a virtual archive and download disks on demand.
-      if (item.files && item.files.length > 0) {
-        const singleDiskMultiVariants = (item.diskCount ?? 1) === 1 && item.files.length > 1;
+      const isWhdloadItem =
+        item.isWhdload === true || item.proxyDownloadUrl.includes('source=whdload');
+
+      // Grouped multi-disk / multi-variant virtual archive (Planetemu or multi-variant WHDLoad):
+      // Open ArchiveModal immediately and download/pack chosen release on demand.
+      if (item.files && item.files.length > 0 && !(isWhdloadItem && item.files.length === 1)) {
+        const singleDiskMultiVariants =
+          !isWhdloadItem && (item.diskCount ?? 1) === 1 && item.files.length > 1;
         const makeLazyCandidate = (file: CatalogDiskFile, idx: number): ArchiveMediaCandidate => {
           let cachedBytes: Uint8Array | null = null;
           let inflight: Promise<Uint8Array> | null = null;
@@ -1266,9 +1361,11 @@ export default function App() {
             name: file.name,
             path: file.name,
             size: file.sizeBytes,
-            kind: 'adf',
-            diskNumber: file.diskNumber ?? (singleDiskMultiVariants ? 1 : null),
-            diskTotal: file.diskTotal ?? (item.diskCount ?? null),
+            kind: isWhdloadItem ? 'hdf' : 'adf',
+            diskNumber: isWhdloadItem
+              ? null
+              : file.diskNumber ?? (singleDiskMultiVariants ? 1 : null),
+            diskTotal: isWhdloadItem ? null : file.diskTotal ?? (item.diskCount ?? null),
             isBadDump: file.isBadDump,
             isVerified: file.isVerified,
             isClean: file.isClean,
@@ -1277,7 +1374,7 @@ export default function App() {
             variantTags: file.variantTags,
             extractBytes: () => {
               if (!cachedBytes) {
-                throw new Error('Диск ещё не скачан.');
+                throw new Error(isWhdloadItem ? 'Архив ещё не скачан.' : 'Диск ещё не скачан.');
               }
               return cachedBytes;
             },
@@ -1290,6 +1387,34 @@ export default function App() {
                     fallbackTitle: file.name,
                   });
                   const resolved = await resolveUploadedFileAsync(filename, bytes);
+                  if (isWhdloadItem) {
+                    if (resolved.kind === 'hdf') {
+                      candidate.name = resolved.name;
+                      candidate.path = resolved.name;
+                      candidate.size = resolved.bytes.length;
+                      cachedBytes = resolved.bytes;
+                      return resolved.bytes;
+                    }
+                    if (resolved.kind === 'archive-files' || resolved.kind === 'archive-choices') {
+                      const existingHdf =
+                        resolved.kind === 'archive-choices'
+                          ? resolved.mediaItems.find((c) => c.kind === 'hdf')
+                          : undefined;
+                      const hdfBytes = existingHdf
+                        ? existingHdf.extractBytes()
+                        : resolved.buildHdf(dh1SizeRef.current);
+                      const hdfName = existingHdf
+                        ? existingHdf.name
+                        : `${resolved.volumeName || item.title}.hdf`;
+                      candidate.name = hdfName;
+                      candidate.path = hdfName;
+                      candidate.size = hdfBytes.length;
+                      cachedBytes = hdfBytes;
+                      return hdfBytes;
+                    }
+                    throw new Error(`В архиве «${file.name}» не найдены файлы WHDLoad.`);
+                  }
+
                   if (resolved.kind === 'adf') {
                     candidate.name = resolved.name;
                     candidate.path = resolved.name;
@@ -1322,12 +1447,13 @@ export default function App() {
 
         const candidates = item.files.map(makeLazyCandidate);
         const totalBytes = candidates.reduce((acc, c) => acc + c.size, 0);
+        const archivePrefix = isWhdloadItem ? 'WHDLOAD' : 'PLANETEMU';
         const nextArchive: PendingArchiveChoice = {
-          target: 0,
+          target: isWhdloadItem ? 'dh1' : 0,
           result: {
             kind: 'archive-choices',
             archiveName: item.title,
-            archiveFormat: item.platform ? `PLANETEMU · ${item.platform}` : 'PLANETEMU',
+            archiveFormat: item.platform ? `${archivePrefix} · ${item.platform}` : archivePrefix,
             volumeName: item.title,
             totalBytes,
             mediaItems: candidates,
@@ -1348,7 +1474,13 @@ export default function App() {
 
       setLaunchingCatalogId(item.id);
       try {
-        const { filename, bytes } = await downloadCatalogArchive({ item });
+        const singleWhdFile = isWhdloadItem && item.files?.length === 1 ? item.files[0] : null;
+        const { filename, bytes } = singleWhdFile
+          ? await downloadCatalogArchiveByUrl({
+              proxyDownloadUrl: singleWhdFile.proxyDownloadUrl,
+              fallbackTitle: singleWhdFile.name,
+            })
+          : await downloadCatalogArchive({ item });
         const resolved = await resolveUploadedFileAsync(filename, bytes);
 
         // Hard disk format mounts directly to DH1 without prompting
@@ -1523,10 +1655,12 @@ export default function App() {
     (sizeMB: number) => {
       const clamped = Math.max(1, Math.min(64, Math.round(sizeMB)));
       const m = machineRef.current;
+      const activeProfile = getModelProfileByKey(dh0ProfileKeyRef.current);
       if (!m || !m.hardfile.isMounted(0)) {
+        const cfgProfile = getModelRomProfile(configRef.current.chipset);
         setDh0SizeMB(clamped);
         try {
-          window.localStorage.setItem(DH0_SIZE_STORAGE_KEY, String(clamped));
+          window.localStorage.setItem(cfgProfile.workbenchSizeStorageKey, String(clamped));
         } catch {
           // Ignore storage error
         }
@@ -1544,7 +1678,7 @@ export default function App() {
 
       setDh0SizeMB(clamped);
       try {
-        window.localStorage.setItem(DH0_SIZE_STORAGE_KEY, String(clamped));
+        window.localStorage.setItem(activeProfile.workbenchSizeStorageKey, String(clamped));
       } catch {
         // Ignore storage error
       }
@@ -1552,8 +1686,8 @@ export default function App() {
       if (slot.data) {
         dh0SavedSeqRef.current = slot.writeSeq;
         void saveBinaryToStorage(
-          SYSTEM_DH0_STORAGE_KEY,
-          slot.name || 'workbench.hdf',
+          activeProfile.workbenchStorageKey,
+          slot.name || activeProfile.workbenchHdfName,
           new Uint8Array(slot.data)
         );
       }
@@ -1725,10 +1859,11 @@ export default function App() {
     if (!m) return;
     const slot = m.hardfile.units[0];
     if (slot.data && slot.writeSeq !== dh0SavedSeqRef.current) {
+      const activeProfile = getModelProfileByKey(dh0ProfileKeyRef.current);
       dh0SavedSeqRef.current = slot.writeSeq;
       void saveBinaryToStorage(
-        SYSTEM_DH0_STORAGE_KEY,
-        slot.name || 'workbench.hdf',
+        activeProfile.workbenchStorageKey,
+        slot.name || activeProfile.workbenchHdfName,
         new Uint8Array(slot.data)
       );
     }
@@ -1740,44 +1875,39 @@ export default function App() {
   const handleMountDh0 = useCallback(async () => {
     const m = machineRef.current;
     if (!m) return;
+    const profile = getModelRomProfile(m.config.chipset);
+    const targetSizeMB = loadSavedHdfSizeMB(
+      profile.workbenchSizeStorageKey,
+      profile.workbenchSizeFallbackKey
+    );
     try {
-      const savedDh0 = await loadBinaryFromStorage(SYSTEM_DH0_STORAGE_KEY);
+      const dh0Payload = await loadProfileWorkbenchHdf(profile, targetSizeMB, biosCacheRef.current);
       if (machineRef.current !== m) return;
-      if (savedDh0) {
-        const res = m.mountHdf(savedDh0.bytes, savedDh0.name || 'workbench.hdf', true, 0);
-        if (res.ok) {
-          dh0SavedSeqRef.current = m.hardfile.units[0].writeSeq;
-          const actualMB = Math.max(1, Math.min(64, Math.round(savedDh0.bytes.length / (1024 * 1024))));
-          setDh0SizeMB(actualMB);
-          setStatus(m.getStatusSnapshot());
-          showToast('ok', 'DH0: подключён (Workbench)');
-          return;
-        }
-      }
-      const resp = await fetch(DEFAULT_WORKBENCH_URL);
-      if (!resp.ok) {
-        showToast('err', 'Не удалось загрузить Workbench из /bios.');
+      if (!dh0Payload) {
+        showToast('err', `Не удалось загрузить ${profile.workbenchSourceName} из /bios.`);
         return;
       }
-      const workbenchBytes = new Uint8Array(await resp.arrayBuffer());
-      const resolved = await resolveUploadedFileAsync(DEFAULT_WORKBENCH_NAME, workbenchBytes);
-      let hdfBytes: Uint8Array | null = null;
-      if (resolved.kind === 'archive-files') {
-        hdfBytes = resolved.buildHdf(dh0SizeRef.current);
-      } else if (resolved.kind === 'hdf') {
-        hdfBytes = resolved.bytes;
-      }
-      if (!hdfBytes || machineRef.current !== m) {
-        showToast('err', 'Не удалось собрать системный образ DH0:.');
+      const res = m.mountHdf(dh0Payload.bytes, dh0Payload.name, true, 0);
+      if (!res.ok) {
+        showToast('err', res.error ?? 'Ошибка подключения системного диска DH0:.');
         return;
       }
-      m.mountHdf(hdfBytes, 'workbench.hdf', true, 0);
+      dh0ProfileKeyRef.current = profile.modelKey;
       dh0SavedSeqRef.current = m.hardfile.units[0].writeSeq;
-      const actualMB = Math.max(1, Math.min(64, Math.round(hdfBytes.length / (1024 * 1024))));
+      const actualMB = Math.max(
+        1,
+        Math.min(64, Math.round(dh0Payload.bytes.length / (1024 * 1024)))
+      );
       setDh0SizeMB(actualMB);
-      void saveBinaryToStorage(SYSTEM_DH0_STORAGE_KEY, 'workbench.hdf', new Uint8Array(hdfBytes));
+      if (!dh0Payload.fromCache) {
+        void saveBinaryToStorage(
+          profile.workbenchStorageKey,
+          dh0Payload.name,
+          new Uint8Array(dh0Payload.bytes)
+        );
+      }
       setStatus(m.getStatusSnapshot());
-      showToast('ok', 'DH0: подключён (Workbench)');
+      showToast('ok', `DH0: подключён (${dh0Payload.name})`);
     } catch {
       showToast('err', 'Ошибка подключения системного диска DH0:.');
     }
@@ -1951,6 +2081,109 @@ export default function App() {
     [captureScreenThumbnail, showToast]
   );
 
+  const syncRomForSavestate = useCallback(
+    async (m: AmigaMachine, state: SerializedAmigaState): Promise<boolean> => {
+      const prevChipset = m.config.chipset;
+      const targetChipset = state.config?.chipset ?? prevChipset;
+      const modelChanged = isModelRomSwitchNeeded(prevChipset, targetChipset);
+      const targetIsOpenKick = Boolean(state.isOpenKick);
+
+      if (!modelChanged && m.isOpenKick === targetIsOpenKick) {
+        return true;
+      }
+
+      const switchSeq = ++romSwitchSeqRef.current;
+      romSwitchPendingRef.current = true;
+      try {
+        const targetProfile = getModelRomProfile(targetChipset);
+        const prevSlot = m.hardfile.units[0];
+        if (modelChanged && prevSlot.data && prevSlot.writeSeq !== dh0SavedSeqRef.current) {
+          const outgoingProfile = getModelProfileByKey(dh0ProfileKeyRef.current);
+          dh0SavedSeqRef.current = prevSlot.writeSeq;
+          void saveBinaryToStorage(
+            outgoingProfile.workbenchStorageKey,
+            prevSlot.name || outgoingProfile.workbenchHdfName,
+            new Uint8Array(prevSlot.data)
+          );
+        }
+
+        const loadTargetRom = async (): Promise<{ bytes: Uint8Array; name: string } | null> => {
+          if (targetIsOpenKick) return null;
+          let romPayload: { bytes: Uint8Array; name: string } | null =
+            await loadBinaryFromStorage(targetProfile.customStorageKey);
+          if (!romPayload) {
+            const cached = biosCacheRef.current.get(targetProfile.romName);
+            if (cached) {
+              romPayload = { bytes: cached, name: targetProfile.romName };
+            } else {
+              try {
+                const resp = await fetch(targetProfile.romUrl);
+                if (resp.ok) {
+                  const bytes = new Uint8Array(await resp.arrayBuffer());
+                  biosCacheRef.current.set(targetProfile.romName, bytes);
+                  romPayload = { bytes, name: targetProfile.romName };
+                }
+              } catch {
+                // Keep existing ROM if BIOS fetch fails
+              }
+            }
+          }
+          return romPayload;
+        };
+
+        const targetDh0SizeMB = loadSavedHdfSizeMB(
+          targetProfile.workbenchSizeStorageKey,
+          targetProfile.workbenchSizeFallbackKey
+        );
+        const loadTargetDh0 =
+          modelChanged && prevSlot.data !== null
+            ? loadProfileWorkbenchHdf(targetProfile, targetDh0SizeMB, biosCacheRef.current)
+            : Promise.resolve(null);
+
+        const [romPayload, dh0Payload] = await Promise.all([loadTargetRom(), loadTargetDh0]);
+        if (machineRef.current !== m || romSwitchSeqRef.current !== switchSeq) {
+          return false;
+        }
+
+        if (targetIsOpenKick) {
+          if (!m.isOpenKick) {
+            m.loadOpenKickRom();
+          }
+        } else if (romPayload && (romPayload.bytes.length === 262144 || romPayload.bytes.length === 524288)) {
+          m.memory.loadRom(romPayload.bytes);
+          m.romName = romPayload.name;
+          m.isOpenKick = false;
+        }
+
+        if (dh0Payload) {
+          const dh0Res = m.mountHdf(dh0Payload.bytes, dh0Payload.name, false, 0, true);
+          if (dh0Res.ok) {
+            dh0ProfileKeyRef.current = targetProfile.modelKey;
+            dh0SavedSeqRef.current = m.hardfile.units[0].writeSeq;
+            const actualMB = Math.max(
+              1,
+              Math.min(64, Math.round(dh0Payload.bytes.length / (1024 * 1024)))
+            );
+            setDh0SizeMB(actualMB);
+            if (!dh0Payload.fromCache) {
+              void saveBinaryToStorage(
+                targetProfile.workbenchStorageKey,
+                dh0Payload.name,
+                new Uint8Array(dh0Payload.bytes)
+              );
+            }
+          }
+        }
+        return true;
+      } finally {
+        if (romSwitchSeqRef.current === switchSeq) {
+          romSwitchPendingRef.current = false;
+        }
+      }
+    },
+    []
+  );
+
   const handleLoadSlot = useCallback(
     async (slot: SaveSlotIndex): Promise<boolean> => {
       const m = machineRef.current;
@@ -1960,11 +2193,14 @@ export default function App() {
         showToast('err', `Слот ${slot} пуст`);
         return false;
       }
+      const synced = await syncRomForSavestate(m, data.state);
+      if (!synced) return false;
       const ok = m.loadSaveBundle(data.state, data.df0Disk, data.df1Disk);
       if (!ok) {
         showToast('err', `Ошибка загрузки Слота ${slot}`);
         return false;
       }
+      saveAmigaConfig(m.config);
 
       configRef.current = m.config;
       setConfig(m.config);
@@ -1989,7 +2225,7 @@ export default function App() {
       showToast('ok', `Загружен Слот ${slot}`);
       return true;
     },
-    [drawScreenshotToMainCanvas, showToast]
+    [drawScreenshotToMainCanvas, showToast, syncRomForSavestate]
   );
 
   const handleDeleteSlot = useCallback(
@@ -2038,11 +2274,14 @@ export default function App() {
           showToast('err', parsed.error);
           return;
         }
+        const synced = await syncRomForSavestate(m, parsed.state);
+        if (!synced) return;
         const ok = m.loadSaveBundle(parsed.state, parsed.df0Disk, parsed.df1Disk);
         if (!ok) {
           showToast('err', 'Не удалось применить состояние из файла.');
           return;
         }
+        saveAmigaConfig(m.config);
         configRef.current = m.config;
         setConfig(m.config);
         setHapticsEnabled(m.config.hapticsEnabled);
@@ -2064,11 +2303,12 @@ export default function App() {
           drawScreenshotToMainCanvas(parsed.screenshotDataUrl);
         }
         showToast('ok', `Загружен сейвстейт: ${file.name}`);
-      } catch {
+      } catch (err) {
+        console.error('[savestate-import]', err);
         showToast('err', 'Ошибка чтения файла сейвстейта.');
       }
     },
-    [drawScreenshotToMainCanvas, showToast]
+    [drawScreenshotToMainCanvas, showToast, syncRomForSavestate]
   );
 
   useEffect(() => {

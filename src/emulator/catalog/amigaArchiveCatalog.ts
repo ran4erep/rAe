@@ -1,4 +1,4 @@
-export type CatalogSource = 'amiga500archive' | 'planetemu';
+export type CatalogSource = 'amiga500archive' | 'planetemu' | 'whdload';
 
 export interface CatalogSourceOption {
   id: CatalogSource;
@@ -8,6 +8,7 @@ export interface CatalogSourceOption {
 export const CATALOG_SOURCES: readonly CatalogSourceOption[] = [
   { id: 'amiga500archive', label: 'Amiga 500 Archive' },
   { id: 'planetemu', label: 'Planetemu' },
+  { id: 'whdload', label: 'WHDLoad' },
 ] as const;
 
 export type CatalogCategory = 'games' | 'top' | 'demos' | 'originals' | 'tools' | 'recent';
@@ -58,6 +59,7 @@ export interface CatalogGameItem {
   tags?: string[];
   platform?: 'CD32' | 'CDTV' | 'AGA' | 'OCS-AGA' | 'OCS/ECS';
   isPrereleaseOnly?: boolean;
+  isWhdload?: boolean;
   diskCount?: number;
   files?: CatalogDiskFile[];
   coverPath: string | null;
@@ -87,8 +89,9 @@ export function getDefaultCatalogProxyBase(
   env: Record<string, unknown> | undefined = (import.meta as ImportMeta & { env?: Record<string, unknown> }).env
 ): string {
   const configured = typeof env?.VITE_CATALOG_PROXY_URL === 'string' ? env.VITE_CATALOG_PROXY_URL.trim() : '';
-  if (configured === '/' || configured === 'local') return '';
-  if (configured) return configured.replace(/\/+$/, '');
+  if (configured && /^https?:\/\//i.test(configured)) {
+    return configured.replace(/\/+$/, '');
+  }
   return DEFAULT_CATALOG_PROXY_URL;
 }
 
@@ -157,8 +160,8 @@ export function buildCatalogApiUrl(
   const source: CatalogSource = opts.source ?? 'amiga500archive';
   const q = opts.query.trim();
 
-  if (source === 'planetemu') {
-    params.set('source', 'planetemu');
+  if (source === 'planetemu' || source === 'whdload') {
+    params.set('source', source);
     if (q) {
       params.set('q', q);
     } else {
@@ -234,7 +237,8 @@ export function decodeHeaderFilename(
   }
 
   const safeBase = fallbackTitle.replace(/[\\/:*?"<>|]+/g, '_').trim() || 'amiga_game';
-  return safeBase.toLowerCase().endsWith('.zip') ? safeBase : `${safeBase}.zip`;
+  const lowBase = safeBase.toLowerCase();
+  return lowBase.endsWith('.zip') || lowBase.endsWith('.lha') ? safeBase : `${safeBase}.zip`;
 }
 
 export async function fetchCatalogPage(opts: {
@@ -249,7 +253,8 @@ export async function fetchCatalogPage(opts: {
 }): Promise<CatalogPageResponse> {
   const proxyBase = (opts.proxyBase ?? getDefaultCatalogProxyBase()).replace(/\/+$/, '');
   const source: CatalogSource = opts.source ?? 'amiga500archive';
-  const categoryOrLetter = source === 'planetemu' ? (opts.letter ?? '0') : opts.category;
+  const categoryOrLetter =
+    source === 'planetemu' || source === 'whdload' ? (opts.letter ?? '0') : opts.category;
   const cacheKey = makeCatalogCacheKey(proxyBase, source, categoryOrLetter, opts.query, opts.page);
 
   if (!opts.bypassCache) {

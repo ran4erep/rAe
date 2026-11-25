@@ -184,11 +184,11 @@ export interface SaveSlotData {
 }
 
 export const DEFAULT_AMIGA_CONFIG: AmigaConfig = {
-  chipset: 'ECS',
+  chipset: 'AGA',
   videoStandard: 'auto',
-  chipRamKB: 1024,
-  slowRamKB: 512,
-  fastRamKB: 0,
+  chipRamKB: 2048,
+  slowRamKB: 0,
+  fastRamKB: 8192,
   audioEnabled: true,
   audioVolume: 1.0,
   audioLedFilter: true,

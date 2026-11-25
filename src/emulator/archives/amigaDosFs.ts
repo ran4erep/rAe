@@ -14,6 +14,7 @@ export interface VirtualAmigaFile {
   path: string;
   bytes: Uint8Array;
   protection?: number;
+  isDirectory?: boolean;
 }
 
 export interface AmigaVolumeInfo {
@@ -85,8 +86,24 @@ function amigaHashName(name: string): number {
 }
 
 function sanitizeAmigaName(raw: string): string {
-  const cleaned = raw.replace(/[:/\\]/g, '_').trim();
-  return (cleaned || 'file').slice(0, 30);
+  const nulIdx = raw.indexOf('\0');
+  const beforeNul = nulIdx >= 0 ? raw.slice(0, nulIdx) : raw;
+  let cleaned = '';
+  for (let i = 0; i < beforeNul.length; i++) {
+    const code = beforeNul.charCodeAt(i);
+    if (code < 32 || code === 127) continue;
+    const ch = beforeNul[i];
+    cleaned += ch === ':' || ch === '/' || ch === '\\' ? '_' : ch;
+  }
+  const clean = cleaned.trim() || 'file';
+  if (clean.length <= 30) return clean;
+  const lower = clean.toLowerCase();
+  for (const ext of ['.info', '.slave', '.rtb', '.pat']) {
+    if (lower.endsWith(ext)) {
+      return clean.slice(0, 30 - ext.length) + clean.slice(clean.length - ext.length);
+    }
+  }
+  return clean.slice(0, 30);
 }
 
 function writeBstr(buf: Uint8Array, off: number, text: string, maxLen = 30): void {
@@ -136,6 +153,12 @@ export function estimateRequiredOfsBlocks(files: VirtualAmigaFile[]): number {
   const dirs = new Set<string>();
   for (const f of files) {
     const parts = f.path.split('/').filter(Boolean);
+    if (f.isDirectory) {
+      for (let i = 0; i < parts.length; i++) {
+        dirs.add(parts.slice(0, i + 1).join('/'));
+      }
+      continue;
+    }
     for (let i = 0; i < parts.length - 1; i++) {
       dirs.add(parts.slice(0, i + 1).join('/'));
     }
@@ -288,6 +311,10 @@ export function buildAmigaOfsVolume(
   for (const file of files) {
     const parts = file.path.replace(/\\/g, '/').split('/').filter(Boolean);
     if (parts.length === 0) continue;
+    if (file.isDirectory) {
+      ensureDir(parts);
+      continue;
+    }
 
     const rawFileName = parts[parts.length - 1];
     const dirSegments = parts.slice(0, -1);
@@ -296,12 +323,24 @@ export function buildAmigaOfsVolume(
     let fileName = sanitizeAmigaName(rawFileName);
     const siblings = usedNamesInDir.get(parentBlock)!;
     if (siblings.has(fileName.toLowerCase())) {
-      // Deduplicate rare collisions inside flattened names
-      let suffix = 1;
-      while (siblings.has(`${fileName.slice(0, 26)}_${suffix}`.toLowerCase())) {
-        suffix++;
+      // Deduplicate rare collisions inside flattened names while keeping .info/.slave suffix
+      const lower = fileName.toLowerCase();
+      let extKeep = '';
+      for (const ext of ['.info', '.slave', '.rtb', '.pat']) {
+        if (lower.endsWith(ext)) {
+          extKeep = fileName.slice(fileName.length - ext.length);
+          break;
+        }
       }
-      fileName = `${fileName.slice(0, 26)}_${suffix}`;
+      const stem = extKeep ? fileName.slice(0, fileName.length - extKeep.length) : fileName;
+      let suffix = 1;
+      let candidate = '';
+      do {
+        const tag = `_${suffix}${extKeep}`;
+        candidate = `${stem.slice(0, 30 - tag.length)}${tag}`;
+        suffix++;
+      } while (siblings.has(candidate.toLowerCase()));
+      fileName = candidate;
     }
     siblings.add(fileName.toLowerCase());
 
@@ -452,6 +491,7 @@ function readBstrName(bytes: Uint8Array, off: number): string {
   let name = '';
   for (let i = 0; i < len; i++) {
     const c = bytes[off + 1 + i];
+    if (c === 0) break;
     if (c >= 32 && c <= 126) name += String.fromCharCode(c);
   }
   return name;
@@ -650,8 +690,9 @@ export function extractAmigaDosFiles(
     return out;
   };
 
-  const walkDir = (dirBlk: number, prefix: string) => {
+  const walkDir = (dirBlk: number, prefix: string): boolean => {
     const dirOff = partitionByteOffset + dirBlk * ADF_SECTOR_SIZE;
+    let hasChildren = false;
     for (let h = 0; h < 72; h++) {
       let entryBlk = readBE32(bytes, dirOff + 24 + h * 4);
       let chainGuard = 0;
@@ -665,9 +706,12 @@ export function extractAmigaDosFiles(
         const nextChain = readBE32(bytes, eOff + 496);
 
         if (name) {
+          hasChildren = true;
           const fullPath = prefix ? `${prefix}/${name}` : name;
           if (secType === ST_USERDIR) {
-            walkDir(entryBlk, fullPath);
+            if (!walkDir(entryBlk, fullPath)) {
+              files.push({ path: fullPath, bytes: new Uint8Array(0), isDirectory: true });
+            }
           } else if (secType === ST_FILE) {
             const protection = readBE32(bytes, eOff + 320);
             files.push({
@@ -681,6 +725,7 @@ export function extractAmigaDosFiles(
         entryBlk = nextChain;
       }
     }
+    return hasChildren;
   };
 
   walkDir(rootBlk, '');
@@ -734,6 +779,71 @@ export function resizeAmigaDosHdf(
     bytes: rebuilt,
     minSizeMB,
   };
+}
+
+/**
+ * Fast zero-allocation check for NUL-corrupted filenames inside an AmigaDOS OFS/FFS HDF
+ * (e.g. "Disk.1\0Dune" written before NUL-stripping). Only rebuilds if any header BSTR contains 0x00.
+ */
+export function repairAmigaDosNulFilenames(bytes: Uint8Array): Uint8Array {
+  if (bytes.length < 1024) return bytes;
+  const d0 = bytes[0];
+  const d1 = bytes[1];
+  const d2 = bytes[2];
+  const d3 = bytes[3];
+  if (d0 !== 0x44 || d1 !== 0x4f || d2 !== 0x53 || d3 > 5) {
+    return bytes;
+  }
+
+  const partBlocks = Math.floor(bytes.length / ADF_SECTOR_SIZE);
+  let rootBlk = readBE32(bytes, 8);
+  if (rootBlk < 2 || rootBlk >= partBlocks) {
+    rootBlk = Math.floor(partBlocks / 2);
+  }
+  const rootOff = rootBlk * ADF_SECTOR_SIZE;
+  if (
+    rootOff + ADF_SECTOR_SIZE > bytes.length ||
+    readBE32(bytes, rootOff) !== T_HEADER ||
+    readBE32(bytes, rootOff + 508) !== ST_ROOT
+  ) {
+    return bytes;
+  }
+
+  let hasBrokenBstr = false;
+  const visited = new Set<number>([rootBlk]);
+  const scanDir = (dirBlk: number) => {
+    if (hasBrokenBstr) return;
+    const dirOff = dirBlk * ADF_SECTOR_SIZE;
+    for (let h = 0; h < 72 && !hasBrokenBstr; h++) {
+      let entryBlk = readBE32(bytes, dirOff + 24 + h * 4);
+      let guard = 0;
+      while (entryBlk >= 2 && entryBlk < partBlocks && !visited.has(entryBlk) && guard++ < 4096) {
+        visited.add(entryBlk);
+        const eOff = entryBlk * ADF_SECTOR_SIZE;
+        if (eOff + ADF_SECTOR_SIZE > bytes.length) break;
+        const nameLen = Math.min(30, bytes[eOff + 432]);
+        for (let i = 0; i < nameLen; i++) {
+          if (bytes[eOff + 433 + i] === 0) {
+            hasBrokenBstr = true;
+            return;
+          }
+        }
+        const secType = readBE32(bytes, eOff + 508);
+        if (secType === ST_USERDIR) {
+          scanDir(entryBlk);
+          if (hasBrokenBstr) return;
+        }
+        entryBlk = readBE32(bytes, eOff + 496);
+      }
+    }
+  };
+  scanDir(rootBlk);
+
+  if (!hasBrokenBstr) return bytes;
+  const extracted = extractAmigaDosFiles(bytes, 0);
+  if (!extracted) return bytes;
+  const targetMB = Math.max(1, Math.min(64, Math.round(bytes.length / (1024 * 1024))));
+  return createPopulatedHdf(extracted.volumeName, extracted.files, targetMB);
 }
 
 /**

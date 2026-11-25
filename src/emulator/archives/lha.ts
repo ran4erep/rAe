@@ -48,6 +48,16 @@ function decodeAscii(bytes: Uint8Array): string {
   return s;
 }
 
+function decodeAsciiCString(bytes: Uint8Array): string {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    if (b === 0) break;
+    s += String.fromCharCode(b);
+  }
+  return s;
+}
+
 export function isLhaData(bytes: Uint8Array): boolean {
   if (bytes.length < 22) return false;
   // Method ID sits at bytes[2..6] like "-lh5-", "-lh0-", "-lh1-", "-lh4-", "-lh6-", "-lh7-", "-lhd-", "-lz4-"
@@ -136,7 +146,7 @@ export function parseLhaArchive(bytes: Uint8Array): LhaArchiveEntry[] {
         throw new Error('Обрезанный заголовок имени файла LHA.');
       }
 
-      fileName = decodeAscii(bytes.subarray(nameStart, nameStart + nameLen));
+      fileName = decodeAsciiCString(bytes.subarray(nameStart, nameStart + nameLen));
       expectedCrc = readU16LE(bytes, nameStart + nameLen);
 
       if (level === 0) {
@@ -152,9 +162,9 @@ export function parseLhaArchive(bytes: Uint8Array): LhaArchiveEntry[] {
           const extType = bytes[extPos];
           const payload = bytes.subarray(extPos + 1, extPos + extSize - 2);
           if (extType === 0x01) {
-            fileName = decodeAscii(payload);
+            fileName = decodeAsciiCString(payload);
           } else if (extType === 0x02) {
-            dirName = decodeAscii(payload);
+            dirName = decodeAsciiCString(payload);
           }
           totalExtBytes += extSize;
           extPos += extSize;
@@ -182,9 +192,9 @@ export function parseLhaArchive(bytes: Uint8Array): LhaArchiveEntry[] {
         const extType = bytes[extPos];
         const payload = bytes.subarray(extPos + 1, extPos + extSize - 2);
         if (extType === 0x01) {
-          fileName = decodeAscii(payload);
+          fileName = decodeAsciiCString(payload);
         } else if (extType === 0x02) {
-          dirName = decodeAscii(payload);
+          dirName = decodeAsciiCString(payload);
         } else if (extType === 0x51 && payload.length >= 4) {
           protection = readU32LE(payload, 0);
         }

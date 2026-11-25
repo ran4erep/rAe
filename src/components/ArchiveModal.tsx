@@ -400,20 +400,29 @@ export const ArchiveModal: React.FC<ArchiveModalProps> = ({
                                 </>
                               );
                             })()}
-                            {mediaItem.kind === 'hdf' && (
-                              <button
-                                type="button"
-                                disabled={isBusy}
-                                onClick={() => void runAction(`${mediaItem.id}:dh1`, () => onSelectArchiveMedia(mediaItem, 'dh1'))}
-                                className={`h-7 px-2.5 rounded text-[11px] font-mono transition-colors disabled:opacity-50 ${
-                                  mountedDh1Name === mediaItem.name
-                                    ? 'bg-[#3B8B59] text-white font-bold'
-                                    : 'bg-[#2A2D33] hover:bg-[#383C44] text-[#7AD39B]'
-                                }`}
-                              >
-                                DH1:
-                              </button>
-                            )}
+                            {mediaItem.kind === 'hdf' && (() => {
+                              const keyDh1 = `${mediaItem.id}:dh1`;
+                              return (
+                                <button
+                                  type="button"
+                                  disabled={isBusy}
+                                  onClick={() => void runAction(keyDh1, () => onSelectArchiveMedia(mediaItem, 'dh1'))}
+                                  aria-label={`Смонтировать ${mediaItem.name} в DH1`}
+                                  className={`h-7 px-2.5 rounded text-[11px] font-mono inline-flex items-center gap-1 whitespace-nowrap transition-colors disabled:opacity-50 ${
+                                    mountedDh1Name === mediaItem.name
+                                      ? 'bg-[#3B8B59] text-white font-bold'
+                                      : 'bg-[#2A2D33] hover:bg-[#383C44] text-[#7AD39B]'
+                                  }`}
+                                >
+                                  {busyKey === keyDh1 ? (
+                                    <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+                                  ) : (
+                                    <HardDrive className="w-3 h-3 shrink-0" />
+                                  )}
+                                  DH1:
+                                </button>
+                              );
+                            })()}
                             {mediaItem.kind === 'rom' && (
                               <button
                                 type="button"

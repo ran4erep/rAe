@@ -515,6 +515,19 @@ export class AmigaMemory implements M68kBus {
       );
     }
 
+    if (this.fastRamSize > 0 && !(this.fastRamAutoconfigDone && this.fastRamConfiguredBase === 0)) {
+      const fastBase = this.fastRamConfiguredBase > 0 ? this.fastRamConfiguredBase : 0x200000;
+      if (a >= fastBase && a + 3 < fastBase + this.fastRamSize) {
+        const off = a - fastBase;
+        return (
+          (this.fastRam[off] << 24) |
+          (this.fastRam[off + 1] << 16) |
+          (this.fastRam[off + 2] << 8) |
+          this.fastRam[off + 3]
+        );
+      }
+    }
+
     return (this.read16(a) << 16) | this.read16((a + 2) & 0x00ffffff);
   }
 
@@ -660,6 +673,18 @@ export class AmigaMemory implements M68kBus {
       this.chipRam[a + 2] = (val >>> 8) & 0xff;
       this.chipRam[a + 3] = val & 0xff;
       return;
+    }
+
+    if (this.fastRamSize > 0 && !(this.fastRamAutoconfigDone && this.fastRamConfiguredBase === 0)) {
+      const fastBase = this.fastRamConfiguredBase > 0 ? this.fastRamConfiguredBase : 0x200000;
+      if (a >= fastBase && a + 3 < fastBase + this.fastRamSize) {
+        const off = a - fastBase;
+        this.fastRam[off] = (val >>> 24) & 0xff;
+        this.fastRam[off + 1] = (val >>> 16) & 0xff;
+        this.fastRam[off + 2] = (val >>> 8) & 0xff;
+        this.fastRam[off + 3] = val & 0xff;
+        return;
+      }
     }
 
     if (a >= 0xdf0000 && a < 0xe00000) {

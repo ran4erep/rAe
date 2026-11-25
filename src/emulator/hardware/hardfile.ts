@@ -28,6 +28,7 @@ const OFF_DEV_EXPUNGE = 0x0250;
 const OFF_DEV_EXTFUNC = 0x0258;
 const OFF_DEV_BEGINIO = 0x0260;
 const OFF_DEV_ABORTIO = 0x0278;
+const OFF_NSD_CMDS = 0x0290;
 
 // Line-A opcodes reserved for amigahd.device Expansion ROM
 const TRAP_DIAG_INIT = 0xa100;
@@ -403,11 +404,18 @@ export class HardfileController {
     this.units[1].hasReadSinceReset = false;
   }
 
-  public mountUnit(unit: 0 | 1, bytes: Uint8Array, name: string, writeProtected = false): void {
+  public mountUnit(
+    unit: 0 | 1,
+    bytes: Uint8Array,
+    name: string,
+    writeProtected = false,
+    preserveAutoconfig = false
+  ): void {
     const usableLen = Math.floor(bytes.length / HDF_SECTOR_SIZE) * HDF_SECTOR_SIZE;
     if (usableLen < 1024) {
       throw new Error(`Файл "${name}" слишком мал для образа HDF.`);
     }
+    const prevConfiguredBase = this.configuredBase;
     const slot = this.units[unit];
     slot.data = bytes.length === usableLen ? new Uint8Array(bytes) : new Uint8Array(bytes.subarray(0, usableLen));
     slot.name = name;
@@ -419,6 +427,10 @@ export class HardfileController {
     slot.ioPulseFrames = 0;
     slot.hasReadSinceReset = false;
     this.rebuildMergedPartitions();
+    if (preserveAutoconfig && prevConfiguredBase > 0) {
+      this.configuredBase = prevConfiguredBase;
+      return;
+    }
     this.reset();
   }
 
@@ -637,6 +649,19 @@ export class HardfileController {
     p = OFF_DEV_ABORTIO;
     emitW(0x70fd); // MOVEQ #-3, D0 (IOERR_NOCMD)
     emitW(0x4e75); // RTS
+
+    // Null-terminated uint16[] SupportedCommands table for NSCMD_DEVICEQUERY
+    p = OFF_NSD_CMDS;
+    for (const c of [
+      CMD_RESET, CMD_READ, CMD_WRITE, CMD_UPDATE, CMD_CLEAR, CMD_STOP, CMD_START, CMD_FLUSH,
+      TD_MOTOR, TD_SEEK, TD_FORMAT, TD_REMOVE, TD_CHANGENUM, TD_CHANGESTATE, TD_PROTSTATUS,
+      TD_GETDRIVETYPE, TD_GETNUMTRACKS, TD_ADDCHANGEINT, TD_REMCHANGEINT, TD_GETGEOMETRY,
+      TD_READ64, TD_WRITE64, TD_FORMAT64,
+      NSCMD_DEVICEQUERY, NSCMD_TD_READ64, NSCMD_TD_WRITE64, NSCMD_TD_FORMAT64,
+      0,
+    ]) {
+      emitW(c);
+    }
   }
 
   private readAutoconfigByte(offset: number): number {
@@ -821,19 +846,20 @@ export class HardfileController {
       }
 
       case TRAP_DIAG_NEXT_PART: {
-        if (this.expBase === 0 || this.diagPartIdx >= this.mergedPartitions.length) {
+        if (this.expBase === 0 || this.diagPartIdx >= this.mergedPartitions.length || this.diagPartIdx >= 24) {
           cpu.pc = this.diagLoopEndPc;
           return true;
         }
         const part = this.mergedPartitions[this.diagPartIdx];
-        const scratch = this.diagCopyAddr + 0x400 + this.diagPartIdx * 0x100;
+        const scratch = this.diagCopyAddr + 0x400 + this.diagPartIdx * 0x80;
         const dosNameAddr = scratch;
-        for (let i = 0; i < part.dosName.length; i++) {
+        const dosNameLen = Math.min(part.dosName.length, 14);
+        for (let i = 0; i < dosNameLen; i++) {
           bus.write8(dosNameAddr + i, part.dosName.charCodeAt(i));
         }
-        bus.write8(dosNameAddr + part.dosName.length, 0);
+        bus.write8(dosNameAddr + dosNameLen, 0);
 
-        const pktAddr = scratch + 0x40;
+        const pktAddr = scratch + 0x10;
         bus.write32(pktAddr + 0, dosNameAddr); // DOS name (e.g. "DH0")
         bus.write32(pktAddr + 4, base + this.strAmigaHdOff); // Exec device name
         bus.write32(pktAddr + 8, part.unit); // Unit
@@ -985,6 +1011,11 @@ export class HardfileController {
         case TD_SEEK:
         case TD_REMOVE:
         case TD_ADDCHANGEINT:
+          // Disk-change soft interrupt hook stays queued (NT_MESSAGE) until TD_REMCHANGEINT; never ReplyMsg immediately
+          bus.write8(ioReq + 31, 0);
+          bus.write32(ioReq + 32, 0);
+          return true;
+
         case TD_REMCHANGEINT:
           err = 0;
           actual = 0;
@@ -1105,12 +1136,12 @@ export class HardfileController {
 
         case NSCMD_DEVICEQUERY: {
           if (dataPtr !== 0 && length >= 16) {
+            const romBase = this.configuredBase > 0 ? this.configuredBase : 0x00e90000;
             bus.write32(dataPtr + 0, 0); // DevQueryFormat
             bus.write32(dataPtr + 4, 16); // SizeAvailable
             bus.write16(dataPtr + 8, 5); // NSDEVTYPE_TRACKDISK
             bus.write16(dataPtr + 10, 0); // DeviceSubType
-            // SupportedCommands list in ROM or zero-terminated
-            bus.write32(dataPtr + 12, 0);
+            bus.write32(dataPtr + 12, romBase + OFF_NSD_CMDS); // 0-terminated uint16[] SupportedCommands
             actual = 16;
             err = 0;
           } else {
