@@ -37,6 +37,7 @@ interface HardwareTopBarProps {
   onWarmReset: () => void;
   onOpenDisks: () => void;
   onOpenSettings: () => void;
+  activePanel?: 'disks' | 'settings' | null;
   onModelTitleTap?: () => void;
 }
 
@@ -56,6 +57,7 @@ export const HardwareTopBar: React.FC<HardwareTopBarProps> = React.memo(
     onWarmReset,
     onOpenDisks,
     onOpenSettings,
+    activePanel = null,
     onModelTitleTap,
   }) => {
     const [overlayMenuOpen, setOverlayMenuOpen] = useState(false);
@@ -302,80 +304,42 @@ export const HardwareTopBar: React.FC<HardwareTopBarProps> = React.memo(
 
           {/* Authentic hardware LEDs wired directly to CIA-A LED & DF0/DF1 motors */}
           <div
-            className="flex items-center gap-1.5 sm:gap-3 text-[10px] sm:text-[11px] font-mono tabular-nums text-[#A7A39A] shrink-0"
+            className="flex items-center gap-1.5 sm:gap-2 shrink-0"
             aria-label="Индикаторы оборудования"
           >
-            <span className="flex items-center gap-1 whitespace-nowrap" title="Power / Audio Filter LED">
-              <span
-                className={`w-2 h-1.5 rounded-[1px] transition-colors duration-150 ${
-                  status.powerLed
-                    ? 'bg-[#E33E33] shadow-[0_0_5px_rgba(227,62,51,0.7)]'
-                    : 'bg-[#5A2420]'
-                }`}
-              />
-              <span className="hidden sm:inline">PWR</span>
-            </span>
+            <span
+              className={`w-2 h-1.5 rounded-[1px] transition-colors duration-150 ${
+                status.powerLed
+                  ? 'bg-[#E33E33] shadow-[0_0_5px_rgba(227,62,51,0.7)]'
+                  : 'bg-[#5A2420]'
+              }`}
+              title="Power / Audio Filter LED"
+            />
             <div
-              className="flex items-center gap-1 sm:gap-1.5"
+              className="grid grid-cols-2 gap-x-1 gap-y-[3px]"
               aria-label="Индикаторы дискет DF0/DF1 (слева) и дисков DH0/DH1 (справа)"
             >
-              {/* Левый столбец: дискеты DF0 и DF1 */}
-              <div className="flex flex-col justify-center gap-[3px]">
-                <span
-                  className="flex items-center gap-1 whitespace-nowrap leading-none"
-                  title="DF0 Floppy Drive LED"
-                >
-                  <span
-                    data-testid="led-df0"
-                    className={`w-2.5 h-[5px] rounded-[1.5px] transition-colors duration-75 ${renderFloppyLedClass(status.df0)}`}
-                  />
-                  <span className="hidden sm:inline text-[8.5px] leading-none">
-                    DF0:{String(status.df0.track).padStart(2, '0')}
-                  </span>
-                </span>
-
-                <span
-                  className="flex items-center gap-1 whitespace-nowrap leading-none"
-                  title="DF1 Floppy Drive LED"
-                >
-                  <span
-                    data-testid="led-df1"
-                    className={`w-2.5 h-[5px] rounded-[1.5px] transition-colors duration-75 ${renderFloppyLedClass(status.df1)}`}
-                  />
-                  <span className="hidden sm:inline text-[8.5px] leading-none">
-                    DF1:{String(status.df1.track).padStart(2, '0')}
-                  </span>
-                </span>
-              </div>
-
-              {/* Правый столбец: жёсткие диски DH0 и DH1 */}
-              <div className="flex flex-col justify-center gap-[3px]">
-                <span
-                  className="flex items-center gap-1 whitespace-nowrap leading-none"
-                  title={status.dh0.mounted ? `DH0 Система: ${status.dh0.name}` : 'DH0 Система (извлечён)'}
-                >
-                  <span
-                    data-testid="led-dh0"
-                    className={`w-2.5 h-[5px] rounded-[1.5px] transition-colors duration-75 ${renderHdfLedClass(status.dh0)}`}
-                  />
-                  <span className="hidden sm:inline text-[8.5px] leading-none">DH0</span>
-                </span>
-
-                <span
-                  className="flex items-center gap-1 whitespace-nowrap leading-none"
-                  title={status.dh1.mounted ? `DH1 HDF: ${status.dh1.name}` : 'DH1 Hardfile (не подключён)'}
-                >
-                  <span
-                    data-testid="led-dh1"
-                    className={`w-2.5 h-[5px] rounded-[1.5px] transition-colors duration-75 ${renderHdfLedClass(status.dh1)}`}
-                  />
-                  <span className="hidden sm:inline text-[8.5px] leading-none">DH1</span>
-                </span>
-              </div>
+              <span
+                data-testid="led-df0"
+                title="DF0 Floppy Drive LED"
+                className={`w-2.5 h-[5px] rounded-[1.5px] transition-colors duration-75 ${renderFloppyLedClass(status.df0)}`}
+              />
+              <span
+                data-testid="led-dh0"
+                title={status.dh0.mounted ? `DH0 Система: ${status.dh0.name}` : 'DH0 Система (извлечён)'}
+                className={`w-2.5 h-[5px] rounded-[1.5px] transition-colors duration-75 ${renderHdfLedClass(status.dh0)}`}
+              />
+              <span
+                data-testid="led-df1"
+                title="DF1 Floppy Drive LED"
+                className={`w-2.5 h-[5px] rounded-[1.5px] transition-colors duration-75 ${renderFloppyLedClass(status.df1)}`}
+              />
+              <span
+                data-testid="led-dh1"
+                title={status.dh1.mounted ? `DH1 HDF: ${status.dh1.name}` : 'DH1 Hardfile LED (не подключён)'}
+                className={`w-2.5 h-[5px] rounded-[1.5px] transition-colors duration-75 ${renderHdfLedClass(status.dh1)}`}
+              />
             </div>
-            <span className="hidden md:inline text-[#8D8980] whitespace-nowrap">
-              {status.chipset} · {status.videoStandard} · {status.fps} FPS
-            </span>
           </div>
         </div>
 
@@ -413,22 +377,32 @@ export const HardwareTopBar: React.FC<HardwareTopBarProps> = React.memo(
 
           <button
             type="button"
+            data-testid="topbar-settings-btn"
             onClick={onOpenSettings}
+            aria-pressed={activePanel === 'settings'}
             aria-label="Настройки чипсета и экрана"
             title="Настройки чипсета и экрана"
-            className="h-7 w-7 sm:h-8 sm:w-8 flex items-center justify-center rounded-md bg-[#2A2D33] hover:bg-[#353941] active:scale-[0.97] text-[#E6E2D9] transition-colors"
+            className={`h-7 w-7 sm:h-8 sm:w-8 flex items-center justify-center rounded-md active:scale-[0.97] transition-colors ${
+              activePanel === 'settings'
+                ? 'bg-[#3A3E48] text-white ring-1 ring-[#E07A22]/80'
+                : 'bg-[#2A2D33] hover:bg-[#353941] text-[#E6E2D9]'
+            }`}
           >
-            <SlidersHorizontal className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+            <SlidersHorizontal className="w-3.5 h-3.5 sm:w-4 sm:h-4 shrink-0" />
           </button>
 
           <button
             type="button"
+            data-testid="topbar-disks-btn"
             onClick={onOpenDisks}
+            aria-pressed={activePanel === 'disks'}
             aria-label="Дискеты, HDF, архивы и Kickstart ROM"
             title="Диски ADF/ADZ/LHA/HDF и ROM"
-            className="h-7 w-7 sm:h-8 sm:w-8 flex items-center justify-center rounded-md bg-[#C8342A] hover:bg-[#D94035] active:scale-[0.97] text-white transition-colors"
+            className={`h-7 w-7 sm:h-8 sm:w-8 flex items-center justify-center rounded-md bg-[#C8342A] hover:bg-[#D94035] active:scale-[0.97] text-white transition-colors ${
+              activePanel === 'disks' ? 'ring-1 ring-white/60' : ''
+            }`}
           >
-            <FloppyDiskIcon className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+            <FloppyDiskIcon className="w-3.5 h-3.5 sm:w-4 sm:h-4 shrink-0" />
           </button>
 
           <button

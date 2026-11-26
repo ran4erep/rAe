@@ -757,16 +757,9 @@ export class AmigaMachine {
     chipset.requestIrq(INT_VERTB);
 
     for (let line = 0; line < totalLines; line++) {
-      chipset.beginScanline(line, cpu.cycles, cpuCyclesPerLine);
-
-      // Phase 1 Copper: execute visible-span Copper moves up to $E1 (incl. $DC/$E0 right-border splits)
-      // before scanline display, while chipset.ts defers whole-line DMA/mod/pointer writes at H >= $D0 to Phase 2
-      chipset.runCopperLine(line, 0xe1);
-
-      // Authentic Agnus sprite DMA header fetch after VBlank Copper loads SPRxPTH/L
-      if (line === spriteHeaderLine) {
-        chipset.fetchSpriteHeaders();
-      }
+      const lineStartCyc = cpu.cycles;
+      const lineEndCyc = lineStartCyc + cpuCyclesPerLine;
+      chipset.beginScanline(line, lineStartCyc, cpuCyclesPerLine);
 
       // Advance floppy /RDY spin-up timer & Paula Disk DMA
       floppy.tickScanline();
@@ -779,18 +772,53 @@ export class AmigaMachine {
         eAccum -= 10;
         eTicks = 46;
       }
-      cia.beginScanline(cpu.cycles, cpuCyclesPerLine, eTicks);
-      cpu.runCycles(cpuCyclesPerLine);
-      chipset.endScanlineBlitter(isPal ? 227 : (line & 1) === 0 ? 227 : 228);
+      cia.beginScanline(lineStartCyc, cpuCyclesPerLine, eTicks);
+
+      // Chronological Copper/CPU/Sprite/Blitter execution along scanline color clocks (0..0xE1).
+      // Zero extra overhead when no Copper wake occurs during the visible span (single cpu.runCycles call).
+      if (chipset.getNextCopperWakeHpos(line) === 0) {
+        chipset.syncToHpos(0);
+      }
+      let curH = 0;
+      let sprHdrDone = line !== spriteHeaderLine;
+      let wakeGuard = 0;
+      while (curH < 0xe1 && wakeGuard++ < 96) {
+        let nextWake = chipset.getNextCopperWakeHpos(line);
+        if (!sprHdrDone && (nextWake < 0 || nextWake > 0x18)) {
+          nextWake = 0x18;
+        }
+        if (nextWake < 0) break;
+        if (nextWake <= curH) {
+          nextWake = curH + 8 <= 0xe1 ? curH + 8 : 0xe1;
+        }
+        const targetCyc = lineStartCyc + (((nextWake * cpuCyclesPerLine) / 227) | 0);
+        const delta = targetCyc - cpu.cycles;
+        if (delta > 0) cpu.runCycles(delta);
+        chipset.syncToHpos(nextWake);
+        if (!sprHdrDone && nextWake >= 0x18) {
+          chipset.fetchSpriteHeaders();
+          sprHdrDone = true;
+        }
+        curH = nextWake;
+      }
+      const remCyc = lineEndCyc - cpu.cycles;
+      if (remCyc > 0) cpu.runCycles(remCyc);
+      chipset.syncToHpos(0xe1);
+      if (!sprHdrDone) {
+        chipset.fetchSpriteHeaders();
+      }
+
+      const lineCcks = isPal ? 227 : (line & 1) === 0 ? 227 : 228;
+      chipset.endScanlineBlitter(lineCcks);
       cia.endScanline();
       cia.onHSync();
-      chipset.stepAudioScanline(isPal ? 227 : (line & 1) === 0 ? 227 : 228);
+      chipset.stepAudioScanline(lineCcks);
 
-      // Render visible scanline via Denise OCS/ECS (advances BPLxPT even when skipping pixels)
+      // Render visible scanline via Denise/Lisa (advances BPLxPT even when skipping pixels)
       chipset.renderScanline(line, renderVideo);
 
-      // Phase 2 Copper: execute HBlank waits/moves (e.g. $E7DF HUD split, $FFE1 PAL wrap) after scanline display
-      chipset.runCopperLine(line, 0xfe);
+      // Complete HBlank Copper moves/waits & PAL line-255 wrap
+      chipset.finishScanlineCopper(line);
     }
 
     this.eClockAccum = eAccum;

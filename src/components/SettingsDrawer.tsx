@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Bug, Copy, Download, FileText, HardDriveDownload, X } from 'lucide-react';
+import { Bug, Copy, Download, FileText, Gamepad2, HardDriveDownload, RotateCcw, SlidersHorizontal, X } from 'lucide-react';
 import {
   AmigaConfig,
   ChipRamKB,
@@ -21,6 +21,10 @@ import {
   OVERSCAN_MIN_WIDTH,
   OVERSCAN_WIDTH_STEP,
 } from '../emulator/hardware/overscan';
+import {
+  countCalibratedBindings,
+  GamepadCalibrationProfile,
+} from '../emulator/controls/gamepadCalibration';
 import {
   CPU_OVERCLOCK_MAX_MHZ,
   CPU_OVERCLOCK_STEP_MHZ,
@@ -46,11 +50,16 @@ const DEBUG_CATEGORY: { id: SettingsCategory; label: string } = {
 
 interface SettingsDrawerProps {
   open: boolean;
+  overlayOnly?: boolean;
   debugUnlocked: boolean;
   config: AmigaConfig;
   activeVideoStandard: ResolvedVideoStandard;
+  gamepadCalibration: GamepadCalibrationProfile | null;
   onClose: () => void;
   onUpdateConfig: (patch: Partial<AmigaConfig>) => void;
+  onOpenOverscanAdjust: () => void;
+  onOpenGamepadCalibration: () => void;
+  onResetGamepadCalibration: () => void;
   onDownloadTriageReport: () => void;
   onCopyTriageReport: () => void;
   onDownloadDebugDump: () => void;
@@ -89,11 +98,16 @@ const ToggleRow: React.FC<ToggleRowProps> = ({ label, hint, checked, onChange, t
 
 export const SettingsDrawer: React.FC<SettingsDrawerProps> = ({
   open,
+  overlayOnly = false,
   debugUnlocked,
   config,
   activeVideoStandard,
+  gamepadCalibration,
   onClose,
   onUpdateConfig,
+  onOpenOverscanAdjust,
+  onOpenGamepadCalibration,
+  onResetGamepadCalibration,
   onDownloadTriageReport,
   onCopyTriageReport,
   onDownloadDebugDump,
@@ -111,19 +125,18 @@ export const SettingsDrawer: React.FC<SettingsDrawerProps> = ({
   const volumePercent = Math.round(volumeRatio * 100);
 
   const overscanViewport = getOverscanViewport(config.overscan, activeVideoStandard);
-  const overscanMinHeight = getMinOverscanHeight(activeVideoStandard);
-  const overscanStdHeight = getStdOverscanHeight(activeVideoStandard);
-  const overscanMaxHeight = getMaxOverscanHeight(activeVideoStandard);
+  const overscanSummary = `${overscanViewport.width}×${overscanViewport.height} px`;
+  const minOverscanH = getMinOverscanHeight(activeVideoStandard);
+  const stdOverscanH = getStdOverscanHeight(activeVideoStandard);
+  const maxOverscanH = getMaxOverscanHeight(activeVideoStandard);
   const overscanWidthRatio =
     (overscanViewport.width - OVERSCAN_MIN_WIDTH) / (OVERSCAN_MAX_WIDTH - OVERSCAN_MIN_WIDTH);
-  const overscanHeightSpan = overscanMaxHeight - overscanMinHeight;
+  const overscanHeightSpan = maxOverscanH - minOverscanH;
   const overscanHeightRatio =
-    overscanHeightSpan > 0
-      ? (overscanViewport.height - overscanMinHeight) / overscanHeightSpan
-      : 0;
-  const overscanExtraWidth = overscanViewport.width - OVERSCAN_MIN_WIDTH;
-  const overscanExtraHeight = overscanViewport.height - overscanStdHeight;
-  const overscanSummary = `${overscanViewport.width}×${overscanViewport.height} px`;
+    overscanHeightSpan > 0 ? (overscanViewport.height - minOverscanH) / overscanHeightSpan : 0;
+  const overscanExtraW = overscanViewport.width - OVERSCAN_MIN_WIDTH;
+  const overscanExtraH = overscanViewport.height - stdOverscanH;
+  const calibratedCount = countCalibratedBindings(gamepadCalibration);
   const baseFps = activeVideoStandard === 'NTSC' ? 60 : 50;
   const cpuOverclockValue = sanitizeCpuOverclock(config.cpuOverclock, 1);
   const minCpuMhz = getEffectiveCpuMhz(config.chipset, activeVideoStandard, false, 1);
@@ -156,15 +169,25 @@ export const SettingsDrawer: React.FC<SettingsDrawerProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/70"
+      className={
+        overlayOnly
+          ? 'fixed inset-0 z-50 flex items-end sm:items-center justify-center lg:items-stretch lg:justify-end bg-black/70 lg:bg-black/45'
+          : 'fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/70 lg:static lg:inset-auto lg:z-auto lg:block lg:bg-transparent lg:w-[400px] xl:w-[430px] lg:h-full lg:shrink-0'
+      }
       role="dialog"
-      aria-modal="true"
+      aria-modal={overlayOnly ? 'true' : undefined}
       aria-label="Настройки"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="w-full sm:max-w-md max-h-[85dvh] bg-[#1E2025] border-t sm:border border-white/12 rounded-t-2xl sm:rounded-xl flex flex-col overflow-hidden shadow-2xl">
+      <div
+        className={
+          overlayOnly
+            ? 'w-full sm:max-w-md max-h-[85dvh] lg:max-w-none lg:w-[420px] lg:max-h-none lg:h-full bg-[#1E2025] border-t sm:border lg:border-t-0 lg:border-r-0 lg:border-b-0 lg:border-l border-white/12 rounded-t-2xl sm:rounded-xl lg:rounded-none lg:rounded-l-xl flex flex-col overflow-hidden shadow-2xl'
+            : 'w-full sm:max-w-md max-h-[85dvh] lg:max-w-none lg:w-full lg:max-h-none lg:h-full bg-[#1E2025] border-t sm:border lg:border-t-0 lg:border-r-0 lg:border-b-0 lg:border-l border-white/10 rounded-t-2xl sm:rounded-xl lg:rounded-none flex flex-col overflow-hidden shadow-2xl lg:shadow-none'
+        }
+      >
         <div className="px-4 py-3 border-b border-white/10 flex items-center justify-between gap-3">
           <h2 className="text-base font-bold text-[#F2EFE9]">Настройки</h2>
           <button
@@ -384,127 +407,152 @@ export const SettingsDrawer: React.FC<SettingsDrawerProps> = ({
                 </div>
               </div>
 
-              <div className="space-y-3">
-                <div className="flex items-baseline justify-between gap-2">
-                  <span className="block text-xs font-semibold text-[#D6D2C9]">
+              {/* Mobile / Fullscreen Overlay: open separate non-blocking panel below screen */}
+              <div
+                className={`${
+                  overlayOnly ? 'flex' : 'flex lg:hidden'
+                } bg-[#16181C] border border-white/10 rounded-lg p-3 items-center justify-between gap-3`}
+              >
+                <div className="min-w-0">
+                  <span className="block text-xs font-semibold text-[#F2EFE9]">
                     Оверскан (поля экрана)
                   </span>
                   <span
                     data-testid="overscan-resolution-label"
-                    className="text-xs font-mono tabular-nums text-[#E07A22]"
+                    className="block text-[11px] font-mono tabular-nums text-[#E07A22] mt-0.5"
                   >
                     {overscanSummary}
                   </span>
                 </div>
-
-                {/* Ширина в пикселях */}
-                <div className="space-y-1">
-                  <div className="flex items-baseline justify-between gap-2">
-                    <label
-                      htmlFor="amiga-overscan-width"
-                      className="text-[11px] font-medium text-[#BDB9B0]"
-                    >
-                      Ширина
-                    </label>
-                    <span
-                      data-testid="overscan-width-value"
-                      className="text-xs font-mono tabular-nums text-[#F2EFE9]"
-                    >
-                      {overscanViewport.width} px
-                      {overscanExtraWidth > 0 ? ` (+${overscanExtraWidth})` : ''}
-                    </span>
-                  </div>
-                  <div className="relative h-7 flex items-center">
-                    <div
-                      aria-hidden="true"
-                      className="w-full h-2.5 rounded-full bg-[#121316] border border-white/12 overflow-hidden"
-                    >
-                      <div
-                        data-testid="overscan-width-fill-bar"
-                        className="h-full w-full origin-left bg-gradient-to-r from-[#C8342A] to-[#E07A22]"
-                        style={{ transform: `scaleX(${overscanWidthRatio})` }}
-                      />
-                    </div>
-                    <input
-                      id="amiga-overscan-width"
-                      type="range"
-                      min={OVERSCAN_MIN_WIDTH}
-                      max={OVERSCAN_MAX_WIDTH}
-                      step={OVERSCAN_WIDTH_STEP}
-                      value={overscanViewport.width}
-                      onChange={(e) =>
-                        onUpdateConfig({
-                          overscan: formatOverscanSetting(
-                            Number(e.target.value),
-                            overscanViewport.height,
-                            activeVideoStandard
-                          ),
-                        })
-                      }
-                      className="amiga-range-input absolute inset-0 w-full h-full cursor-pointer"
-                    />
-                  </div>
-                  <div className="flex items-center justify-between text-[10px] font-mono tabular-nums text-[#8F8B82]">
-                    <span>{OVERSCAN_MIN_WIDTH} px</span>
-                    <span>{OVERSCAN_MAX_WIDTH} px</span>
-                  </div>
-                </div>
-
-                {/* Высота в пикселях (строках) */}
-                <div className="space-y-1">
-                  <div className="flex items-baseline justify-between gap-2">
-                    <label
-                      htmlFor="amiga-overscan-height"
-                      className="text-[11px] font-medium text-[#BDB9B0]"
-                    >
-                      Высота ({activeVideoStandard})
-                    </label>
-                    <span
-                      data-testid="overscan-height-value"
-                      className="text-xs font-mono tabular-nums text-[#F2EFE9]"
-                    >
-                      {overscanViewport.height} px
-                      {overscanExtraHeight !== 0
-                        ? ` (${overscanExtraHeight > 0 ? `+${overscanExtraHeight}` : overscanExtraHeight})`
-                        : ''}
-                    </span>
-                  </div>
-                  <div className="relative h-7 flex items-center">
-                    <div
-                      aria-hidden="true"
-                      className="w-full h-2.5 rounded-full bg-[#121316] border border-white/12 overflow-hidden"
-                    >
-                      <div
-                        data-testid="overscan-height-fill-bar"
-                        className="h-full w-full origin-left bg-gradient-to-r from-[#C8342A] to-[#E07A22]"
-                        style={{ transform: `scaleX(${overscanHeightRatio})` }}
-                      />
-                    </div>
-                    <input
-                      id="amiga-overscan-height"
-                      type="range"
-                      min={overscanMinHeight}
-                      max={overscanMaxHeight}
-                      step={OVERSCAN_HEIGHT_STEP}
-                      value={overscanViewport.height}
-                      onChange={(e) =>
-                        onUpdateConfig({
-                          overscan: formatOverscanSetting(
-                            overscanViewport.width,
-                            Number(e.target.value),
-                            activeVideoStandard
-                          ),
-                        })
-                      }
-                      className="amiga-range-input absolute inset-0 w-full h-full cursor-pointer"
-                    />
-                  </div>
-                  <div className="flex items-center justify-between text-[10px] font-mono tabular-nums text-[#8F8B82]">
-                    <span>{overscanMinHeight} px</span>
-                    <span>{overscanMaxHeight} px</span>
-                  </div>
-                </div>
+                <button
+                  type="button"
+                  data-testid="overscan-adjust-btn"
+                  onClick={onOpenOverscanAdjust}
+                  className="h-9 px-3 rounded-lg bg-[#C8342A] hover:bg-[#D94035] text-xs font-semibold text-white inline-flex items-center gap-1.5 shrink-0 transition-colors"
+                >
+                  <SlidersHorizontal className="w-3.5 h-3.5" />
+                  Отрегулировать
+                </button>
               </div>
+
+              {/* Desktop Inline Side Panel: sliders directly inside Settings (screen stays visible beside) */}
+              {!overlayOnly && (
+                <div className="hidden lg:block space-y-3 bg-[#16181C] border border-white/10 rounded-lg p-3">
+                  <div className="flex items-baseline justify-between gap-2">
+                    <span className="text-xs font-semibold text-[#F2EFE9]">
+                      Оверскан (поля экрана)
+                    </span>
+                    <span
+                      data-testid="overscan-desktop-resolution-label"
+                      className="text-[11px] font-mono tabular-nums text-[#E07A22]"
+                    >
+                      {overscanSummary}
+                    </span>
+                  </div>
+
+                  {/* Width Slider */}
+                  <div className="space-y-1">
+                    <div className="flex items-baseline justify-between gap-2">
+                      <label
+                        htmlFor="amiga-overscan-width"
+                        className="text-xs font-medium text-[#D6D2C9]"
+                      >
+                        Ширина
+                      </label>
+                      <span className="text-xs font-mono tabular-nums text-[#F2EFE9]">
+                        {overscanViewport.width} px
+                        {overscanExtraW > 0 ? ` (+${overscanExtraW})` : ''}
+                      </span>
+                    </div>
+                    <div className="relative h-7 flex items-center">
+                      <div
+                        aria-hidden="true"
+                        className="w-full h-2.5 rounded-full bg-[#121316] border border-white/12 overflow-hidden"
+                      >
+                        <div
+                          className="h-full w-full origin-left bg-gradient-to-r from-[#C8342A] to-[#E07A22]"
+                          style={{ transform: `scaleX(${overscanWidthRatio})` }}
+                        />
+                      </div>
+                      <input
+                        id="amiga-overscan-width"
+                        data-testid="overscan-width-slider"
+                        type="range"
+                        min={OVERSCAN_MIN_WIDTH}
+                        max={OVERSCAN_MAX_WIDTH}
+                        step={OVERSCAN_WIDTH_STEP}
+                        value={overscanViewport.width}
+                        onChange={(e) =>
+                          onUpdateConfig({
+                            overscan: formatOverscanSetting(
+                              Number(e.target.value),
+                              overscanViewport.height,
+                              activeVideoStandard
+                            ),
+                          })
+                        }
+                        className="amiga-range-input absolute inset-0 w-full h-full cursor-pointer"
+                      />
+                    </div>
+                    <div className="flex items-center justify-between text-[10px] font-mono tabular-nums text-[#8F8B82]">
+                      <span>{OVERSCAN_MIN_WIDTH} px</span>
+                      <span>{OVERSCAN_MAX_WIDTH} px</span>
+                    </div>
+                  </div>
+
+                  {/* Height Slider */}
+                  <div className="space-y-1">
+                    <div className="flex items-baseline justify-between gap-2">
+                      <label
+                        htmlFor="amiga-overscan-height"
+                        className="text-xs font-medium text-[#D6D2C9]"
+                      >
+                        Высота ({activeVideoStandard})
+                      </label>
+                      <span className="text-xs font-mono tabular-nums text-[#F2EFE9]">
+                        {overscanViewport.height} px
+                        {overscanExtraH !== 0
+                          ? ` (${overscanExtraH > 0 ? `+${overscanExtraH}` : overscanExtraH})`
+                          : ''}
+                      </span>
+                    </div>
+                    <div className="relative h-7 flex items-center">
+                      <div
+                        aria-hidden="true"
+                        className="w-full h-2.5 rounded-full bg-[#121316] border border-white/12 overflow-hidden"
+                      >
+                        <div
+                          className="h-full w-full origin-left bg-gradient-to-r from-[#C8342A] to-[#E07A22]"
+                          style={{ transform: `scaleX(${overscanHeightRatio})` }}
+                        />
+                      </div>
+                      <input
+                        id="amiga-overscan-height"
+                        data-testid="overscan-height-slider"
+                        type="range"
+                        min={minOverscanH}
+                        max={maxOverscanH}
+                        step={OVERSCAN_HEIGHT_STEP}
+                        value={overscanViewport.height}
+                        onChange={(e) =>
+                          onUpdateConfig({
+                            overscan: formatOverscanSetting(
+                              overscanViewport.width,
+                              Number(e.target.value),
+                              activeVideoStandard
+                            ),
+                          })
+                        }
+                        className="amiga-range-input absolute inset-0 w-full h-full cursor-pointer"
+                      />
+                    </div>
+                    <div className="flex items-center justify-between text-[10px] font-mono tabular-nums text-[#8F8B82]">
+                      <span>{minOverscanH} px</span>
+                      <span>{maxOverscanH} px</span>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               <div className="space-y-2">
                 <span className="block text-xs font-semibold text-[#D6D2C9]">Пропуск кадров</span>
@@ -674,6 +722,48 @@ export const SettingsDrawer: React.FC<SettingsDrawerProps> = ({
                   onChange={(checked) => onUpdateConfig({ showEmuPerf: checked })}
                   testId="toggle-emu-perf"
                 />
+              </div>
+
+              <div className="bg-[#16181C] border border-white/10 rounded-lg p-3 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <span className="block text-xs font-semibold text-[#F2EFE9]">
+                      Физический геймпад
+                    </span>
+                    <span
+                      data-testid="gamepad-calibration-status"
+                      className="block text-[11px] text-[#9B968D] truncate mt-0.5"
+                    >
+                      {gamepadCalibration
+                        ? `Откалиброван (${calibratedCount} кнопок) · ${gamepadCalibration.padId}`
+                        : 'Стандартная схема (W3C)'}
+                    </span>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    data-testid="gamepad-calibration-btn"
+                    onClick={onOpenGamepadCalibration}
+                    className="flex-1 h-9 px-3 rounded-lg bg-[#2A2D33] hover:bg-[#353941] border border-white/10 text-xs font-semibold text-[#F2EFE9] inline-flex items-center justify-center gap-1.5 transition-colors"
+                  >
+                    <Gamepad2 className="w-4 h-4 text-[#E07A22]" />
+                    Калибровка геймпада
+                  </button>
+                  {gamepadCalibration && (
+                    <button
+                      type="button"
+                      data-testid="gamepad-calibration-clear-btn"
+                      onClick={onResetGamepadCalibration}
+                      aria-label="Сбросить калибровку геймпада"
+                      title="Сбросить на стандартную схему"
+                      className="h-9 px-2.5 rounded-lg bg-[#2A2D33] hover:bg-[#462626] text-xs font-medium text-[#D8D4CC] hover:text-[#FF9E98] inline-flex items-center gap-1 shrink-0 transition-colors"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      Сброс
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
           )}

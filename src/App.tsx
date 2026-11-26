@@ -4,7 +4,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Check, CircleSlash, Download, FilePlus2, FolderUp, Gamepad2, HardDrive, Hash, Keyboard, LayoutGrid, Lock, MousePointer, Pencil } from 'lucide-react';
+import { Check, Gamepad2, Hash, Keyboard, LayoutGrid, MousePointer, Pencil } from 'lucide-react';
 import { ArchiveMediaCandidate, resolveUploadedFileAsync } from './emulator/archives/archiveManager';
 import {
   CatalogDiskFile,
@@ -28,6 +28,12 @@ import {
   StickDirection,
   updateActiveProfile,
 } from './emulator/controls/customProfiles';
+import {
+  clearGamepadCalibration,
+  GamepadCalibrationProfile,
+  loadGamepadCalibration,
+  saveGamepadCalibration,
+} from './emulator/controls/gamepadCalibration';
 import {
   hasAnyConnectedGamepad,
   PhysicalGamepadSink,
@@ -84,7 +90,6 @@ import {
 } from './emulator/performanceStats';
 import { FullscreenOverlayMode, HardwareTopBar } from './components/HardwareTopBar';
 import { AmigaScreen } from './components/AmigaScreen';
-import { FloppyDiskIcon } from './components/FloppyDiskIcon';
 import { AmigaKeyboard } from './components/AmigaKeyboard';
 import { AmigaKeyboardPicker } from './components/AmigaKeyboardPicker';
 import { CustomControlsOverlay } from './components/CustomControlsOverlay';
@@ -95,9 +100,9 @@ import { ArchiveModal, PendingArchiveChoice } from './components/ArchiveModal';
 import { BlankDiskModal } from './components/BlankDiskModal';
 import { CatalogViewState, createInitialCatalogViewState } from './components/CatalogTab';
 import { DiskRomDrawer, LaunchDrawerTab } from './components/DiskRomDrawer';
-import { HardfileSizePanel } from './components/HardfileSizePanel';
+import { GamepadCalibrationModal } from './components/GamepadCalibrationModal';
+import { OverscanAdjustPanel } from './components/OverscanAdjustPanel';
 import { SettingsDrawer } from './components/SettingsDrawer';
-import { SaveSlotsList } from './components/SaveSlotsList';
 import { ToastContainer, ToastMessage } from './components/ToastContainer';
 import {
   AmigaModelKey,
@@ -212,12 +217,17 @@ export default function App() {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [fullscreenOverlayHidden, setFullscreenOverlayHidden] = useState(false);
   const thumbCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const sidebarDf0InputRef = useRef<HTMLInputElement | null>(null);
-  const sidebarDf1InputRef = useRef<HTMLInputElement | null>(null);
-  const sidebarDh1InputRef = useRef<HTMLInputElement | null>(null);
   const [disksOpen, setDisksOpen] = useState(false);
   const [blankDiskDrive, setBlankDiskDrive] = useState<0 | 1 | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [overscanAdjustOpen, setOverscanAdjustOpen] = useState(false);
+  const [calibrationOpen, setCalibrationOpen] = useState(false);
+  const [gamepadCalibration, setGamepadCalibration] = useState<GamepadCalibrationProfile | null>(() =>
+    loadGamepadCalibration()
+  );
+  const gamepadCalibrationRef = useRef<GamepadCalibrationProfile | null>(gamepadCalibration);
+  gamepadCalibrationRef.current = gamepadCalibration;
+  const gamepadTrackerRef = useRef<PhysicalGamepadTracker | null>(null);
   const [debugUnlocked, setDebugUnlocked] = useState(false);
   const modelTapStateRef = useRef<SecretTapState>(createInitialSecretTapState());
   const modalOpenRef = useRef(false);
@@ -445,6 +455,8 @@ export default function App() {
     };
 
     const gamepadTracker = new PhysicalGamepadTracker();
+    gamepadTracker.setCalibration(gamepadCalibrationRef.current);
+    gamepadTrackerRef.current = gamepadTracker;
     const gamepadSink: PhysicalGamepadSink = {
       setJoystick: (patch) => machine.setJoystick(patch),
       setKey: (code, isDown) => machine.setKey(code, isDown),
@@ -885,6 +897,7 @@ export default function App() {
       disposed = true;
       cancelAnimationFrame(rafId);
       gamepadTracker.releaseAll(gamepadSink);
+      gamepadTrackerRef.current = null;
       window.removeEventListener('gamepadconnected', handleGamepadConnected);
       window.removeEventListener('gamepaddisconnected', handleGamepadDisconnected);
       persistDh0IfDirty();
@@ -904,11 +917,34 @@ export default function App() {
   const archiveModalOpen = pendingArchive !== null;
   const blankDiskModalOpen = blankDiskDrive !== null;
   const customPickerOpen = customPickerContext !== null;
-  modalOpenRef.current =
-    disksOpen || settingsOpen || archiveModalOpen || blankDiskModalOpen || customPickerOpen;
+  const anyModalOpen =
+    disksOpen ||
+    settingsOpen ||
+    archiveModalOpen ||
+    blankDiskModalOpen ||
+    customPickerOpen ||
+    calibrationOpen;
+  modalOpenRef.current = anyModalOpen;
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (disksOpen || settingsOpen || archiveModalOpen || blankDiskModalOpen || customPickerOpen) return;
+      if (anyModalOpen) {
+        if (e.code === 'Escape') {
+          if (calibrationOpen) {
+            setCalibrationOpen(false);
+          } else if (customPickerOpen) {
+            setCustomPickerContext(null);
+          } else if (blankDiskModalOpen) {
+            setBlankDiskDrive(null);
+          } else if (archiveModalOpen) {
+            setPendingArchive(null);
+          } else if (settingsOpen) {
+            setSettingsOpen(false);
+          } else if (disksOpen) {
+            setDisksOpen(false);
+          }
+        }
+        return;
+      }
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       const raw = BROWSER_CODE_TO_AMIGA[e.code];
       if (raw === undefined) return;
@@ -926,7 +962,7 @@ export default function App() {
     };
 
     const onKeyUp = (e: KeyboardEvent) => {
-      if (customPickerOpen) return;
+      if (customPickerOpen || calibrationOpen) return;
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       const raw = BROWSER_CODE_TO_AMIGA[e.code];
       if (raw === undefined) return;
@@ -940,7 +976,7 @@ export default function App() {
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
     };
-  }, [archiveModalOpen, blankDiskModalOpen, customPickerOpen, disksOpen, settingsOpen]);
+  }, [anyModalOpen, archiveModalOpen, blankDiskModalOpen, calibrationOpen, customPickerOpen, disksOpen, settingsOpen]);
 
   const wakeAudio = useCallback(() => {
     if (configRef.current.audioEnabled) {
@@ -2535,6 +2571,14 @@ export default function App() {
   }, [debugUnlocked, showToast]);
 
   const handleOpenDisks = useCallback(() => {
+    setSettingsOpen(false);
+    setOverscanAdjustOpen(false);
+    setCalibrationOpen(false);
+    if (disksOpen || pendingArchive !== null) {
+      setDisksOpen(false);
+      setPendingArchive(null);
+      return;
+    }
     if (lastLaunchViewRef.current === 'archive' && lastArchive) {
       setDisksOpen(false);
       setPendingArchive(lastArchive);
@@ -2542,7 +2586,34 @@ export default function App() {
       lastLaunchViewRef.current = 'drawer';
       setDisksOpen(true);
     }
-  }, [lastArchive]);
+  }, [disksOpen, lastArchive, pendingArchive]);
+
+  const handleOpenSettings = useCallback(() => {
+    setDisksOpen(false);
+    setPendingArchive(null);
+    setOverscanAdjustOpen(false);
+    setCalibrationOpen(false);
+    setSettingsOpen((prev) => !prev);
+  }, []);
+
+  const handleSaveGamepadCalibration = useCallback(
+    (profile: GamepadCalibrationProfile) => {
+      setGamepadCalibration(profile);
+      gamepadCalibrationRef.current = profile;
+      saveGamepadCalibration(profile);
+      gamepadTrackerRef.current?.setCalibration(profile);
+      showToast('ok', `Калибровка геймпада сохранена (${profile.padId})`);
+    },
+    [showToast]
+  );
+
+  const handleResetGamepadCalibration = useCallback(() => {
+    setGamepadCalibration(null);
+    gamepadCalibrationRef.current = null;
+    clearGamepadCalibration();
+    gamepadTrackerRef.current?.setCalibration(null);
+    showToast('ok', 'Восстановлена стандартная схема геймпада');
+  }, [showToast]);
 
   return (
     <div
@@ -2570,7 +2641,14 @@ export default function App() {
         onToggleAudio={handleToggleAudio}
         onWarmReset={handleWarmReset}
         onOpenDisks={handleOpenDisks}
-        onOpenSettings={() => setSettingsOpen(true)}
+        onOpenSettings={handleOpenSettings}
+        activePanel={
+          disksOpen || pendingArchive !== null
+            ? 'disks'
+            : settingsOpen || calibrationOpen
+              ? 'settings'
+              : null
+        }
         onModelTitleTap={handleModelTitleTap}
       />
 
@@ -2579,19 +2657,26 @@ export default function App() {
         className={
           isFullscreen
             ? 'flex-1 min-w-0 h-full flex flex-col relative bg-black'
-            : 'flex-1 min-h-0 flex flex-col max-w-[1440px] w-full mx-auto'
+            : 'flex-1 min-h-0 flex flex-col lg:flex-row max-w-[1440px] w-full mx-auto'
         }
       >
+        <div
+          className={
+            isFullscreen
+              ? 'flex-1 min-w-0 min-h-0 flex flex-col relative'
+              : 'flex-1 min-w-0 min-h-0 flex flex-col'
+          }
+        >
         {/* Fullscreen Custom Editor sits cleanly ABOVE the screen/control zone (never overlapping) */}
         {isFullscreen && customEditToolbarNode}
 
-        {/* SCREEN (+ Side Hardware Bay on Desktop when not fullscreen, or Overlay Controls in fullscreen) */}
+        {/* SCREEN (full-width centered CRT on desktop & mobile; shrinks horizontally when desktop side panel is open) */}
         <section
           style={{ ['--screen-aspect' as string]: String(cropAspect) }}
           className={
             isFullscreen
               ? 'relative w-full flex-1 min-h-0 bg-black overflow-hidden'
-              : 'shrink-0 w-full aspect-[var(--screen-aspect)] max-h-[52dvh] lg:aspect-auto lg:flex-1 lg:min-h-0 lg:max-h-none grid grid-cols-1 lg:grid-cols-[1fr_340px] bg-[#0D0E11] border-b lg:border-b-0 border-white/10'
+              : 'shrink-0 w-full aspect-[var(--screen-aspect)] max-h-[52dvh] lg:aspect-auto lg:flex-1 lg:min-h-0 lg:max-h-none bg-[#0D0E11] border-b lg:border-b-0 border-white/10'
           }
         >
           <div className="min-w-0 min-h-0 w-full h-full">
@@ -2599,6 +2684,7 @@ export default function App() {
               canvasRef={canvasRef}
               scanlines={config.crtScanlines}
               paused={status.paused}
+              pointerLockAllowed={!status.paused && !overscanAdjustOpen && !calibrationOpen && !(isFullscreen && anyModalOpen)}
               emuPerf={config.showEmuPerf ? emuPerf : null}
               aspectRatio={cropAspect}
               fullscreen={isFullscreen}
@@ -2672,315 +2758,35 @@ export default function App() {
             </div>
           )}
 
-          {/* Desktop Side Hardware Bay (hidden in fullscreen) */}
-          {!isFullscreen && (
-          <aside
-            className="hidden lg:flex flex-col bg-[#1A1C20] border-l border-white/10 p-3 gap-2.5 min-h-0 overflow-y-auto"
-            aria-label="Дисководы и сохранения"
-          >
-            {/* Active Drives DF0 / DF1 / DH0 / DH1 & ROM */}
-            <div className="bg-[#131417] border border-white/8 rounded-lg px-2.5 py-2 space-y-2 shrink-0">
-              {/* DF0 */}
-              <div className="space-y-1">
-                <div className="flex items-center justify-between gap-1.5">
-                  <span className="inline-flex items-center gap-1 text-[11px] font-mono text-[#E07A22] font-semibold">
-                    <FloppyDiskIcon className="w-3.5 h-3.5 shrink-0" />
-                    DF0:
-                  </span>
-                  <div className="flex items-center gap-1 shrink-0">
-                    <input
-                      ref={sidebarDf0InputRef}
-                      type="file"
-                      aria-label="Выбрать ADF или архив (7z, rar, zip, lha, adz) для DF0"
-                      className="hidden"
-                      onChange={(e) => {
-                        const f = e.target.files?.[0];
-                        e.target.value = '';
-                        if (f) void handleUploadAdf(0, f);
-                      }}
-                    />
-                    <button
-                      type="button"
-                      onClick={() => sidebarDf0InputRef.current?.click()}
-                      className="h-7 px-2 rounded bg-[#2A2D33] hover:bg-[#383C44] text-[11px] font-medium text-[#F2EFE9] flex items-center gap-1"
-                    >
-                      <FolderUp className="w-3 h-3" />
-                      ADF/Архив
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleInsertBlankAdf(0)}
-                      aria-label="Вставить пустую дискету в DF0"
-                      className="h-7 px-2 rounded bg-[#2A2D33] hover:bg-[#383C44] text-[11px] font-medium text-[#E6E2D9] flex items-center gap-1"
-                    >
-                      <FilePlus2 className="w-3 h-3 text-[#E07A22]" />
-                      Пустая
-                    </button>
-                    {status.df0.inserted && (
-                      <>
-                        <button
-                          type="button"
-                          onClick={() => handleDownloadAdf(0)}
-                          aria-label="Скачать DF0"
-                          title="Скачать ADF"
-                          className="h-7 w-7 rounded bg-[#2A2D33] hover:bg-[#383C44] text-[#8BC49A] flex items-center justify-center"
-                        >
-                          <Download className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleEjectDisk(0)}
-                          aria-label="Извлечь DF0"
-                          title="Извлечь диск"
-                          className="h-7 w-7 rounded bg-[#2A2D33] hover:bg-[#3A2222] text-[#A7A39A] hover:text-[#FF9E98] flex items-center justify-center"
-                        >
-                          <CircleSlash className="w-3.5 h-3.5" />
-                        </button>
-                      </>
-                    )}
-                  </div>
-                </div>
-                <p className="text-xs font-medium text-[#F2EFE9] truncate">
-                  {status.df0.inserted ? status.df0.name : 'Пусто'}
-                </p>
-              </div>
-
-              {/* DF1 */}
-              <div className="space-y-1 pt-1.5 border-t border-white/6">
-                <div className="flex items-center justify-between gap-1.5">
-                  <span className="inline-flex items-center gap-1 text-[11px] font-mono text-[#A7A39A] font-semibold">
-                    <FloppyDiskIcon className="w-3.5 h-3.5 shrink-0" />
-                    DF1:
-                  </span>
-                  <div className="flex items-center gap-1 shrink-0">
-                    <input
-                      ref={sidebarDf1InputRef}
-                      type="file"
-                      aria-label="Выбрать ADF или архив (7z, rar, zip, lha, adz) для DF1"
-                      className="hidden"
-                      onChange={(e) => {
-                        const f = e.target.files?.[0];
-                        e.target.value = '';
-                        if (f) void handleUploadAdf(1, f);
-                      }}
-                    />
-                    <button
-                      type="button"
-                      onClick={() => sidebarDf1InputRef.current?.click()}
-                      className="h-7 px-2 rounded bg-[#2A2D33] hover:bg-[#383C44] text-[11px] font-medium text-[#F2EFE9] flex items-center gap-1"
-                    >
-                      <FolderUp className="w-3 h-3" />
-                      ADF/Архив
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleInsertBlankAdf(1)}
-                      aria-label="Вставить пустую дискету в DF1"
-                      className="h-7 px-2 rounded bg-[#2A2D33] hover:bg-[#383C44] text-[11px] font-medium text-[#E6E2D9] flex items-center gap-1"
-                    >
-                      <FilePlus2 className="w-3 h-3 text-[#E07A22]" />
-                      Пустая
-                    </button>
-                    {status.df1.inserted && (
-                      <>
-                        <button
-                          type="button"
-                          onClick={() => handleDownloadAdf(1)}
-                          aria-label="Скачать DF1"
-                          title="Скачать ADF"
-                          className="h-7 w-7 rounded bg-[#2A2D33] hover:bg-[#383C44] text-[#8BC49A] flex items-center justify-center"
-                        >
-                          <Download className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleEjectDisk(1)}
-                          aria-label="Извлечь DF1"
-                          title="Извлечь диск"
-                          className="h-7 w-7 rounded bg-[#2A2D33] hover:bg-[#3A2222] text-[#A7A39A] hover:text-[#FF9E98] flex items-center justify-center"
-                        >
-                          <CircleSlash className="w-3.5 h-3.5" />
-                        </button>
-                      </>
-                    )}
-                  </div>
-                </div>
-                <p className="text-xs font-medium text-[#F2EFE9] truncate">
-                  {status.df1.inserted ? status.df1.name : 'Пусто'}
-                </p>
-              </div>
-
-              {/* DH0: Locked System Workbench (Auto-saved in browser IndexedDB) */}
-              <div className="space-y-1 pt-1.5 border-t border-white/6">
-                <div className="flex items-center justify-between gap-1.5">
-                  <div className="flex items-center gap-1.5 min-w-0">
-                    <span className="inline-flex items-center gap-1 text-[11px] font-mono text-[#7AD39B] font-semibold shrink-0">
-                      <HardDrive className="w-3.5 h-3.5 shrink-0" />
-                      DH0:
-                    </span>
-                    <span className="inline-flex items-center gap-0.5 text-[9.5px] font-medium text-[#8BC49A] bg-[#58B87C]/12 border border-[#58B87C]/25 rounded px-1 py-0.5 truncate">
-                      <Lock className="w-2.5 h-2.5 shrink-0" />
-                      Система (кеш)
-                    </span>
-                  </div>
-                  {status.dh0.mounted ? (
-                    <div className="flex items-center gap-1 shrink-0">
-                      <button
-                        type="button"
-                        onClick={handleDownloadDh0}
-                        aria-label="Скачать DH0 Workbench HDF"
-                        title="Скачать копию DH0"
-                        className="h-7 w-7 rounded bg-[#2A2D33] hover:bg-[#383C44] text-[#8BC49A] flex items-center justify-center"
-                      >
-                        <Download className="w-3.5 h-3.5" />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleEjectDh0}
-                        aria-label="Извлечь DH0"
-                        title="Извлечь DH0"
-                        className="h-7 w-7 rounded bg-[#2A2D33] hover:bg-[#3A2222] text-[#A7A39A] hover:text-[#FF9E98] flex items-center justify-center"
-                      >
-                        <CircleSlash className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={() => void handleMountDh0()}
-                      aria-label="Подключить системный диск DH0"
-                      className="h-7 px-2 rounded bg-[#2B5B40] hover:bg-[#346E4E] text-[11px] font-medium text-white flex items-center gap-1 shrink-0"
-                    >
-                      <HardDrive className="w-3 h-3" />
-                      Подключить
-                    </button>
-                  )}
-                </div>
-                <p className="text-xs font-medium text-[#F2EFE9] truncate">
-                  {status.dh0.mounted
-                    ? `${status.dh0.name} (${Math.max(1, Math.round(status.dh0.sizeBytes / (1024 * 1024)))} МБ)`
-                    : 'Извлечён (в кеше)'}
-                </p>
-                <HardfileSizePanel
-                  compact
-                  dh0={status.dh0}
-                  targetSizeMB={dh0SizeMB}
-                  driveLabel="DH0:"
-                  sliderLabel="Память системы (DH0:)"
-                  onChangeSizeMB={handleChangeDh0Size}
-                />
-              </div>
-
-              {/* DH1: User Games & Data HDF */}
-              <div className="space-y-1 pt-1.5 border-t border-white/6">
-                <div className="flex items-center justify-between gap-1.5">
-                  <span className="inline-flex items-center gap-1 text-[11px] font-mono text-[#7AD39B] font-semibold">
-                    <HardDrive className="w-3.5 h-3.5 shrink-0" />
-                    DH1:
-                  </span>
-                  <div className="flex items-center gap-1 shrink-0">
-                    <input
-                      ref={sidebarDh1InputRef}
-                      type="file"
-                      aria-label="Выбрать HDF или любой архив (7z, rar, zip, lha) для DH1"
-                      className="hidden"
-                      onChange={(e) => {
-                        const f = e.target.files?.[0];
-                        e.target.value = '';
-                        if (f) void handleUploadDh1(f);
-                      }}
-                    />
-                    <button
-                      type="button"
-                      onClick={() => sidebarDh1InputRef.current?.click()}
-                      className="h-7 px-2 rounded bg-[#2A2D33] hover:bg-[#383C44] text-[11px] font-medium text-[#F2EFE9] flex items-center gap-1"
-                    >
-                      <HardDrive className="w-3 h-3 text-[#7AD39B]" />
-                      HDF/Архив
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleCreateBlankDh1(dh1SizeMB)}
-                      aria-label={`Создать новый DH1 HDF ${dh1SizeMB} МБ`}
-                      title={`Создать новый DH1 HDF ${dh1SizeMB} МБ`}
-                      className="h-7 px-2 rounded bg-[#2A2D33] hover:bg-[#383C44] text-[11px] font-medium text-[#E6E2D9] flex items-center gap-1"
-                    >
-                      <FilePlus2 className="w-3 h-3 text-[#7AD39B]" />
-                      {dh1SizeMB}МБ
-                    </button>
-                    {status.dh1.mounted && (
-                      <>
-                        <button
-                          type="button"
-                          onClick={handleDownloadDh1}
-                          aria-label="Скачать DH1 HDF"
-                          title="Скачать DH1 HDF"
-                          className="h-7 w-7 rounded bg-[#2A2D33] hover:bg-[#383C44] text-[#8BC49A] flex items-center justify-center"
-                        >
-                          <Download className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={handleEjectDh1}
-                          aria-label="Отключить DH1"
-                          title="Отключить DH1"
-                          className="h-7 w-7 rounded bg-[#2A2D33] hover:bg-[#3A2222] text-[#A7A39A] hover:text-[#FF9E98] flex items-center justify-center"
-                        >
-                          <CircleSlash className="w-3.5 h-3.5" />
-                        </button>
-                      </>
-                    )}
-                  </div>
-                </div>
-                <p className="text-xs font-medium text-[#F2EFE9] truncate">
-                  {status.dh1.mounted
-                    ? `${status.dh1.name} (${Math.max(1, Math.round(status.dh1.sizeBytes / (1024 * 1024)))} МБ)`
-                    : 'Не подключён (Игры / Файлы)'}
-                </p>
-                <HardfileSizePanel
-                  compact
-                  dh0={status.dh1}
-                  targetSizeMB={dh1SizeMB}
-                  driveLabel="DH1:"
-                  onChangeSizeMB={handleChangeDh1Size}
-                />
-              </div>
-
-              {/* ROM */}
-              <div className="flex items-center justify-between gap-2 pt-1.5 border-t border-white/6">
-                <span className="text-[10px] text-[#8D8980] truncate">ROM: {status.romName}</span>
-                <button
-                  type="button"
-                  onClick={() => setDisksOpen(true)}
-                  className="text-[11px] font-medium text-[#E07A22] hover:underline shrink-0"
-                >
-                  Диски / HDF / ROM
-                </button>
-              </div>
-            </div>
-
-            {/* 5 Save State Slots */}
-            <div className="flex-1 min-h-[160px] flex flex-col gap-1.5">
-              <h2 className="text-xs font-semibold text-[#BDB9B0] shrink-0">Сохранения</h2>
-              <div className="flex-1 min-h-0 overflow-y-auto pr-0.5">
-                <SaveSlotsList
-                  compact
-                  slots={saveSlots}
-                  onSaveSlot={handleSaveSlot}
-                  onLoadSlot={handleLoadSlot}
-                  onDeleteSlot={handleDeleteSlot}
-                  onDownloadSlot={handleDownloadSlot}
-                  onDownloadLiveSavestate={handleDownloadLiveSavestate}
-                  onImportSavestateFile={handleImportSavestateFile}
-                />
-              </div>
-            </div>
-          </aside>
-          )}
         </section>
 
-        {/* MOBILE INPUT MODE SWITCHER & CONTROL DECK (hidden on desktop and in fullscreen) */}
-        {!isFullscreen && (
+        {/* Fullscreen Non-blocking Overscan Adjust Dock */}
+        {isFullscreen && overscanAdjustOpen && (
+          <div className="absolute bottom-2.5 left-1/2 -translate-x-1/2 z-30 w-[min(94vw,540px)]">
+            <OverscanAdjustPanel
+              fullscreen
+              config={config}
+              activeVideoStandard={status.videoStandard}
+              onUpdateConfig={handleUpdateConfig}
+              onDone={() => setOverscanAdjustOpen(false)}
+            />
+          </div>
+        )}
+
+        {/* Non-fullscreen Overscan Adjust Panel docked cleanly below the screen on mobile/tablet */}
+        {!isFullscreen && overscanAdjustOpen && (
+          <div className="flex-1 min-h-0 w-full shrink-0 lg:hidden">
+            <OverscanAdjustPanel
+              config={config}
+              activeVideoStandard={status.videoStandard}
+              onUpdateConfig={handleUpdateConfig}
+              onDone={() => setOverscanAdjustOpen(false)}
+            />
+          </div>
+        )}
+
+        {/* MOBILE INPUT MODE SWITCHER & CONTROL DECK (hidden on desktop, in fullscreen, and while adjusting overscan) */}
+        {!isFullscreen && !overscanAdjustOpen && (
         <>
         <div className="lg:hidden h-10 shrink-0 bg-[#1B1C1F] border-b border-white/10 px-1.5 flex items-center justify-center gap-1.5 select-none">
           <div
@@ -3158,6 +2964,114 @@ export default function App() {
         </section>
         </>
         )}
+        </div>
+
+        {/* DESKTOP DOCKED RIGHT PANEL (opens on demand beside the screen, never covering it; on < lg uses modal bottom-sheet) */}
+        {!isFullscreen && (
+          <>
+            <DiskRomDrawer
+              open={disksOpen}
+              activeTab={drawerTab}
+              onChangeTab={setDrawerTab}
+              catalogState={catalogState}
+              onChangeCatalogState={setCatalogState}
+              lastArchiveName={lastArchive?.result.archiveName ?? null}
+              onReopenLastArchive={() => {
+                if (lastArchive) {
+                  lastLaunchViewRef.current = 'archive';
+                  setDisksOpen(false);
+                  setPendingArchive(lastArchive);
+                }
+              }}
+              status={status}
+              saveSlots={saveSlots}
+              onClose={() => {
+                lastLaunchViewRef.current = 'drawer';
+                setDisksOpen(false);
+              }}
+              onUploadAdf={handleUploadAdf}
+              onInsertBlankAdf={handleInsertBlankAdf}
+              onDownloadAdf={handleDownloadAdf}
+              onEjectDisk={handleEjectDisk}
+              turboFloppy={config.turboFloppy}
+              onToggleTurboFloppy={(enabled) => handleUpdateConfig({ turboFloppy: enabled })}
+              dh0SizeMB={dh0SizeMB}
+              onChangeDh0Size={handleChangeDh0Size}
+              onDownloadDh0={handleDownloadDh0}
+              onEjectDh0={handleEjectDh0}
+              onMountDh0={handleMountDh0}
+              dh1SizeMB={dh1SizeMB}
+              onUploadDh1={handleUploadDh1}
+              onCreateBlankDh1={handleCreateBlankDh1}
+              onChangeDh1Size={handleChangeDh1Size}
+              onDownloadDh1={handleDownloadDh1}
+              onEjectDh1={handleEjectDh1}
+              onUploadRom={handleUploadRom}
+              onRestoreOpenKick={handleRestoreOpenKick}
+              onLoadDefaultBios={handleLoadDefaultBios}
+              onSaveSlot={handleSaveSlot}
+              onLoadSlot={handleLoadSlot}
+              onDeleteSlot={handleDeleteSlot}
+              onDownloadSlot={handleDownloadSlot}
+              onDownloadLiveSavestate={handleDownloadLiveSavestate}
+              onImportSavestateFile={handleImportSavestateFile}
+              launchingCatalogId={launchingCatalogId}
+              onLaunchCatalogItem={handleLaunchCatalogItem}
+            />
+
+            <ArchiveModal
+              pendingArchive={pendingArchive}
+              insertedDf0Name={status.df0.inserted ? status.df0.name : undefined}
+              insertedDf1Name={status.df1.inserted ? status.df1.name : undefined}
+              mountedDh1Name={status.dh1.mounted ? status.dh1.name : undefined}
+              backLabel={drawerTab === 'catalog' ? 'Каталог' : 'Назад'}
+              onBack={() => {
+                lastLaunchViewRef.current = 'drawer';
+                setPendingArchive(null);
+                setDisksOpen(true);
+              }}
+              onClose={() => {
+                lastLaunchViewRef.current = 'drawer';
+                setPendingArchive(null);
+              }}
+              onSelectArchiveMedia={handleSelectArchiveMedia}
+              onMountArchiveDualAdf={handleMountArchiveDualAdf}
+              onPackArchiveAsAdf={handlePackArchiveAsAdf}
+              onPackArchiveAsHdf={handlePackArchiveAsHdf}
+            />
+
+            <SettingsDrawer
+              open={settingsOpen}
+              debugUnlocked={debugUnlocked}
+              config={config}
+              activeVideoStandard={status.videoStandard}
+              gamepadCalibration={gamepadCalibration}
+              onClose={() => setSettingsOpen(false)}
+              onUpdateConfig={handleUpdateConfig}
+              onOpenOverscanAdjust={() => {
+                setSettingsOpen(false);
+                setOverscanAdjustOpen(true);
+              }}
+              onOpenGamepadCalibration={() => {
+                setSettingsOpen(false);
+                setCalibrationOpen(true);
+              }}
+              onResetGamepadCalibration={handleResetGamepadCalibration}
+              onDownloadTriageReport={handleDownloadTriageReport}
+              onCopyTriageReport={handleCopyTriageReport}
+              onDownloadDebugDump={handleDownloadDebugDump}
+              onDownloadLiveSavestate={handleDownloadLiveSavestate}
+            />
+
+            <GamepadCalibrationModal
+              open={calibrationOpen}
+              existingCalibration={gamepadCalibration}
+              onSave={handleSaveGamepadCalibration}
+              onResetToDefault={handleResetGamepadCalibration}
+              onClose={() => setCalibrationOpen(false)}
+            />
+          </>
+        )}
       </main>
 
       {/* Authentic Amiga Keyboard Picker for Custom Controls */}
@@ -3223,90 +3137,116 @@ export default function App() {
         );
       })()}
 
-      {/* Modals / Bottom Sheets */}
-      <DiskRomDrawer
-        open={disksOpen}
-        activeTab={drawerTab}
-        onChangeTab={setDrawerTab}
-        catalogState={catalogState}
-        onChangeCatalogState={setCatalogState}
-        lastArchiveName={lastArchive?.result.archiveName ?? null}
-        onReopenLastArchive={() => {
-          if (lastArchive) {
-            lastLaunchViewRef.current = 'archive';
-            setDisksOpen(false);
-            setPendingArchive(lastArchive);
-          }
-        }}
-        status={status}
-        saveSlots={saveSlots}
-        onClose={() => {
-          lastLaunchViewRef.current = 'drawer';
-          setDisksOpen(false);
-        }}
-        onUploadAdf={handleUploadAdf}
-        onInsertBlankAdf={handleInsertBlankAdf}
-        onDownloadAdf={handleDownloadAdf}
-        onEjectDisk={handleEjectDisk}
-        turboFloppy={config.turboFloppy}
-        onToggleTurboFloppy={(enabled) => handleUpdateConfig({ turboFloppy: enabled })}
-        dh0SizeMB={dh0SizeMB}
-        onChangeDh0Size={handleChangeDh0Size}
-        onDownloadDh0={handleDownloadDh0}
-        onEjectDh0={handleEjectDh0}
-        onMountDh0={handleMountDh0}
-        dh1SizeMB={dh1SizeMB}
-        onUploadDh1={handleUploadDh1}
-        onCreateBlankDh1={handleCreateBlankDh1}
-        onChangeDh1Size={handleChangeDh1Size}
-        onDownloadDh1={handleDownloadDh1}
-        onEjectDh1={handleEjectDh1}
-        onUploadRom={handleUploadRom}
-        onRestoreOpenKick={handleRestoreOpenKick}
-        onLoadDefaultBios={handleLoadDefaultBios}
-        onSaveSlot={handleSaveSlot}
-        onLoadSlot={handleLoadSlot}
-        onDeleteSlot={handleDeleteSlot}
-        onDownloadSlot={handleDownloadSlot}
-        onDownloadLiveSavestate={handleDownloadLiveSavestate}
-        onImportSavestateFile={handleImportSavestateFile}
-        launchingCatalogId={launchingCatalogId}
-        onLaunchCatalogItem={handleLaunchCatalogItem}
-      />
+      {/* Fullscreen Overlay Modals */}
+      {isFullscreen && (
+        <>
+          <DiskRomDrawer
+            open={disksOpen}
+            overlayOnly
+            activeTab={drawerTab}
+            onChangeTab={setDrawerTab}
+            catalogState={catalogState}
+            onChangeCatalogState={setCatalogState}
+            lastArchiveName={lastArchive?.result.archiveName ?? null}
+            onReopenLastArchive={() => {
+              if (lastArchive) {
+                lastLaunchViewRef.current = 'archive';
+                setDisksOpen(false);
+                setPendingArchive(lastArchive);
+              }
+            }}
+            status={status}
+            saveSlots={saveSlots}
+            onClose={() => {
+              lastLaunchViewRef.current = 'drawer';
+              setDisksOpen(false);
+            }}
+            onUploadAdf={handleUploadAdf}
+            onInsertBlankAdf={handleInsertBlankAdf}
+            onDownloadAdf={handleDownloadAdf}
+            onEjectDisk={handleEjectDisk}
+            turboFloppy={config.turboFloppy}
+            onToggleTurboFloppy={(enabled) => handleUpdateConfig({ turboFloppy: enabled })}
+            dh0SizeMB={dh0SizeMB}
+            onChangeDh0Size={handleChangeDh0Size}
+            onDownloadDh0={handleDownloadDh0}
+            onEjectDh0={handleEjectDh0}
+            onMountDh0={handleMountDh0}
+            dh1SizeMB={dh1SizeMB}
+            onUploadDh1={handleUploadDh1}
+            onCreateBlankDh1={handleCreateBlankDh1}
+            onChangeDh1Size={handleChangeDh1Size}
+            onDownloadDh1={handleDownloadDh1}
+            onEjectDh1={handleEjectDh1}
+            onUploadRom={handleUploadRom}
+            onRestoreOpenKick={handleRestoreOpenKick}
+            onLoadDefaultBios={handleLoadDefaultBios}
+            onSaveSlot={handleSaveSlot}
+            onLoadSlot={handleLoadSlot}
+            onDeleteSlot={handleDeleteSlot}
+            onDownloadSlot={handleDownloadSlot}
+            onDownloadLiveSavestate={handleDownloadLiveSavestate}
+            onImportSavestateFile={handleImportSavestateFile}
+            launchingCatalogId={launchingCatalogId}
+            onLaunchCatalogItem={handleLaunchCatalogItem}
+          />
 
-      <ArchiveModal
-        pendingArchive={pendingArchive}
-        insertedDf0Name={status.df0.inserted ? status.df0.name : undefined}
-        insertedDf1Name={status.df1.inserted ? status.df1.name : undefined}
-        mountedDh1Name={status.dh1.mounted ? status.dh1.name : undefined}
-        backLabel={drawerTab === 'catalog' ? 'Каталог' : 'Назад'}
-        onBack={() => {
-          lastLaunchViewRef.current = 'drawer';
-          setPendingArchive(null);
-          setDisksOpen(true);
-        }}
-        onClose={() => {
-          lastLaunchViewRef.current = 'drawer';
-          setPendingArchive(null);
-        }}
-        onSelectArchiveMedia={handleSelectArchiveMedia}
-        onMountArchiveDualAdf={handleMountArchiveDualAdf}
-        onPackArchiveAsAdf={handlePackArchiveAsAdf}
-        onPackArchiveAsHdf={handlePackArchiveAsHdf}
-      />
+          <ArchiveModal
+            pendingArchive={pendingArchive}
+            overlayOnly
+            insertedDf0Name={status.df0.inserted ? status.df0.name : undefined}
+            insertedDf1Name={status.df1.inserted ? status.df1.name : undefined}
+            mountedDh1Name={status.dh1.mounted ? status.dh1.name : undefined}
+            backLabel={drawerTab === 'catalog' ? 'Каталог' : 'Назад'}
+            onBack={() => {
+              lastLaunchViewRef.current = 'drawer';
+              setPendingArchive(null);
+              setDisksOpen(true);
+            }}
+            onClose={() => {
+              lastLaunchViewRef.current = 'drawer';
+              setPendingArchive(null);
+            }}
+            onSelectArchiveMedia={handleSelectArchiveMedia}
+            onMountArchiveDualAdf={handleMountArchiveDualAdf}
+            onPackArchiveAsAdf={handlePackArchiveAsAdf}
+            onPackArchiveAsHdf={handlePackArchiveAsHdf}
+          />
 
-      <SettingsDrawer
-        open={settingsOpen}
-        debugUnlocked={debugUnlocked}
-        config={config}
-        activeVideoStandard={status.videoStandard}
-        onClose={() => setSettingsOpen(false)}
-        onUpdateConfig={handleUpdateConfig}
-        onDownloadTriageReport={handleDownloadTriageReport}
-        onCopyTriageReport={handleCopyTriageReport}
-        onDownloadDebugDump={handleDownloadDebugDump}
-        onDownloadLiveSavestate={handleDownloadLiveSavestate}
-      />
+          <SettingsDrawer
+            open={settingsOpen}
+            overlayOnly
+            debugUnlocked={debugUnlocked}
+            config={config}
+            activeVideoStandard={status.videoStandard}
+            gamepadCalibration={gamepadCalibration}
+            onClose={() => setSettingsOpen(false)}
+            onUpdateConfig={handleUpdateConfig}
+            onOpenOverscanAdjust={() => {
+              setSettingsOpen(false);
+              setOverscanAdjustOpen(true);
+            }}
+            onOpenGamepadCalibration={() => {
+              setSettingsOpen(false);
+              setCalibrationOpen(true);
+            }}
+            onResetGamepadCalibration={handleResetGamepadCalibration}
+            onDownloadTriageReport={handleDownloadTriageReport}
+            onCopyTriageReport={handleCopyTriageReport}
+            onDownloadDebugDump={handleDownloadDebugDump}
+            onDownloadLiveSavestate={handleDownloadLiveSavestate}
+          />
+
+          <GamepadCalibrationModal
+            open={calibrationOpen}
+            overlayOnly
+            existingCalibration={gamepadCalibration}
+            onSave={handleSaveGamepadCalibration}
+            onResetToDefault={handleResetGamepadCalibration}
+            onClose={() => setCalibrationOpen(false)}
+          />
+        </>
+      )}
 
       <BlankDiskModal
         drive={blankDiskDrive}

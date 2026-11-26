@@ -1,5 +1,11 @@
 import { AMIGA_RAW } from '../keyboard/amigaKeyMap';
 import { JoystickState } from '../types';
+import {
+  GamepadActionId,
+  GamepadCalibrationProfile,
+  GamepadInputSource,
+  isGamepadInputActive,
+} from './gamepadCalibration';
 
 export interface GamepadButtonLike {
   pressed: boolean;
@@ -7,6 +13,7 @@ export interface GamepadButtonLike {
 }
 
 export interface GamepadLike {
+  id?: string;
   connected?: boolean;
   axes: readonly number[];
   buttons: readonly GamepadButtonLike[];
@@ -34,6 +41,40 @@ const BIT_RMB = 1 << 9; // R1 (button 5) -> Right Mouse Button
 const BIT_ESC = 1 << 10; // Start (button 9) -> Escape
 
 const JOY_BITS_MASK = BIT_UP | BIT_DOWN | BIT_LEFT | BIT_RIGHT | BIT_FIRE1 | BIT_FIRE2;
+
+const ACTION_TO_BIT: ReadonlyArray<readonly [GamepadActionId, number]> = [
+  ['up', BIT_UP],
+  ['down', BIT_DOWN],
+  ['left', BIT_LEFT],
+  ['right', BIT_RIGHT],
+  ['fire1', BIT_FIRE1],
+  ['fire2', BIT_FIRE2],
+  ['space', BIT_SPACE],
+  ['return', BIT_RETURN],
+  ['lmb', BIT_LMB],
+  ['rmb', BIT_RMB],
+  ['esc', BIT_ESC],
+];
+
+interface CompiledBinding {
+  bit: number;
+  src: GamepadInputSource;
+}
+
+function compileCalibration(
+  profile: GamepadCalibrationProfile | null | undefined
+): CompiledBinding[] | null {
+  if (!profile) return null;
+  const list: CompiledBinding[] = [];
+  for (let i = 0; i < ACTION_TO_BIT.length; i++) {
+    const [actionId, bit] = ACTION_TO_BIT[i];
+    const src = profile.bindings[actionId];
+    if (src) {
+      list.push({ bit, src });
+    }
+  }
+  return list.length > 0 ? list : null;
+}
 
 function isBtnPressed(buttons: readonly GamepadButtonLike[], index: number): boolean {
   if (index >= buttons.length) return false;
@@ -81,6 +122,24 @@ export function readPhysicalGamepadMask(pads: ArrayLike<GamepadLike | null | und
   return mask;
 }
 
+function readCompiledGamepadMask(
+  pads: ArrayLike<GamepadLike | null | undefined>,
+  compiled: readonly CompiledBinding[]
+): number {
+  let mask = 0;
+  for (let i = 0; i < pads.length; i++) {
+    const pad = pads[i];
+    if (!pad || pad.connected === false) continue;
+    for (let j = 0; j < compiled.length; j++) {
+      const entry = compiled[j];
+      if (isGamepadInputActive(pad, entry.src)) {
+        mask |= entry.bit;
+      }
+    }
+  }
+  return mask;
+}
+
 export function hasAnyConnectedGamepad(pads: ArrayLike<GamepadLike | null | undefined>): boolean {
   for (let i = 0; i < pads.length; i++) {
     const pad = pads[i];
@@ -95,13 +154,20 @@ export function hasAnyConnectedGamepad(pads: ArrayLike<GamepadLike | null | unde
  */
 export class PhysicalGamepadTracker {
   private prevMask = 0;
+  private compiledCalibration: CompiledBinding[] | null = null;
+
+  public setCalibration(profile: GamepadCalibrationProfile | null): void {
+    this.compiledCalibration = compileCalibration(profile);
+  }
 
   public get activeMask(): number {
     return this.prevMask;
   }
 
   public poll(pads: ArrayLike<GamepadLike | null | undefined>, sink: PhysicalGamepadSink): void {
-    const nextMask = readPhysicalGamepadMask(pads);
+    const nextMask = this.compiledCalibration
+      ? readCompiledGamepadMask(pads, this.compiledCalibration)
+      : readPhysicalGamepadMask(pads);
     this.applyMask(nextMask, sink);
   }
 

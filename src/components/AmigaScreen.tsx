@@ -1,4 +1,4 @@
-import React, { useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { EmuPerfSnapshot } from '../emulator/performanceStats';
 import { triggerHaptic } from '../emulator/haptics';
 import { FB_HEIGHT, FB_WIDTH } from '../emulator/hardware/chipset';
@@ -8,11 +8,12 @@ interface AmigaScreenProps {
   canvasRef: React.RefObject<HTMLCanvasElement | null>;
   scanlines: boolean;
   paused: boolean;
+  pointerLockAllowed?: boolean;
   emuPerf?: EmuPerfSnapshot | null;
   aspectRatio?: number;
   fullscreen?: boolean;
   onMouseMove: (dx: number, dy: number) => void;
-  onMouseButton: (left?: boolean, right?: boolean) => void;
+  onMouseButton: (left?: boolean, right?: boolean, middle?: boolean) => void;
   onUserInteract: () => void;
 }
 
@@ -21,6 +22,7 @@ export const AmigaScreen: React.FC<AmigaScreenProps> = React.memo(
     canvasRef,
     scanlines,
     paused,
+    pointerLockAllowed = true,
     emuPerf = null,
     aspectRatio = 4 / 3,
     fullscreen = false,
@@ -44,6 +46,69 @@ export const AmigaScreen: React.FC<AmigaScreenProps> = React.memo(
     const subpixelRem = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
     const tapClickTimer = useRef<number | null>(null);
 
+    const [pointerLocked, setPointerLocked] = useState(false);
+    const [showLockHint, setShowLockHint] = useState(false);
+    const lockHintTimerRef = useRef<number | null>(null);
+    const pointerLockRejectedRef = useRef(false);
+    const suppressCaptureReleaseRef = useRef(false);
+    const onMouseButtonRef = useRef(onMouseButton);
+    onMouseButtonRef.current = onMouseButton;
+
+    useEffect(() => {
+      const handleLockChange = () => {
+        const canvas = canvasRef.current;
+        const locked = Boolean(canvas && document.pointerLockElement === canvas);
+        setPointerLocked(locked);
+        if (locked) {
+          pointerLockRejectedRef.current = false;
+          desktopMouseLast.current = null;
+          setShowLockHint(true);
+          if (lockHintTimerRef.current !== null) {
+            window.clearTimeout(lockHintTimerRef.current);
+          }
+          lockHintTimerRef.current = window.setTimeout(() => {
+            setShowLockHint(false);
+            lockHintTimerRef.current = null;
+          }, 2400);
+        } else {
+          setShowLockHint(false);
+          suppressCaptureReleaseRef.current = false;
+          if (lockHintTimerRef.current !== null) {
+            window.clearTimeout(lockHintTimerRef.current);
+            lockHintTimerRef.current = null;
+          }
+          onMouseButtonRef.current(false, false, false);
+        }
+      };
+
+      const handleLockError = () => {
+        pointerLockRejectedRef.current = true;
+        suppressCaptureReleaseRef.current = false;
+        setPointerLocked(false);
+      };
+
+      document.addEventListener('pointerlockchange', handleLockChange);
+      document.addEventListener('pointerlockerror', handleLockError);
+      return () => {
+        document.removeEventListener('pointerlockchange', handleLockChange);
+        document.removeEventListener('pointerlockerror', handleLockError);
+        if (lockHintTimerRef.current !== null) {
+          window.clearTimeout(lockHintTimerRef.current);
+          lockHintTimerRef.current = null;
+        }
+      };
+    }, [canvasRef]);
+
+    useEffect(() => {
+      if (!pointerLockAllowed && canvasRef.current && document.pointerLockElement === canvasRef.current) {
+        try {
+          document.exitPointerLock?.();
+        } catch {
+          // Ignore exit errors
+        }
+      }
+    }, [canvasRef, pointerLockAllowed]);
+
     const emitScaledDelta = (rawDx: number, rawDy: number, sensitivity: number) => {
       const fx = subpixelRem.current.x + rawDx * sensitivity;
       const fy = subpixelRem.current.y + rawDy * sensitivity;
@@ -61,9 +126,32 @@ export const AmigaScreen: React.FC<AmigaScreenProps> = React.memo(
       onUserInteract();
 
       if (e.pointerType === 'mouse') {
+        const canvas = e.currentTarget;
+        const isAlreadyLocked = document.pointerLockElement === canvas;
+
+        if (!isAlreadyLocked && pointerLockAllowed && typeof canvas.requestPointerLock === 'function' && !pointerLockRejectedRef.current) {
+          suppressCaptureReleaseRef.current = true;
+          try {
+            const maybePromise = canvas.requestPointerLock() as unknown as Promise<void> | undefined;
+            if (maybePromise && typeof maybePromise.catch === 'function') {
+              maybePromise.catch(() => {
+                pointerLockRejectedRef.current = true;
+                suppressCaptureReleaseRef.current = false;
+              });
+            }
+          } catch {
+            pointerLockRejectedRef.current = true;
+            suppressCaptureReleaseRef.current = false;
+          }
+          desktopMouseLast.current = { x: e.clientX, y: e.clientY };
+          return;
+        }
+
         desktopMouseLast.current = { x: e.clientX, y: e.clientY };
         if (e.button === 2) {
           onMouseButton(undefined, true);
+        } else if (e.button === 1) {
+          onMouseButton(undefined, undefined, true);
         } else if (e.button === 0) {
           onMouseButton(true, undefined);
         }
@@ -89,12 +177,20 @@ export const AmigaScreen: React.FC<AmigaScreenProps> = React.memo(
 
     const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
       if (e.pointerType === 'mouse') {
+        const w = e.currentTarget.clientWidth;
+        const scale = w > 0 ? Math.max(0.65, 320 / w) : 1;
+
+        if (document.pointerLockElement === e.currentTarget) {
+          if (e.movementX !== 0 || e.movementY !== 0) {
+            emitScaledDelta(e.movementX, e.movementY, scale);
+          }
+          return;
+        }
+
         const prev = desktopMouseLast.current;
         desktopMouseLast.current = { x: e.clientX, y: e.clientY };
         if (!prev) return;
-        const rect = e.currentTarget.getBoundingClientRect();
-        const scale = rect.width > 0 ? 320 / rect.width : 1;
-        emitScaledDelta(e.clientX - prev.x, e.clientY - prev.y, Math.max(0.65, scale));
+        emitScaledDelta(e.clientX - prev.x, e.clientY - prev.y, scale);
         return;
       }
 
@@ -118,8 +214,14 @@ export const AmigaScreen: React.FC<AmigaScreenProps> = React.memo(
 
     const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
       if (e.pointerType === 'mouse') {
+        if (suppressCaptureReleaseRef.current) {
+          suppressCaptureReleaseRef.current = false;
+          return;
+        }
         if (e.button === 2) {
           onMouseButton(undefined, false);
+        } else if (e.button === 1) {
+          onMouseButton(undefined, undefined, false);
         } else if (e.button === 0) {
           onMouseButton(false, undefined);
         }
@@ -145,7 +247,7 @@ export const AmigaScreen: React.FC<AmigaScreenProps> = React.memo(
     };
 
     const handlePointerLeave = (e: React.PointerEvent<HTMLCanvasElement>) => {
-      if (e.pointerType === 'mouse') {
+      if (e.pointerType === 'mouse' && document.pointerLockElement !== e.currentTarget) {
         desktopMouseLast.current = null;
       }
     };
@@ -176,13 +278,17 @@ export const AmigaScreen: React.FC<AmigaScreenProps> = React.memo(
             width={FB_WIDTH}
             height={FB_HEIGHT}
             data-testid="amiga-crt-canvas"
+            data-pointer-locked={pointerLocked ? 'true' : 'false'}
+            title="Кликните в экран для захвата мыши (Esc — освободить курсор)"
             onPointerDown={handlePointerDown}
             onPointerMove={handlePointerMove}
             onPointerUp={handlePointerUp}
             onPointerCancel={handlePointerUp}
             onPointerLeave={handlePointerLeave}
             onContextMenu={(e) => e.preventDefault()}
-            className="w-full h-full block crt-canvas touch-none cursor-crosshair"
+            className={`w-full h-full block crt-canvas touch-none ${
+              pointerLocked ? 'cursor-none' : 'cursor-crosshair'
+            }`}
           />
 
           {scanlines && (
@@ -197,6 +303,15 @@ export const AmigaScreen: React.FC<AmigaScreenProps> = React.memo(
             className="pointer-events-none absolute inset-0 shadow-[inset_0_0_24px_rgba(0,0,0,0.42)]"
             aria-hidden="true"
           />
+
+          {showLockHint && pointerLocked && (
+            <div
+              data-testid="pointer-lock-hint"
+              className="pointer-events-none absolute top-2.5 left-1/2 -translate-x-1/2 z-10 rounded-md bg-[#121316]/88 border border-white/15 px-3 py-1 text-[11px] font-medium text-[#F2EFE9] shadow-lg whitespace-nowrap"
+            >
+              Мышь захвачена · <span className="font-mono text-[#E07A22]">Esc</span> — освободить
+            </div>
+          )}
 
           {emuPerf && (
             <div

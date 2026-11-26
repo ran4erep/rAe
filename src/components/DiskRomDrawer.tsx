@@ -25,6 +25,7 @@ export type LaunchDrawerTab = 'launch' | 'saves' | 'catalog';
 
 interface DiskRomDrawerProps {
   open: boolean;
+  overlayOnly?: boolean;
   activeTab: LaunchDrawerTab;
   onChangeTab: (tab: LaunchDrawerTab) => void;
   catalogState: CatalogViewState;
@@ -66,6 +67,7 @@ interface DiskRomDrawerProps {
 
 export const DiskRomDrawer: React.FC<DiskRomDrawerProps> = ({
   open,
+  overlayOnly = false,
   activeTab,
   onChangeTab,
   catalogState,
@@ -152,15 +154,25 @@ export const DiskRomDrawer: React.FC<DiskRomDrawerProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/70"
+      className={
+        overlayOnly
+          ? 'fixed inset-0 z-50 flex items-end sm:items-center justify-center lg:items-stretch lg:justify-end bg-black/70 lg:bg-black/45'
+          : 'fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/70 lg:static lg:inset-auto lg:z-auto lg:block lg:bg-transparent lg:w-[400px] xl:w-[430px] lg:h-full lg:shrink-0'
+      }
       role="dialog"
-      aria-modal="true"
+      aria-modal={overlayOnly ? 'true' : undefined}
       aria-label="Окно запуска: дисководы, жёсткие диски, Kickstart ROM, сейвстейты и каталог игр"
       onClick={(e) => {
         if (e.target === e.currentTarget) handleRequestClose();
       }}
     >
-      <div className="w-full sm:max-w-2xl max-h-[90dvh] bg-[#1E2025] border-t sm:border border-white/12 rounded-t-2xl sm:rounded-xl flex flex-col overflow-hidden shadow-2xl">
+      <div
+        className={
+          overlayOnly
+            ? 'w-full sm:max-w-2xl max-h-[90dvh] lg:max-w-none lg:w-[460px] lg:max-h-none lg:h-full bg-[#1E2025] border-t sm:border lg:border-t-0 lg:border-r-0 lg:border-b-0 lg:border-l border-white/12 rounded-t-2xl sm:rounded-xl lg:rounded-none lg:rounded-l-xl flex flex-col overflow-hidden shadow-2xl'
+            : 'w-full sm:max-w-2xl max-h-[90dvh] lg:max-w-none lg:w-full lg:max-h-none lg:h-full bg-[#1E2025] border-t sm:border lg:border-t-0 lg:border-r-0 lg:border-b-0 lg:border-l border-white/10 rounded-t-2xl sm:rounded-xl lg:rounded-none flex flex-col overflow-hidden shadow-2xl lg:shadow-none'
+        }
+      >
         {/* Header */}
         <div className="px-4 py-3 border-b border-white/10 flex items-center justify-between gap-2 shrink-0">
           <h2 className="text-base font-bold text-[#F2EFE9] truncate">Запуск, сохранения и каталог</h2>

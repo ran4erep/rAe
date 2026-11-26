@@ -19,6 +19,7 @@ export interface PendingArchiveChoice {
 
 interface ArchiveModalProps {
   pendingArchive: PendingArchiveChoice | null;
+  overlayOnly?: boolean;
   insertedDf0Name?: string;
   insertedDf1Name?: string;
   mountedDh1Name?: string;
@@ -37,6 +38,7 @@ export { pickDualAdfPair };
 
 export const ArchiveModal: React.FC<ArchiveModalProps> = ({
   pendingArchive,
+  overlayOnly = false,
   insertedDf0Name,
   insertedDf1Name,
   mountedDh1Name,
@@ -120,15 +122,25 @@ export const ArchiveModal: React.FC<ArchiveModalProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-[60] flex items-end sm:items-center justify-center bg-black/75"
+      className={
+        overlayOnly
+          ? 'fixed inset-0 z-[60] flex items-end sm:items-center justify-center lg:items-stretch lg:justify-end bg-black/75 lg:bg-black/45'
+          : 'fixed inset-0 z-[60] flex items-end sm:items-center justify-center bg-black/75 lg:static lg:inset-auto lg:z-auto lg:block lg:bg-transparent lg:w-[400px] xl:w-[430px] lg:h-full lg:shrink-0'
+      }
       role="dialog"
-      aria-modal="true"
+      aria-modal={overlayOnly ? 'true' : undefined}
       aria-label={`Содержимое архива ${result.archiveName}`}
       onClick={(e) => {
         if (e.target === e.currentTarget && !isBusy) onClose();
       }}
     >
-      <div className="w-full sm:max-w-xl max-h-[86dvh] bg-[#1B1E24] border-t sm:border border-[#E07A22]/35 rounded-t-2xl sm:rounded-xl flex flex-col overflow-hidden shadow-2xl">
+      <div
+        className={
+          overlayOnly
+            ? 'w-full sm:max-w-xl max-h-[86dvh] lg:max-w-none lg:w-[480px] lg:max-h-none lg:h-full bg-[#1B1E24] border-t sm:border lg:border-t-0 lg:border-r-0 lg:border-b-0 lg:border-l border-[#E07A22]/35 rounded-t-2xl sm:rounded-xl lg:rounded-none lg:rounded-l-xl flex flex-col overflow-hidden shadow-2xl'
+            : 'w-full sm:max-w-xl max-h-[86dvh] lg:max-w-none lg:w-full lg:max-h-none lg:h-full bg-[#1B1E24] border-t sm:border lg:border-t-0 lg:border-r-0 lg:border-b-0 lg:border-l border-[#E07A22]/35 lg:border-white/10 rounded-t-2xl sm:rounded-xl lg:rounded-none flex flex-col overflow-hidden shadow-2xl lg:shadow-none'
+        }
+      >
         {/* Modal Header */}
         <div className="px-4 py-3 border-b border-white/10 flex items-center justify-between gap-3 shrink-0 bg-[#14171D]">
           <div className="flex items-center gap-2.5 min-w-0">
