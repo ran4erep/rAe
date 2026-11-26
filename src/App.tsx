@@ -2558,6 +2558,7 @@ export default function App() {
       onOpenStickDirPicker={(dir) => setCustomPickerContext({ kind: 'stick-dir', dir })}
       onChangeSelectedSize={handleChangeSelectedCustomSize}
       onDone={handleToggleCustomEdit}
+      fullscreenOverlay={isFullscreen}
     />
   ) : null;
 
@@ -2667,8 +2668,12 @@ export default function App() {
               : 'flex-1 min-w-0 min-h-0 flex flex-col'
           }
         >
-        {/* Fullscreen Custom Editor sits cleanly ABOVE the screen/control zone (never overlapping) */}
-        {isFullscreen && customEditToolbarNode}
+        {/* Fullscreen Custom Editor floats above the screen so it never pushes or resizes the image */}
+        {isFullscreen && customEditToolbarNode && (
+          <div className="absolute top-0 inset-x-0 z-30 pointer-events-auto">
+            {customEditToolbarNode}
+          </div>
+        )}
 
         {/* SCREEN (full-width centered CRT on desktop & mobile; shrinks horizontally when desktop side panel is open) */}
         <section

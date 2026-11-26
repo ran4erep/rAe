@@ -34,8 +34,11 @@ export const TouchpadDeck: React.FC<TouchpadDeckProps> = React.memo(
 
     const [lmbPressed, setLmbPressed] = useState(false);
     const [rmbPressed, setRmbPressed] = useState(false);
+    const lmbPointerIdRef = useRef<number | null>(null);
+    const rmbPointerIdRef = useRef<number | null>(null);
 
     const updateTouchpadGlow = (clientX: number, clientY: number, visible: boolean) => {
+      if (fullscreenOverlay) return;
       const glow = touchpadGlowRef.current;
       const pad = touchpadRef.current;
       if (!glow || !pad) return;
@@ -58,15 +61,18 @@ export const TouchpadDeck: React.FC<TouchpadDeckProps> = React.memo(
     const handlePadDown = (e: React.PointerEvent<HTMLDivElement>) => {
       e.preventDefault();
       onUserInteract();
+      if (padPointer.current !== null) return;
       try {
         e.currentTarget.setPointerCapture(e.pointerId);
       } catch {
         // Ignore in synthetic environments
       }
 
-      const b = e.currentTarget.getBoundingClientRect();
-      padRectRef.current = { left: b.left, top: b.top };
-      updateTouchpadGlow(e.clientX, e.clientY, true);
+      if (!fullscreenOverlay) {
+        const b = e.currentTarget.getBoundingClientRect();
+        padRectRef.current = { left: b.left, top: b.top };
+        updateTouchpadGlow(e.clientX, e.clientY, true);
+      }
 
       const now = performance.now();
       // Double-tap-and-hold on trackpad holds LMB while dragging (just like a laptop trackpad)
@@ -154,6 +160,8 @@ export const TouchpadDeck: React.FC<TouchpadDeckProps> = React.memo(
         onPointerDown={(e) => {
           e.preventDefault();
           onUserInteract();
+          if (lmbPointerIdRef.current !== null) return;
+          lmbPointerIdRef.current = e.pointerId;
           try {
             e.currentTarget.setPointerCapture(e.pointerId);
           } catch {
@@ -163,11 +171,15 @@ export const TouchpadDeck: React.FC<TouchpadDeckProps> = React.memo(
           setLmbPressed(true);
           onMouseButton(true, undefined);
         }}
-        onPointerUp={() => {
+        onPointerUp={(e) => {
+          if (lmbPointerIdRef.current !== e.pointerId) return;
+          lmbPointerIdRef.current = null;
           setLmbPressed(false);
           onMouseButton(false, undefined);
         }}
-        onPointerCancel={() => {
+        onPointerCancel={(e) => {
+          if (lmbPointerIdRef.current !== e.pointerId) return;
+          lmbPointerIdRef.current = null;
           setLmbPressed(false);
           onMouseButton(false, undefined);
         }}
@@ -186,6 +198,8 @@ export const TouchpadDeck: React.FC<TouchpadDeckProps> = React.memo(
         onPointerDown={(e) => {
           e.preventDefault();
           onUserInteract();
+          if (rmbPointerIdRef.current !== null) return;
+          rmbPointerIdRef.current = e.pointerId;
           try {
             e.currentTarget.setPointerCapture(e.pointerId);
           } catch {
@@ -195,11 +209,15 @@ export const TouchpadDeck: React.FC<TouchpadDeckProps> = React.memo(
           setRmbPressed(true);
           onMouseButton(undefined, true);
         }}
-        onPointerUp={() => {
+        onPointerUp={(e) => {
+          if (rmbPointerIdRef.current !== e.pointerId) return;
+          rmbPointerIdRef.current = null;
           setRmbPressed(false);
           onMouseButton(undefined, false);
         }}
-        onPointerCancel={() => {
+        onPointerCancel={(e) => {
+          if (rmbPointerIdRef.current !== e.pointerId) return;
+          rmbPointerIdRef.current = null;
           setRmbPressed(false);
           onMouseButton(undefined, false);
         }}
@@ -239,14 +257,7 @@ export const TouchpadDeck: React.FC<TouchpadDeckProps> = React.memo(
             onPointerCancel={handlePadUp}
             onContextMenu={(e) => e.preventDefault()}
             className="pointer-events-auto relative flex-1 h-full overflow-hidden touch-none cursor-crosshair bg-transparent"
-          >
-            <div
-              ref={touchpadGlowRef}
-              data-testid="touchpad-glow"
-              aria-hidden="true"
-              className="pointer-events-none absolute top-0 left-0 w-[72px] h-[72px] rounded-full bg-white/15 blur-md opacity-0 transition-opacity duration-100 will-change-transform"
-            />
-          </div>
+          />
         </div>
       );
     }

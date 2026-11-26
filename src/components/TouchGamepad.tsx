@@ -19,6 +19,7 @@ export const TouchGamepad: React.FC<TouchGamepadProps> = React.memo(
     const padRef = useRef<HTMLDivElement | null>(null);
     const knobRef = useRef<HTMLDivElement | null>(null);
     const padPointerId = useRef<number | null>(null);
+    const padRectRef = useRef<{ left: number; top: number; width: number } | null>(null);
     const prevDirKey = useRef<string>('0000');
     const [activeDirs, setActiveDirs] = useState({
       up: false,
@@ -41,9 +42,14 @@ export const TouchGamepad: React.FC<TouchGamepadProps> = React.memo(
     const updateStickFromPoint = (clientX: number, clientY: number) => {
       const el = padRef.current;
       if (!el) return;
-      const rect = el.getBoundingClientRect();
+      let rect = padRectRef.current;
+      if (!rect) {
+        const b = el.getBoundingClientRect();
+        rect = { left: b.left, top: b.top, width: b.width };
+        padRectRef.current = rect;
+      }
       const cx = rect.left + rect.width / 2;
-      const cy = rect.top + rect.height / 2;
+      const cy = rect.top + rect.width / 2;
       const radius = rect.width * 0.42;
       let dx = clientX - cx;
       let dy = clientY - cy;
@@ -73,7 +79,13 @@ export const TouchGamepad: React.FC<TouchGamepadProps> = React.memo(
     const handlePadDown = (e: React.PointerEvent<HTMLDivElement>) => {
       e.preventDefault();
       onUserInteract();
+      if (padPointerId.current !== null) return;
       padPointerId.current = e.pointerId;
+      const el = padRef.current;
+      if (el) {
+        const b = el.getBoundingClientRect();
+        padRectRef.current = { left: b.left, top: b.top, width: b.width };
+      }
       try {
         e.currentTarget.setPointerCapture(e.pointerId);
       } catch {
@@ -91,6 +103,7 @@ export const TouchGamepad: React.FC<TouchGamepadProps> = React.memo(
     const handlePadUp = (e: React.PointerEvent<HTMLDivElement>) => {
       if (padPointerId.current !== e.pointerId) return;
       padPointerId.current = null;
+      padRectRef.current = null;
       prevDirKey.current = '0000';
       setKnobTransform(0, 0);
       const cleared = { up: false, down: false, left: false, right: false };

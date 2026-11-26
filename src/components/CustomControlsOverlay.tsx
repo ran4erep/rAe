@@ -78,7 +78,11 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
     const stickPadRef = useRef<HTMLDivElement | null>(null);
     const stickKnobRef = useRef<HTMLDivElement | null>(null);
     const stickPointerId = useRef<number | null>(null);
+    const stickRectRef = useRef<{ left: number; top: number; width: number } | null>(null);
     const prevStickDirKey = useRef<string>('0000');
+
+    // Per-button owning pointerId map for clean multi-touch
+    const btnPointerIdsRef = useRef<Record<string, number>>({});
 
     // Background mouse trackpad refs
     const bgMousePointer = useRef<{
@@ -110,12 +114,19 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
       latestYPct: number;
       moved: boolean;
       el: HTMLElement;
+      surfaceWidth: number;
+      surfaceHeight: number;
     } | null>(null);
 
     const stickRef = useRef(profile.stick);
     stickRef.current = profile.stick;
 
     const releaseAllHeldControls = useCallback(() => {
+      bgMousePointer.current = null;
+      bgRectRef.current = null;
+      stickPointerId.current = null;
+      stickRectRef.current = null;
+      btnPointerIdsRef.current = {};
       prevStickDirKey.current = '0000';
       if (stickKnobRef.current) {
         stickKnobRef.current.style.transform = 'translate3d(0px, 0px, 0)';
@@ -144,6 +155,7 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
 
     // ---------------- Background Borderless Mouse Trackpad ----------------
     const updateBgGlow = (clientX: number, clientY: number, visible: boolean) => {
+      if (fullscreenOverlay) return;
       const glow = bgMouseGlowRef.current;
       const surface = touchSurfaceRef.current;
       if (!glow || !surface) return;
@@ -173,15 +185,19 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
         return;
       }
 
+      if (bgMousePointer.current !== null) return;
+
       try {
         e.currentTarget.setPointerCapture(e.pointerId);
       } catch {
         // Ignore
       }
 
-      const b = e.currentTarget.getBoundingClientRect();
-      bgRectRef.current = { left: b.left, top: b.top };
-      updateBgGlow(e.clientX, e.clientY, true);
+      if (!fullscreenOverlay) {
+        const b = e.currentTarget.getBoundingClientRect();
+        bgRectRef.current = { left: b.left, top: b.top };
+        updateBgGlow(e.clientX, e.clientY, true);
+      }
 
       const now = performance.now();
       const isTapHoldDrag = now - lastBgTapUpTime.current < 240;
@@ -261,9 +277,14 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
       const el = stickPadRef.current;
       const stickCfg = stickRef.current;
       if (!el || !stickCfg) return;
-      const rect = el.getBoundingClientRect();
+      let rect = stickRectRef.current;
+      if (!rect) {
+        const b = el.getBoundingClientRect();
+        rect = { left: b.left, top: b.top, width: b.width };
+        stickRectRef.current = rect;
+      }
       const cx = rect.left + rect.width / 2;
-      const cy = rect.top + rect.height / 2;
+      const cy = rect.top + rect.width / 2;
       const radius = rect.width * 0.42;
       let dx = clientX - cx;
       let dy = clientY - cy;
@@ -311,7 +332,13 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
       e.preventDefault();
       e.stopPropagation();
       onUserInteract();
+      if (stickPointerId.current !== null) return;
       stickPointerId.current = e.pointerId;
+      const padEl = stickPadRef.current;
+      if (padEl) {
+        const b = padEl.getBoundingClientRect();
+        stickRectRef.current = { left: b.left, top: b.top, width: b.width };
+      }
       try {
         e.currentTarget.setPointerCapture(e.pointerId);
       } catch {
@@ -331,6 +358,7 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
       if (stickPointerId.current !== e.pointerId) return;
       e.stopPropagation();
       stickPointerId.current = null;
+      stickRectRef.current = null;
       prevStickDirKey.current = '0000';
       if (stickKnobRef.current) {
         stickKnobRef.current.style.transform = 'translate3d(0px, 0px, 0)';
@@ -351,6 +379,9 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
     ) => {
       e.preventDefault();
       e.stopPropagation();
+      if (dragRef.current !== null) return;
+      const surface = touchSurfaceRef.current;
+      const rect = surface ? surface.getBoundingClientRect() : null;
       try {
         e.currentTarget.setPointerCapture(e.pointerId);
       } catch {
@@ -369,13 +400,14 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
         latestYPct: origYPct,
         moved: false,
         el: e.currentTarget,
+        surfaceWidth: rect?.width ?? 0,
+        surfaceHeight: rect?.height ?? 0,
       };
     };
 
     const moveEditDrag = (e: React.PointerEvent<HTMLElement>) => {
       const d = dragRef.current;
-      const surface = touchSurfaceRef.current;
-      if (!d || d.pointerId !== e.pointerId || !surface) return;
+      if (!d || d.pointerId !== e.pointerId) return;
       e.preventDefault();
       e.stopPropagation();
 
@@ -385,16 +417,15 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
         d.moved = true;
       }
 
-      const rect = surface.getBoundingClientRect();
-      if (rect.width <= 0 || rect.height <= 0) return;
+      if (d.surfaceWidth <= 0 || d.surfaceHeight <= 0) return;
 
       const minX = d.kind === 'stick' ? 6 : 4;
       const maxX = d.kind === 'stick' ? 94 : 96;
       const minY = d.kind === 'stick' ? 10 : 6;
       const maxY = d.kind === 'stick' ? 90 : 94;
 
-      const nextX = clampPct(d.origXPct + (dx / rect.width) * 100, minX, maxX);
-      const nextY = clampPct(d.origYPct + (dy / rect.height) * 100, minY, maxY);
+      const nextX = clampPct(d.origXPct + (dx / d.surfaceWidth) * 100, minX, maxX);
+      const nextY = clampPct(d.origYPct + (dy / d.surfaceHeight) * 100, minY, maxY);
       d.latestXPct = nextX;
       d.latestYPct = nextY;
 
@@ -437,12 +468,15 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
         }`}
         aria-label="Кастомное управление"
       >
-        {/* Subtle direct-DOM touch glow for mouse cursor feedback */}
-        <div
-          ref={bgMouseGlowRef}
-          aria-hidden="true"
-          className="pointer-events-none absolute top-0 left-0 w-[68px] h-[68px] rounded-full bg-white/15 blur-md opacity-0 transition-opacity duration-100 will-change-transform"
-        />
+        {/* Subtle direct-DOM touch glow for mouse cursor feedback (non-fullscreen deck only) */}
+        {!fullscreenOverlay && (
+          <div
+            ref={bgMouseGlowRef}
+            data-testid="custom-mouse-glow"
+            aria-hidden="true"
+            className="pointer-events-none absolute top-0 left-0 w-[68px] h-[68px] rounded-full bg-white/15 blur-md opacity-0 transition-opacity duration-100 will-change-transform"
+          />
+        )}
 
         {/* Movable, Customizable 8-Way Stick (only when added by user) */}
         {stick && stickDims && (
@@ -531,7 +565,7 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
                 top: `${btn.yPct}%`,
                 transform: 'translate(-50%, -50%)',
               }}
-                onPointerDown={(e) => {
+              onPointerDown={(e) => {
                 if (editMode) {
                   startEditDrag('button', btn.id, btn.xPct, btn.yPct, e);
                   return;
@@ -539,6 +573,8 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
                 e.preventDefault();
                 e.stopPropagation();
                 onUserInteract();
+                if (btnPointerIdsRef.current[btn.id] !== undefined) return;
+                btnPointerIdsRef.current[btn.id] = e.pointerId;
                 triggerHaptic(10);
                 try {
                   e.currentTarget.setPointerCapture(e.pointerId);
@@ -565,6 +601,8 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
                   return;
                 }
                 e.stopPropagation();
+                if (btnPointerIdsRef.current[btn.id] !== e.pointerId) return;
+                delete btnPointerIdsRef.current[btn.id];
                 const actions = holdManagerRef.current.setSource(`btn:${btn.id}`, []);
                 if (actions.length > 0) {
                   dispatchTargetActions(actions, {
@@ -580,6 +618,8 @@ export const CustomControlsOverlay: React.FC<CustomControlsOverlayProps> = React
                   endEditDrag(e);
                   return;
                 }
+                if (btnPointerIdsRef.current[btn.id] !== e.pointerId) return;
+                delete btnPointerIdsRef.current[btn.id];
                 const actions = holdManagerRef.current.setSource(`btn:${btn.id}`, []);
                 if (actions.length > 0) {
                   dispatchTargetActions(actions, {

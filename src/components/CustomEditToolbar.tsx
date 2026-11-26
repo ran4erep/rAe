@@ -30,6 +30,7 @@ interface CustomEditToolbarProps {
   onOpenStickDirPicker: (dir: StickDirection) => void;
   onChangeSelectedSize: (size: ControlButtonSize) => void;
   onDone: () => void;
+  fullscreenOverlay?: boolean;
 }
 
 export const CustomEditToolbar: React.FC<CustomEditToolbarProps> = ({
@@ -48,6 +49,7 @@ export const CustomEditToolbar: React.FC<CustomEditToolbarProps> = ({
   onOpenStickDirPicker,
   onChangeSelectedSize,
   onDone,
+  fullscreenOverlay = false,
 }) => {
   const [formMode, setFormMode] = useState<'new' | 'rename' | null>(null);
   const [mouseMenuOpen, setMouseMenuOpen] = useState(false);
@@ -74,7 +76,11 @@ export const CustomEditToolbar: React.FC<CustomEditToolbarProps> = ({
 
   return (
     <div
-      className="shrink-0 bg-[#1B1C20] border-b border-white/12 px-2 py-1.5 flex flex-col gap-1.5 z-30 select-none"
+      className={`shrink-0 px-2 py-1.5 flex flex-col gap-1.5 z-30 select-none border-b ${
+        fullscreenOverlay
+          ? 'bg-[#1B1C20]/90 backdrop-blur-sm border-white/15 shadow-lg'
+          : 'bg-[#1B1C20] border-white/12'
+      }`}
       role="toolbar"
       aria-label="Редактор кастомного управления"
     >

@@ -159,6 +159,7 @@ export const AmigaScreen: React.FC<AmigaScreenProps> = React.memo(
       }
 
       // Touch / Pen: dragging moves cursor freely without holding LMB; quick tap clicks LMB
+      if (touchRef.current !== null) return;
       try {
         e.currentTarget.setPointerCapture(e.pointerId);
       } catch {
@@ -206,8 +207,8 @@ export const AmigaScreen: React.FC<AmigaScreenProps> = React.memo(
       }
 
       if (dx !== 0 || dy !== 0) {
-        const rect = e.currentTarget.getBoundingClientRect();
-        const scale = rect.width > 0 ? 320 / rect.width : 1;
+        const w = e.currentTarget.clientWidth;
+        const scale = w > 0 ? 320 / w : 1;
         emitScaledDelta(dx, dy, Math.max(1.05, scale * 1.1));
       }
     };
